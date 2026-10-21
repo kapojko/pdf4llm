@@ -40,7 +40,7 @@ pdf4llm <input.pdf> [options]
 | `-o/--out DIR` | output dir, **default = same folder as the PDF** |
 | `--pages A-B,12,15` | page subset (useful for short LLM tests) |
 | `--llm` | run local-LLM broken-text correction (default **off**) |
-| `--llm-workers N` | parallel LLM chunk requests, N ≥ 1 (default **1** = sequential; the server must allow concurrency, e.g. llama-server `-np 4`) |
+| `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 4)`), else 1; an explicit value overrides the server |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
@@ -107,13 +107,29 @@ Then:
 pdf4llm <file.pdf> --llm --pages 1-10
 ```
 
-Chunks are processed one after another by default. `--llm-workers N` sends up
-to N chunk requests in parallel (ThreadPoolExecutor; litellm calls are
-thread-safe) — with a llama-server started with `-np 4` this cuts the LLM pass
-to roughly a quarter of the sequential time. Safety is unaffected: every chunk
-still goes through the same verify → salvage → retry pipeline, chunks are
-independent and the output is reassembled strictly in original chunk order,
-so the result and the meta.json stats are identical to the sequential run.
+Chunks are processed one after another unless parallelism is available. With
+a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
+self-description endpoint and:
+
+- sets the number of workers automatically to `min(slots, 4)` (the GPU is
+  bandwidth-limited — more slots only thin out per-stream throughput without
+  shortening the critical path); an explicit `--llm-workers` overrides this;
+- reads the per-request `contextSize` (total `-c` divided by slots) and checks
+  a rough token estimate (input + same-size output + margin, ~3.5 chars/token)
+  for the **largest actual chunk** against it; if a chunk provably cannot fit,
+  the pass is **aborted before any LLM call** (exit code 4) — reduce the chunk
+  size or raise the server context.
+
+Missing data degrades safely: no info endpoint → 1 worker, current behaviour;
+model key not listed / no `contextSize` → warning, check skipped. The detected
+server capabilities and worker count are recorded in `meta.json` (`llm.swappy`).
+With a plain OpenAI-compatible endpoint (Ollama, bare llama-server) the
+behaviour is unchanged: `--llm-workers N` for parallelism, 1 otherwise.
+
+Safety is unaffected by parallelism: every chunk still goes through the same
+verify → salvage → retry pipeline, chunks are independent and the output is
+reassembled strictly in original chunk order, so the result and the meta.json
+stats are identical to the sequential run.
 
 `litellm` is the pluggable client — it works with Ollama, llama.cpp
 (llama-server), or any OpenAI-compatible endpoint.

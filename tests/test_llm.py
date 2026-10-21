@@ -1,9 +1,10 @@
 """Offline tests for the LLM correction pass: chunking, verifier, classifiers.
 
 No network access needed — only the pure functions are exercised (the parallel
---llm-workers path is tested with a stubbed _call_llm).
+--llm-workers path and the llama-swappy probe are tested with stubs).
 """
 import importlib
+import json
 
 import pytest
 
@@ -442,7 +443,8 @@ def test_parallel_rejections_carry_chunk_indices(monkeypatch):
 
 
 def test_workers_default_is_one(monkeypatch):
-    # workers=1 must take the sequential path (exact current behaviour)
+    # workers=None with no swappy info endpoint -> sequential path (exact
+    # current behaviour); the probe fails fast offline and is never fatal
     seen = []
 
     def fake_call(system_prompt, chunk, *a, **kw):
@@ -455,6 +457,160 @@ def test_workers_default_is_one(monkeypatch):
         max_chars=MAXC)
     assert stats["chunks_accepted"] == stats["chunks_total"]
     assert out == _prep(PAR_TEXT)
+    assert "swappy" not in stats
+
+
+# ---------------------------------------------------------------------------
+# llama-swappy probe: auto workers + context check
+# ---------------------------------------------------------------------------
+
+SWAPPY_INFO = {
+    "version": "1.3",
+    "models": [
+        {"key": "m-np1", "contextSize": 147456, "slots": 1},
+        {"key": "m-np4", "contextSize": 36864, "slots": 4},
+        {"key": "m-np8", "contextSize": 18432, "slots": 8},
+    ],
+}
+
+
+def test_probe_swappy_urls_and_failure(monkeypatch):
+    hits = []
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(SWAPPY_INFO).encode()
+
+    def fake_urlopen(req, timeout):
+        hits.append(req.full_url)
+        if len(hits) == 1:
+            raise llm.urllib.error.HTTPError(req.full_url, 404, "nope", {}, None)
+        return FakeResp()
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    info = llm.probe_swappy("http://host:12380/v1", "key")
+    assert info == SWAPPY_INFO
+    # /v1-stripped base tried first, endpoint as given second; fallback works
+    assert hits == ["http://host:12380/llama-swappy/info",
+                    "http://host:12380/v1/llama-swappy/info"]
+
+
+def test_probe_swappy_first_url_wins(monkeypatch):
+    hits = []
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(SWAPPY_INFO).encode()
+
+    def fake_urlopen(req, timeout):
+        hits.append(req.full_url)
+        return FakeResp()
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    assert llm.probe_swappy("http://host:12380/v1", "key") == SWAPPY_INFO
+    assert hits == ["http://host:12380/llama-swappy/info"]
+
+
+def test_probe_swappy_never_raises(monkeypatch):
+    def boom(req, timeout):
+        raise OSError("no network")
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", boom)
+    assert llm.probe_swappy("http://x/v1", "k") is None
+
+
+def test_resolve_workers_auto_from_slots(monkeypatch):
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: SWAPPY_INFO)
+    notes = []
+    w, entry = llm.resolve_workers("http://x", "k", "m-np4", 6000, None,
+                                   note=notes.append)
+    assert w == 4 and entry["key"] == "m-np4"        # min(slots, 4)
+    w8, _ = llm.resolve_workers("http://x", "k", "m-np8", 6000, None,
+                                note=notes.append)
+    assert w8 == 4                                    # capped at 4
+    w1, _ = llm.resolve_workers("http://x", "k", "m-np1", 6000, None,
+                                note=notes.append)
+    assert w1 == 1                                    # np=1 -> sequential
+    assert any("workers=4" in n for n in notes)
+
+
+def test_resolve_workers_explicit_overrides_slots(monkeypatch):
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: SWAPPY_INFO)
+    w, _ = llm.resolve_workers("http://x", "k", "m-np4", 6000, 2,
+                               note=lambda m: None)
+    assert w == 2
+
+
+def test_resolve_workers_no_info_endpoint(monkeypatch):
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: None)
+    assert llm.resolve_workers("http://x", "k", "m", 6000, None)[0] == 1
+    assert llm.resolve_workers("http://x", "k", "m", 6000, 3)[0] == 3
+
+
+def test_resolve_workers_missing_model_degrades(monkeypatch):
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: SWAPPY_INFO)
+    notes = []
+    w, entry = llm.resolve_workers("http://x", "k", "unknown", 6000, None,
+                                   note=notes.append)
+    assert w == 1 and entry is None
+    assert any("no entry" in n for n in notes)
+
+
+def test_resolve_workers_context_check(monkeypatch):
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: SWAPPY_INFO)
+    # 36864 tok/request is plenty for a 6000-char chunk (~3.9k tokens est.)
+    llm.resolve_workers("http://x", "k", "m-np4", 6000, None, note=lambda m: None)
+    # but a 200k-char monster chunk does not fit -> abort
+    with pytest.raises(llm.LlmContextError, match="context too small"):
+        llm.resolve_workers("http://x", "k", "m-np4", 200_000, None,
+                            note=lambda m: None)
+
+
+def test_correct_with_llm_aborts_when_context_too_small(monkeypatch):
+    tiny_info = {"version": "1.3",
+                 "models": [{"key": "m", "contextSize": 500, "slots": 2}]}
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: tiny_info)
+
+    def must_not_call(*a, **kw):
+        raise AssertionError("LLM must not be called when the context check fails")
+
+    monkeypatch.setattr(llm, "_call_llm", must_not_call)
+    with pytest.raises(llm.LlmContextError):
+        llm.correct_with_llm(PAR_TEXT, "m", "http://x", "k", verbose=False,
+                             classify=False, max_chars=MAXC)
+
+
+def test_correct_with_llm_records_swappy_and_auto_workers(monkeypatch):
+    info = {"version": "1.3",
+            "models": [{"key": "m", "contextSize": 36864, "slots": 4}]}
+    monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: info)
+    monkeypatch.setattr(llm, "_call_llm",
+                        lambda system_prompt, chunk, *a, **kw: _fixed(chunk))
+    out, stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False, classify=False,
+        max_chars=MAXC)   # workers=None -> auto: min(4 slots, 4) = 4
+    assert out == _fixed(_prep(PAR_TEXT))
+    assert stats["swappy"] == {"key": "m", "slots": 4,
+                               "context_per_request": 36864, "workers": 4}
+
+
+def test_estimate_chunk_tokens_sanity():
+    # ~3.5 chars/token in, same-size out, plus margin
+    assert llm.estimate_chunk_tokens(0) == llm._CTX_MARGIN_TOKENS
+    need = llm.estimate_chunk_tokens(6000)
+    assert 2 * (6000 / 4) < need < 2 * (6000 / 3) + 512 + 1
 
 
 # ---------------------------------------------------------------------------

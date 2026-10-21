@@ -23,9 +23,12 @@ Design (safety-first):
 from __future__ import annotations
 
 import difflib
+import json
+import math
 import re
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
@@ -711,6 +714,127 @@ def _apply_chunk_delta(stats: dict, delta: dict) -> None:
     stats["retries_used"] += delta["retries_used"]
 
 
+# ---------------------------------------------------------------------------
+# llama-swappy self-description probe (workers auto-set + context check)
+# ---------------------------------------------------------------------------
+
+# Rough chars-per-token for technical English datasheet/manual prose. Used
+# ONLY for the coarse "does the chunk fit the context" estimate — never for
+# anything safety-relevant (the verifier is the safety mechanism).
+_CHARS_PER_TOKEN = 3.5
+# Slack for the system prompt, retry hint, code-fence wrapping and estimator
+# error, added on top of the estimated input+output tokens.
+_CTX_MARGIN_TOKENS = 512
+# Cap on auto-selected workers: beyond 4 slots the GPU (bandwidth-limited)
+# spends its throughput on more concurrent streams without shortening the
+# critical path.
+_MAX_AUTO_WORKERS = 4
+
+
+class LlmContextError(RuntimeError):
+    """The server context provably cannot hold a chunk's input + output."""
+
+
+def probe_swappy(endpoint: str, api_key: str, timeout: float = 3.0) -> dict | None:
+    """Fetch the llama-swappy self-description endpoint, if present.
+
+    Tries ``<base>/llama-swappy/info`` where <base> is the endpoint with a
+    trailing ``/v1`` stripped first, then the endpoint as given. Returns the
+    parsed JSON dict, or None when the endpoint does not exist or does not
+    answer (any ordinary OpenAI-compatible server, network issue, bad JSON).
+    Never raises.
+    """
+    base = endpoint.rstrip("/")
+    urls = [b + "/llama-swappy/info" for b in dict.fromkeys(
+        [re.sub(r"/v1/?$", "", base), base])]
+    for url in urls:
+        try:
+            req = urllib.request.Request(
+                url, headers={"Authorization": f"Bearer {api_key}"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read())
+            if isinstance(data, dict) and isinstance(data.get("models"), list):
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def estimate_chunk_tokens(max_chunk_chars: int) -> int:
+    """Rough token estimate for the largest chunk: input + output + slack.
+
+    The correction pass is whitespace-only, so the output has roughly the
+    same size as the input — hence 2x the input estimate plus a margin for
+    the system prompt, retry hint and estimator error.
+    """
+    in_tokens = math.ceil(max_chunk_chars / _CHARS_PER_TOKEN)
+    return 2 * in_tokens + _CTX_MARGIN_TOKENS
+
+
+def resolve_workers(
+    endpoint: str,
+    api_key: str,
+    model: str,
+    max_chunk_chars: int,
+    workers: int | None,
+    note=None,
+) -> tuple[int, dict | None]:
+    """Probe llama-swappy; auto-set workers and check the context fit.
+
+    Worker priority: explicit ``workers`` argument > ``min(slots, 4)`` from
+    the info endpoint > 1 (unknown server). The context check compares a
+    rough input+output estimate for the largest chunk against the per-request
+    contextSize reported by llama-swappy (v1.3 semantics: total -c divided
+    by slots) and raises LlmContextError when it does not fit. Missing data
+    (no info endpoint, model key not listed, contextSize absent) degrades
+    with a warning — never aborts.
+
+    Returns (workers, swappy_model_entry_or_None).
+    """
+    if note is None:  # pragma: no cover
+        def note(msg: str) -> None:
+            print(msg, flush=True)
+
+    info = probe_swappy(endpoint, api_key)
+    if info is None:
+        return (max(1, workers) if workers is not None else 1), None
+
+    models = info.get("models") or []
+    entry = next((m for m in models if m.get("key") == model), None)
+    if entry is None and len(models) == 1:
+        entry = models[0]
+    if entry is None:
+        note(f"  llm: note: llama-swappy info has no entry for model {model!r} "
+             "— skipping context check")
+        return (max(1, workers) if workers is not None else 1), None
+
+    ctx = entry.get("contextSize")
+    if ctx:
+        need = estimate_chunk_tokens(max_chunk_chars)
+        if need > ctx:
+            raise LlmContextError(
+                f"server context too small: {ctx} tokens/request available "
+                f"(llama-swappy, model {entry.get('key')!r}), but the largest "
+                f"chunk needs ~{need} tokens (in+out, rough estimate; "
+                f"{max_chunk_chars} chars). Reduce the chunk size or increase "
+                "the server context (-c, divided by -np)."
+            )
+
+    slots = entry.get("slots")
+    if workers is not None:
+        n_workers = max(1, workers)
+        how = "explicit"
+    elif slots:
+        n_workers = min(int(slots), _MAX_AUTO_WORKERS)
+        how = "from llama-swappy slots"
+    else:
+        n_workers = 1
+        how = "default (slots unknown)"
+    note(f"  llm: llama-swappy: slots={slots}, context={ctx} tok/request "
+         f"-> workers={n_workers} ({how})")
+    return n_workers, entry
+
+
 def correct_with_llm(
     text: str,
     model: str,
@@ -721,7 +845,7 @@ def correct_with_llm(
     classify: bool = True,
     sampling: dict | None = None,
     retries: int = 2,
-    workers: int = 1,
+    workers: int | None = None,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass.
 
@@ -736,6 +860,12 @@ def correct_with_llm(
     litellm calls are thread-safe). Safety is unaffected: every chunk still
     goes through the same verify/salvage/retry pipeline, chunks are
     independent and the output is reassembled strictly in original order.
+
+    ``workers`` None (default) auto-selects from the llama-swappy info
+    endpoint: min(slots, 4), falling back to 1 when the server does not
+    self-describe. When the server reports its per-request context, a rough
+    input+output estimate for the largest chunk is checked against it and
+    the pass is aborted (LlmContextError) when a chunk provably cannot fit.
     """
     text = dedupe_bullets(text)
     text, hr_removed = strip_horizontal_rules(text)
@@ -757,6 +887,20 @@ def correct_with_llm(
         )
 
     chunks = chunk_markdown(text, max_chars)
+
+    # llama-swappy probe: auto workers + rough context-sufficiency check.
+    # Runs on the ACTUAL largest chunk (an oversized single line can exceed
+    # max_chars), before any LLM call so an abort costs nothing.
+    swappy_entry: dict | None = None
+    if chunks:
+        biggest = max(len(chunk) for chunk, _sep in chunks)
+        workers, swappy_entry = resolve_workers(
+            endpoint, api_key, model, biggest, workers,
+            note=lambda msg: print(msg, flush=True),
+        )
+    elif workers is None:
+        workers = 1
+
     stats: dict = {
         "model": model,
         "sampling": sampling or DEFAULT_SAMPLING,
@@ -774,6 +918,13 @@ def correct_with_llm(
         "retries_used": 0,
         "rejections": [],
     }
+    if swappy_entry is not None:
+        stats["swappy"] = {
+            "key": swappy_entry.get("key"),
+            "slots": swappy_entry.get("slots"),
+            "context_per_request": swappy_entry.get("contextSize"),
+            "workers": workers,
+        }
 
     out_parts: list[str | None] = [None] * len(chunks)
     t0 = time.monotonic()

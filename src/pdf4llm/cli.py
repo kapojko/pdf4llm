@@ -114,8 +114,9 @@ def convert_cmd(
         None, "--pages", help="Page subset, e.g. '1,3,5-7' (useful for short LLM tests)"
     ),
     llm_workers: int = typer.Option(
-        1, "--llm-workers", min=1,
-        help="Parallel LLM chunk requests (server must allow concurrency; 1 = sequential)",
+        None, "--llm-workers", min=1,
+        help="Parallel LLM chunk requests. Default: auto from llama-swappy info "
+             "(min(slots, 4)), else 1. Explicit value overrides the server.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
@@ -157,11 +158,15 @@ def convert_cmd(
             )
             raise typer.Exit(3)
         text = md_path.read_text(encoding="utf-8")
-        text, llm_stats = llm.correct_with_llm(
-            text, model, endpoint, api_key, verbose=verbose,
-            sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
-            workers=llm_workers,
-        )
+        try:
+            text, llm_stats = llm.correct_with_llm(
+                text, model, endpoint, api_key, verbose=verbose,
+                sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
+                workers=llm_workers,
+            )
+        except llm.LlmContextError as e:
+            typer.echo(f"error: --llm aborted: {e}", err=True)
+            raise typer.Exit(4)
         md_path.write_text(text, encoding="utf-8")
         meta["llm"] = llm_stats
         meta["checks"] = checks.run_checks(text, meta["page_chars"])
