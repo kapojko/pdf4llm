@@ -18,6 +18,9 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $scriptDir
 try {
     Write-Host "Installing pdf4llm via `uv tool install` ..."
+    # drop only pdf4llm's cached build artifacts, so a version bump is picked
+    # up (uv otherwise reuses the cached wheel); nvidia wheels stay cached
+    uv cache clean pdf4llm | Out-Null
     $gpuArgs = if ($DirectML) {
         @("--with", "onnxruntime-directml>=1.20")
     } else {
