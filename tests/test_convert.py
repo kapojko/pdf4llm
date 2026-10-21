@@ -83,6 +83,28 @@ def test_chunk_markdown_sizes():
     assert len(chunks) > 1
 
 
+def test_fetch_models_empty_on_error():
+    from pdf4llm import config
+
+    assert config.fetch_models("http://127.0.0.1:1/models", "k") == []
+    assert config.fetch_models("", "k") == []
+
+
+def test_setup_llm_picks_model(tmp_path, monkeypatch):
+    import pdf4llm.cli as cli
+    from pdf4llm import config
+
+    monkeypatch.setattr(config, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(config, "fetch_models", lambda e, k: ["model-a", "model-b"])
+    answers = iter(["http://h/v1", "key", "2"])  # endpoint, key, pick #2
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    cli._setup_llm()
+
+    c = config.load_config()
+    assert c["model"] == "model-b"
+    assert c["endpoint"] == "http://h/v1"
+
+
 def test_score_penalizes_no_headings():
     from pdf4llm import checks
 

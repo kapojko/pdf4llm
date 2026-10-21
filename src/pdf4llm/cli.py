@@ -22,20 +22,41 @@ app = typer.Typer(no_args_is_help=True)
 
 
 def _setup_llm() -> None:
-    """Interactively set & save LLM credentials to the user config file."""
+    """Interactively set & save LLM credentials to the user config file.
+
+    Fetches the available model list from the endpoint (/v1/models) and lets
+    the user pick one; falls back to manual entry if the list can't be fetched.
+    """
     c = cfg.load_config()
     endpoint = input(
         f"endpoint (base url, e.g. http://127.0.0.1:11434/v1) "
         f"[{c.get('endpoint', '')}]: "
     ).strip()
     api_key = input(f"api key [{c.get('api_key', '')}]: ").strip()
-    model = input(f"model name [{c.get('model', '')}]: ").strip()
     if endpoint:
         c["endpoint"] = endpoint
     if api_key:
         c["api_key"] = api_key
+
+    endpoint = c.get("endpoint", "")
+    api_key = c.get("api_key", "")
+    models = cfg.fetch_models(endpoint, api_key)
+    model = ""
+    if models:
+        typer.echo("Available models:")
+        for i, m in enumerate(models, 1):
+            typer.echo(f"  {i}. {m}")
+        choice = input(f"Select model [1-{len(models)}] (or type a name): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            model = models[int(choice) - 1]
+        else:
+            model = choice
+    else:
+        typer.echo("Could not fetch model list — enter the model name manually.")
+        model = input(f"model name [{c.get('model', '')}]: ").strip()
     if model:
         c["model"] = model
+
     path = cfg.save_config(c)
     typer.echo(
         f"LLM config saved to {path}  "

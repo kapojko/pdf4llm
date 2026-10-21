@@ -40,6 +40,34 @@ def save_config(cfg: dict) -> Path:
     return p
 
 
+def fetch_models(endpoint: str, api_key: str) -> list[str]:
+    """Fetch available model ids from an OpenAI-compatible /v1/models endpoint.
+
+    Returns an empty list on any error so the caller can fall back to manual
+    input.
+    """
+    if not endpoint:
+        return []
+    url = endpoint.rstrip("/") + "/models"
+    try:
+        import requests
+
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return []
+        return [
+            it["id"]
+            for it in items
+            if isinstance(it, dict) and it.get("id")
+        ]
+    except Exception:
+        return []
+
+
 def mask(value: str) -> str:
     """Mask an API key for display."""
     if not value:
