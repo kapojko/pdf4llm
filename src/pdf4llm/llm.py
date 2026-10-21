@@ -24,13 +24,36 @@ from __future__ import annotations
 
 import difflib
 import re
+import time
 
 # ---------------------------------------------------------------------------
-# Deterministic pre-pass: bullet deduplication (no LLM involved).
-# PDF extraction often emits BOTH a Markdown '-' marker and the original
-# '•' glyph. Removing a duplicated bullet is structural, not content, so it
-# is done deterministically instead of being trusted to the model.
+# Deterministic pre-passes (no LLM involved).
 # ---------------------------------------------------------------------------
+
+_HR_LINE_RE = re.compile(r"(?m)^\s*(?:-{3,}|\*{3,}|_{3,})\s*\n")
+
+
+def _is_hr_line(line: str) -> bool:
+    """True for standalone horizontal-rule lines ('---', '***', '___').
+
+    A '|' anywhere means it is a table row (e.g. a single-cell delimiter
+    '| --- |'), which must never be stripped.
+    """
+    return "|" not in line and bool(re.fullmatch(r"\s*(?:-{3,}|\*{3,}|_{3,})\s*", line))
+
+
+def strip_horizontal_rules(text: str) -> tuple[str, int]:
+    """Remove standalone horizontal-rule lines (PDF page-break artifacts).
+
+    Must run BEFORE the LLM pass: models reliably try to delete them, which
+    is a content change and would poison whole chunks. Stripping first means
+    the model never sees them. Only lines consisting solely of dashes/
+    asterisks/underscores are removed; nothing inside tables or text.
+    Returns (text, removed_count).
+    """
+    out, n = _HR_LINE_RE.subn("", text)
+    return out, n
+
 
 _BULLET_LEAD_RE = re.compile(r"(?m)^(\s*[-*+])\s+[•\u2022]\s+")
 _BULLET_TRAIL_RE = re.compile(r"(?m)^(\s*[-*+].*?)\s+[•\u2022]\s*$")
@@ -41,6 +64,71 @@ def dedupe_bullets(text: str) -> str:
     text = _BULLET_LEAD_RE.sub(r"\1 ", text)
     text = _BULLET_TRAIL_RE.sub(r"\1", text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-pass: subscript normalisation (no LLM involved).
+# PDF extraction flattens V_CC to 'V CC', T_amb to 'T amb', t_pd to 't pd'.
+# Normalised forms: established uppercase terms are joined ('V CC' -> 'VCC',
+# 'V IH' -> 'VIH', 't PLH' -> 'tPLH'); everything else gets an underscore
+# ('T amb' -> 'T_amb', 'C L' -> 'C_L', 'I IK' -> 'I_IK', 'Q n+1' -> 'Q_n+1').
+# Deterministic + guarded: prefix/suffix whitelists, English-stopword filter,
+# so prose like 'I do' or 'a few' can never be rewritten.
+# ---------------------------------------------------------------------------
+
+_SUB_PAIR_RE = re.compile(r"(?<![A-Za-z_\-])([A-Za-z]) ([A-Za-z][A-Za-z0-9+]{0,3}(?:\+\d+)?)\b")
+
+# prefixes that are established quantity symbols in datasheets (never English
+# words on their own). 'I' (current) and 'V' (voltage) collide with the
+# pronoun/numeral readings, so 'I' is restricted below and handled via
+# underscore form only.
+_SUB_PREFIXES = set("VTPCRQtfLNM")
+
+# English words a subscript suffix must never collide with (lowercase form).
+_SUB_STOPWORDS = {
+    "a", "an", "am", "and", "any", "are", "as", "at", "be", "but", "by",
+    "can", "do", "due", "few", "for", "from", "had", "has", "he", "her",
+    "him", "his", "how", "if", "in", "is", "it", "its", "may", "me",
+    "my", "no", "not", "now", "of", "on", "one", "only", "or", "our",
+    "out", "per", "so", "sub", "such", "than", "that", "the", "their",
+    "them", "then", "there", "these", "they", "this", "to", "two", "up",
+    "us", "use", "was", "way", "we", "were", "what", "when", "which",
+    "who", "why", "will", "with", "you", "your",
+}
+
+
+def _sub_form(prefix: str, suffix: str) -> str | None:
+    """Return the normalised 'prefix_suffix' token, or None if not safe."""
+    if prefix not in _SUB_PREFIXES and prefix != "I":
+        return None  # prefix is not a known quantity symbol -> leave alone
+    if prefix in {"A", "a", "i"}:
+        return None  # article/pronoun readings dominate
+    if suffix.lower() in _SUB_STOPWORDS:
+        return None
+    if prefix == "I":
+        # current symbol; joining I+IK -> 'IIK' is unreadable, and 'I' is the
+        # English pronoun -> underscore form only
+        return f"{prefix}_{suffix}"
+    if suffix.isupper() and len(suffix) >= 2:
+        # established compact terms: V CC -> VCC, V IH -> VIH, t PLH -> tPLH
+        return f"{prefix}{suffix}"
+    # mixed/lowercase or single-letter suffixes: T amb -> T_amb, C L -> C_L
+    return f"{prefix}_{suffix}"
+
+
+def fix_subscripts(text: str) -> tuple[str, int]:
+    """Normalise flattened subscripts. Returns (text, replacement_count)."""
+    count = 0
+
+    def repl(m: re.Match) -> str:
+        nonlocal count
+        form = _sub_form(m.group(1), m.group(2))
+        if form is None:
+            return m.group(0)
+        count += 1
+        return form
+
+    return _SUB_PAIR_RE.sub(repl, text), count
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +289,9 @@ ALLOWED ONLY:
     (or with nothing where two word halves join).
 FORBIDDEN:
 - adding, deleting, reordering or changing ANY non-whitespace character;
+- removing or altering horizontal rule lines ('---' on its own line) — keep
+  them byte-identical;
+- changing the spacing around em/en dashes ('—', '–') — keep it as-is;
 - translating, rephrasing, summarising, "improving" grammar or spelling;
 - changing the number of lines that start with '|' (table rows) or the number
   of '|' characters in them;
@@ -210,11 +301,10 @@ Return ONLY the corrected Markdown, nothing else."""
 
 TECHNICAL_SYSTEM_PROMPT = (
     "The text comes from an electronic component datasheet or microcontroller "
-    "reference manual. PDF extraction left false spaces inside words and "
-    "subscripts.\n"
+    "reference manual. PDF extraction left false spaces inside words.\n"
     "Typical fixes in this domain: 'D-t yp e' -> 'D-type', 'fli p -flo p' -> "
-    "'flip-flop', 'V CC' -> 'VCC', 'T amb' -> 'Tamb', 'Q n+1' -> 'Qn+1', "
-    "'SOT108 - 1' -> 'SOT108-1', 'Orderin g' -> 'Ordering'.\n"
+    "'flip-flop', 'Orderin g' -> 'Ordering'. Subscripts like 'VCC', 'T_amb', "
+    "'C_L' are already normalised — never change or move underscores ('_').\n"
     "Register values, pin numbers, voltages, timings and part numbers are "
     "sacrosanct: never let two numbers or a number and a symbol merge "
     "('2 0' must NOT become '20', '0.5 V' must stay '0.5 V').\n"
@@ -273,6 +363,8 @@ def _join_allowed(left: str, right: str) -> bool:
     if left.isalpha() and right in ".,;:!?)":        # 'V CC .' -> 'VCC.'
         return True
     if left in "([{" and right.isalnum():            # '( nD)' -> '(nD)'
+        return True
+    if left in "\u2014\u2013" or right in "\u2014\u2013":  # around em/en dashes
         return True
     return False
 
@@ -359,6 +451,18 @@ def _verify_chunk(orig: str, out: str) -> str | None:
 # Correction pass
 # ---------------------------------------------------------------------------
 
+def _fmt_duration(seconds: float) -> str:
+    """Human-readable duration: 42s, 6m05s, 1h02m."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{sec:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
 def _split_sampling(sampling: dict) -> tuple[dict, dict]:
     """Split sampling config into litellm standard kwargs vs extra_body."""
     std = {k: v for k, v in sampling.items() if k in _STANDARD_SAMPLING_KEYS}
@@ -407,6 +511,38 @@ def _verify_line_in_context(o_lines: list[str], idx: int, c_line: str) -> str | 
     return _check_whitespace_edit(ctx_o, ctx_c)
 
 
+def _pair_by_similarity(o_blk: list[str], c_blk: list[str],
+                        min_ratio: float = 0.55) -> dict[int, int]:
+    """Greedy 1:1 pairing of orig lines to candidate lines by similarity.
+
+    Used when line counts differ (model deleted/merged a line, e.g. a '---'
+    horizontal rule): the shift must not cost us every following row.
+    Returns {orig_index_within_block: cand_index_within_block}.
+    """
+    scored: list[tuple[float, int, int]] = []
+    for i, ol in enumerate(o_blk):
+        for j, cl in enumerate(c_blk):
+            if ol == cl:
+                r = 1.0
+            elif not ol.strip() or not cl.strip():
+                continue
+            else:
+                r = difflib.SequenceMatcher(None, ol, cl).ratio()
+            if r >= min_ratio:
+                scored.append((r, i, j))
+    scored.sort(reverse=True)
+    pairs: dict[int, int] = {}
+    used_o: set[int] = set()
+    used_c: set[int] = set()
+    for r, i, j in scored:
+        if i in used_o or j in used_c:
+            continue
+        pairs[i] = j
+        used_o.add(i)
+        used_c.add(j)
+    return pairs
+
+
 def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
     """Line/block-level salvage from a rejected candidate.
 
@@ -450,17 +586,38 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
                     reasons.append(reason)
                     out_lines.append(o_line)
         else:
-            total += 1
+            # unequal line counts: first try the block as a whole (this handles
+            # legitimate false-line-break joins); if that fails, pair rows by
+            # similarity so one deleted line does not poison the whole block
             o_text = "\n".join(o_blk)
             c_text = "\n".join(c_blk)
-            reason = _verify_chunk(o_text, c_text) if c_text.strip() else "empty"
-            if c_text.strip() and reason is None:
+            if c_text.strip() and _verify_chunk(o_text, c_text) is None:
                 out_lines.extend(c_blk)
                 fixed += 1
-            else:
-                if reason and reason != "empty":
+                total += 1
+                continue
+            pairs = _pair_by_similarity(o_blk, c_blk)
+            for k, o_line in enumerate(o_blk):
+                j = pairs.get(k)
+                c_line = c_blk[j] if j is not None else None
+                if c_line is None or o_line == c_line:
+                    out_lines.append(o_line)
+                    continue
+                total += 1
+                if not c_line.strip():
+                    out_lines.append(o_line)
+                    continue
+                abs_idx = i1 + k
+                if o_line.lstrip().startswith("|") or c_line.lstrip().startswith("|"):
+                    reason = _verify_chunk(o_line, c_line)
+                else:
+                    reason = _verify_line_in_context(o_lines, abs_idx, c_line)
+                if reason is None:
+                    out_lines.append(c_line)
+                    fixed += 1
+                else:
                     reasons.append(reason)
-                out_lines.extend(o_blk)
+                    out_lines.append(o_line)
     return "\n".join(out_lines), fixed, total, reasons
 
 
@@ -473,7 +630,7 @@ def correct_with_llm(
     max_chars: int = 6000,
     classify: bool = True,
     sampling: dict | None = None,
-    retries: int = 1,
+    retries: int = 2,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass.
 
@@ -485,6 +642,7 @@ def correct_with_llm(
     kept as the original — rejection is always safe, never silent.
     """
     text = dedupe_bullets(text)
+    text, hr_removed = strip_horizontal_rules(text)
 
     is_technical, source = (True, "heuristic")
     if classify:
@@ -492,10 +650,14 @@ def correct_with_llm(
             text, model, endpoint, api_key, sampling=sampling
         )
     system_prompt = TECHNICAL_SYSTEM_PROMPT if is_technical else GENERAL_SYSTEM_PROMPT
+    sub_count = 0
+    if is_technical:
+        text, sub_count = fix_subscripts(text)
     if verbose:
         print(
             f"  llm: document classified {'technical' if is_technical else 'general'} "
             f"({source})"
+            + (f"; {sub_count} subscripts normalised" if sub_count else "")
         )
 
     chunks = chunk_markdown(text, max_chars)
@@ -506,6 +668,8 @@ def correct_with_llm(
             "technical": is_technical,
             "source": source,
         },
+        "subscripts_normalised": sub_count,
+        "horizontal_rules_removed": hr_removed,
         "chunks_total": len(chunks),
         "chunks_accepted": 0,
         "chunks_salvaged": 0,
@@ -516,9 +680,13 @@ def correct_with_llm(
     }
 
     out_parts: list[str] = []
+    t0 = time.monotonic()
+    chunk_durations: list[float] = []
     for i, (chunk, sep) in enumerate(chunks, 1):
-        if verbose:
-            print(f"  llm: chunk {i}/{len(chunks)} ({len(chunk)} chars) ...")
+        # unconditional progress: the LLM pass is slow and the user must see
+        # that it is alive, with an ETA based on the average chunk so far
+        print(f"  llm: chunk {i}/{len(chunks)} ({len(chunk)} chars) ...", flush=True)
+        chunk_start = time.monotonic()
         best: str | None = None      # verified-safe version of this chunk
         best_fixed = -1
         chunk_rejections: list[str] = []
@@ -561,5 +729,15 @@ def correct_with_llm(
             stats["blocks_fixed"] += best_fixed
             out_parts.append(best + sep)
         stats["retries_used"] += max(0, n_calls - 1)
+        chunk_durations.append(time.monotonic() - chunk_start)
+        if i < len(chunks):
+            eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
+            print(
+                f"  llm: chunk {i}/{len(chunks)} done in "
+                f"{_fmt_duration(chunk_durations[-1])}  |  elapsed "
+                f"{_fmt_duration(time.monotonic() - t0)}  |  "
+                f"eta ~{_fmt_duration(eta)}",
+                flush=True,
+            )
 
     return "".join(out_parts), stats

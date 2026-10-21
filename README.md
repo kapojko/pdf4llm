@@ -99,7 +99,7 @@ Saved to the user config dir (Windows: `%APPDATA%\pdf4llm\config.json`,
 POSIX: `~/.config/pdf4llm\config.json`) as `{endpoint, api_key, model}`.
 Optional keys: `llm_sampling` (dict forwarded to the model; defaults to the
 Ornith-1.5-9B card's precise-coding set: `temperature 0.6, top_p 0.95,
-top_k 20, min_p 0.0, presence_penalty 0.0`) and `llm_retries` (default 1).
+top_k 20, min_p 0.0, presence_penalty 0.0`) and `llm_retries` (default 2).
 Then:
 
 ```powershell

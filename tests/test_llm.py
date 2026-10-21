@@ -316,3 +316,85 @@ def test_split_sampling_standard_vs_extra():
     assert std["temperature"] == 0.6
     assert "top_k" in extra and "min_p" in extra
     assert "top_k" not in std
+
+
+# ---------------------------------------------------------------------------
+# deterministic subscript normalisation
+# ---------------------------------------------------------------------------
+
+def test_fix_subscripts_joins_established_terms():
+    text = "in excess of V CC . | V IH | V IL | t PLH |"
+    out, n = llm.fix_subscripts(text)
+    assert "VCC" in out and "VIH" in out and "VIL" in out and "tPLH" in out
+    assert n == 4
+
+
+def test_fix_subscripts_underscore_for_mixed_suffixes():
+    text = "T amb  = -40 ; P tot ; t pd ; C L ; R L ; Q n+1"
+    out, n = llm.fix_subscripts(text)
+    assert "T_amb" in out and "P_tot" in out and "t_pd" in out
+    assert "C_L" in out and "R_L" in out and "Q_n+1" in out
+    assert n == 6
+
+
+def test_fix_subscripts_current_symbol_uses_underscore():
+    # I+IK joined would read 'IIK' — unreadable, so underscore form
+    out, n = llm.fix_subscripts("| I IK | input clamping current | I O |")
+    assert "I_IK" in out and "I_O" in out and n == 2
+
+
+def test_fix_subscripts_never_rewrites_prose():
+    text = "as I do here; a few words; I am; the use of it; V to 5 V"
+    out, _n = llm.fix_subscripts(text)
+    assert out == text
+
+
+def test_fix_subscripts_digit_prefixed_pair():
+    out, n = llm.fix_subscripts("exceeds 0.5V CC margin")
+    assert "0.5VCC" in out and n == 1
+
+
+def test_fix_subscripts_never_touches_split_words():
+    # 'D-t yp e' is a hyphenated word fragment, not a 't yp' subscript
+    out, n = llm.fix_subscripts("Dual D-t yp e fli p -flo p")
+    assert "t_yp" not in out
+    assert out == "Dual D-t yp e fli p -flo p" and n == 0
+
+
+def test_fix_subscripts_part_numbers_untouched():
+    text = "74HC74D 74HCT74D SOT108 - 1 2 mm x 2 mm"
+    out, _n = llm.fix_subscripts(text)
+    assert out == text
+
+
+def test_strip_horizontal_rules():
+    src = "A\n\n---\n\nB\n***\nC\n ___ \nD\n| --- | \nE"
+    out, n = llm.strip_horizontal_rules(src)
+    assert n == 3
+    hr_lines = [l for l in out.split("\n") if llm._is_hr_line(l)]
+    assert hr_lines == []           # standalone rules gone
+    assert "| --- |" in out         # table delimiter row must survive
+    assert out == "A\nB\nC\nD\n| --- | \nE"
+
+
+# ---------------------------------------------------------------------------
+# similarity-based salvage (survives model deleting lines like '---')
+# ---------------------------------------------------------------------------
+
+def test_salvage_survives_deleted_horizontal_rule():
+    orig = "---\n\n| V CC | 14 | supply voltage |\n| 2RD | 13 | reset |\n\n---"
+    # model deleted the FIRST '---' but fixed cells
+    cand = "\n| VCC | 14 | supply voltage |\n| 2RD | 13 | reset |\n\n---"
+    salvaged, fixed, _total, _r = llm._salvage(orig, cand)
+    assert "---" in salvaged                     # rule preserved from orig
+    assert "| VCC | 14 | supply voltage |" in salvaged  # good row fix applied
+    assert "| 2RD | 13 | reset |" in salvaged
+    assert fixed >= 1  # one row genuinely changed (the other was identical)
+
+
+def test_salvage_line_join_still_works():
+    orig = "text that was\nfalsely split\nend"
+    cand = "text that was falsely split\nend"
+    salvaged, fixed, _total, _ = llm._salvage(orig, cand)
+    assert fixed == 1
+    assert salvaged == "text that was falsely split\nend"

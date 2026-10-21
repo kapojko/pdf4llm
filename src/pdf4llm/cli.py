@@ -155,7 +155,7 @@ def convert_cmd(
         text = md_path.read_text(encoding="utf-8")
         text, llm_stats = llm.correct_with_llm(
             text, model, endpoint, api_key, verbose=verbose,
-            sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 1)),
+            sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
         )
         md_path.write_text(text, encoding="utf-8")
         meta["llm"] = llm_stats
