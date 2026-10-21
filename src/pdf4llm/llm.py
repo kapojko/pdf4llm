@@ -692,6 +692,8 @@ def _run_chunk(
     chunk_rejections: list[str] = []
     n_calls = 0
     truncated = 0
+    last_cand_empty = False      # last attempt produced no usable text
+    last_salvage_total = 0       # differing blocks the last salvage examined
 
     for attempt in range(1 + max(0, retries)):
         hint = chunk_rejections[-1] if (attempt and chunk_rejections) else None
@@ -705,6 +707,7 @@ def _run_chunk(
             chunk_rejections.append(f"llm error: {type(e).__name__}: {e}"[:200])
             continue
         candidate = _strip_thinking(candidate)
+        last_cand_empty = not candidate.strip()
         if finish == "length":
             truncated += 1
             chunk_rejections.append(
@@ -714,6 +717,7 @@ def _run_chunk(
             best, best_fixed = candidate, 1 << 30  # whole chunk verified
             break
         salvaged, fixed, n_total, reasons = _salvage(chunk, candidate)
+        last_salvage_total = n_total
         chunk_rejections.extend(reasons[:3])
         if fixed > best_fixed:
             best, best_fixed = salvaged, fixed
@@ -722,13 +726,27 @@ def _run_chunk(
 
     if best is None or best_fixed <= 0:
         result = chunk + sep
+        if chunk_rejections:
+            reason = "; ".join(chunk_rejections[:3])
+        elif last_cand_empty:
+            # all attempts returned nothing usable after thinking-strip
+            reason = "empty model output"
+        else:
+            # output looked plausible but diverged so far from the input
+            # (dropped/reworded lines) that nothing was pairable or verifiable
+            if last_salvage_total:
+                reason = (f"candidate rewrite beyond salvage: 0 of {last_salvage_total} "
+                          "differing block(s) verifiable")
+            else:
+                reason = ("candidate rewrite beyond salvage: no line could be "
+                          "paired to a verifiable edit (dropped/reworded lines?)")
         delta = {
             "index": idx,
             "rejected": True,
             "blocks_fixed": 0,
             "rejection": {
                 "chunk": idx,
-                "reason": "; ".join(chunk_rejections[:3]) or "no usable output",
+                "reason": reason or "no usable output",
                 "preview": chunk[:120],
             },
         }
