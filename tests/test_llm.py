@@ -1,6 +1,7 @@
 """Offline tests for the LLM correction pass: chunking, verifier, classifiers.
 
-No network access needed — only the pure functions are exercised.
+No network access needed — only the pure functions are exercised (the parallel
+--llm-workers path is tested with a stubbed _call_llm).
 """
 import importlib
 
@@ -305,6 +306,155 @@ def test_salvage_empty_candidate_keeps_original():
     orig = "line one\nline two"
     salvaged, fixed, _total, _ = llm._salvage(orig, "")
     assert salvaged == orig and fixed == 0
+
+
+# ---------------------------------------------------------------------------
+# parallel chunk processing (--llm-workers > 1)
+# ---------------------------------------------------------------------------
+
+PAR_TEXT = (
+    "## 1. General description\n"
+    "\n"
+    "The 74HC74 is a dual D-t yp e fli p -flo p with V CC supply.\n"
+    "\n"
+    "## 2. Features\n"
+    "\n"
+    "Wide supply voltage range from 2.0 to 6.0 V.\n"
+    "\n"
+    "## 3. Ordering information\n"
+    "\n"
+    "Orderin g code SOT108 - 1.\n"
+    "\n"
+    "## 4. Applications\n"
+    "\n"
+    "Logic design and fli p -flo p applications.\n"
+    "\n"
+    "## 5. Revision history\n"
+    "\n"
+    "Rev. 9 — 2 April 2024.\n"
+)
+
+
+def _fixed(chunk: str) -> str:
+    """A realistic 'model' answer: safe whitespace-only fixes."""
+    return (chunk
+            .replace("D-t yp e", "D-type")
+            .replace("fli p -flo p", "flip-flop")
+            .replace("V CC", "VCC")
+            .replace("Orderin g", "Ordering")
+            .replace("SOT108 - 1", "SOT108-1"))
+
+
+def _prep(text: str) -> str:
+    """Mirror correct_with_llm's deterministic pre-passes (classify=False path)."""
+    text, _ = llm.strip_horizontal_rules(llm.dedupe_bullets(text))
+    text, _ = llm.fix_subscripts(text)
+    return text
+
+
+# small max_chars so PAR_TEXT splits into several chunks
+MAXC = 80
+
+
+def test_parallel_reassembles_in_order_and_merges_stats(monkeypatch):
+    calls: list[str] = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        return _fixed(chunk)
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+
+    out, stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False,
+        classify=False, max_chars=MAXC, workers=3,
+    )
+    # reassembly is exact and in original order (nothing lost/reordered)
+    assert out == _fixed(_prep(PAR_TEXT))
+    assert len(calls) == stats["chunks_total"] > 2
+    assert stats["chunks_accepted"] == stats["chunks_total"]
+    assert stats["chunks_rejected"] == 0 and stats["chunks_salvaged"] == 0
+    assert stats["retries_used"] == 0 and stats["rejections"] == []
+
+
+def test_parallel_output_identical_to_sequential(monkeypatch):
+    def fake_call(system_prompt, chunk, model, endpoint, api_key,
+                  max_tokens, sampling=None, retry_hint=None):
+        # first attempt 'hallucinates' -> exercises salvage; retry hint path
+        if retry_hint is None and "Ordering" in chunk:
+            return chunk + " extra hallucinated content"
+        return _fixed(chunk)
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    out1, stats1 = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False,
+        classify=False, max_chars=MAXC, retries=2, workers=1)
+    out4, stats4 = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False,
+        classify=False, max_chars=MAXC, retries=2, workers=4)
+    assert out1 == out4 == _fixed(_prep(PAR_TEXT))
+    for key in ("chunks_total", "chunks_accepted", "chunks_salvaged",
+                "chunks_rejected", "blocks_fixed", "retries_used"):
+        assert stats1[key] == stats4[key], key
+
+
+def test_parallel_completions_out_of_order_still_ordered(monkeypatch):
+    import threading
+    import time as _time
+
+    order: list[int] = []
+    order_lock = threading.Lock()
+    # chunk -> 1-based index, mirroring the pipeline's pre-processing so the
+    # stub can look up which chunk it got (works whatever the chunking does)
+    chunk_idx = {c: i for i, (c, _s) in
+                 enumerate(llm.chunk_markdown(_prep(PAR_TEXT), MAXC), 1)}
+
+    def fake_call(system_prompt, chunk, model, endpoint, api_key,
+                  max_tokens, sampling=None, retry_hint=None):
+        # make LATER chunks finish FIRST so completion order != chunk order
+        delay = max(1.0 - 0.15 * chunk_idx[chunk], 0.05)
+        _time.sleep(delay)
+        with order_lock:
+            order.append(chunk_idx[chunk])
+        return _fixed(chunk)
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    out, stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False,
+        classify=False, max_chars=MAXC, workers=5)
+    assert out == _fixed(_prep(PAR_TEXT))   # output still in original order
+    assert sorted(order) == list(range(1, stats["chunks_total"] + 1))
+
+
+def test_parallel_rejections_carry_chunk_indices(monkeypatch):
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "totally unrelated hallucinated text"  # invariant A fails,
+        # salvage yields nothing -> rejected, original kept
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    out, stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False,
+        classify=False, max_chars=MAXC, retries=1, workers=2)
+    assert out == _prep(PAR_TEXT)           # every original kept verbatim
+    assert stats["chunks_rejected"] == stats["chunks_total"]
+    idxs = sorted(r["chunk"] for r in stats["rejections"])
+    assert idxs == list(range(1, stats["chunks_total"] + 1))
+
+
+def test_workers_default_is_one(monkeypatch):
+    # workers=1 must take the sequential path (exact current behaviour)
+    seen = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        seen.append(chunk)
+        return chunk
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    out, stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False, classify=False,
+        max_chars=MAXC)
+    assert stats["chunks_accepted"] == stats["chunks_total"]
+    assert out == _prep(PAR_TEXT)
 
 
 # ---------------------------------------------------------------------------

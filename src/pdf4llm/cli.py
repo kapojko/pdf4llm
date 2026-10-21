@@ -113,6 +113,10 @@ def convert_cmd(
     pages: str = typer.Option(
         None, "--pages", help="Page subset, e.g. '1,3,5-7' (useful for short LLM tests)"
     ),
+    llm_workers: int = typer.Option(
+        1, "--llm-workers", min=1,
+        help="Parallel LLM chunk requests (server must allow concurrency; 1 = sequential)",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Convert one PDF to LLM-readable Markdown with a sanity score."""
@@ -156,6 +160,7 @@ def convert_cmd(
         text, llm_stats = llm.correct_with_llm(
             text, model, endpoint, api_key, verbose=verbose,
             sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
+            workers=llm_workers,
         )
         md_path.write_text(text, encoding="utf-8")
         meta["llm"] = llm_stats

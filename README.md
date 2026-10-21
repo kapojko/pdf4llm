@@ -40,6 +40,7 @@ pdf4llm <input.pdf> [options]
 | `-o/--out DIR` | output dir, **default = same folder as the PDF** |
 | `--pages A-B,12,15` | page subset (useful for short LLM tests) |
 | `--llm` | run local-LLM broken-text correction (default **off**) |
+| `--llm-workers N` | parallel LLM chunk requests, N ≥ 1 (default **1** = sequential; the server must allow concurrency, e.g. llama-server `-np 4`) |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
@@ -105,6 +106,14 @@ Then:
 ```powershell
 pdf4llm <file.pdf> --llm --pages 1-10
 ```
+
+Chunks are processed one after another by default. `--llm-workers N` sends up
+to N chunk requests in parallel (ThreadPoolExecutor; litellm calls are
+thread-safe) — with a llama-server started with `-np 4` this cuts the LLM pass
+to roughly a quarter of the sequential time. Safety is unaffected: every chunk
+still goes through the same verify → salvage → retry pipeline, chunks are
+independent and the output is reassembled strictly in original chunk order,
+so the result and the meta.json stats are identical to the sequential run.
 
 `litellm` is the pluggable client — it works with Ollama, llama.cpp
 (llama-server), or any OpenAI-compatible endpoint.

@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import difflib
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Deterministic pre-passes (no LLM involved).
@@ -621,6 +623,94 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
     return "\n".join(out_lines), fixed, total, reasons
 
 
+def _run_chunk(
+    idx: int,
+    total: int,
+    chunk: str,
+    sep: str,
+    system_prompt: str,
+    model: str,
+    endpoint: str,
+    api_key: str,
+    max_tokens: int,
+    sampling: dict | None,
+    retries: int,
+) -> tuple[str, dict]:
+    """Process ONE chunk: call -> verify -> accept / salvage -> bounded retries.
+
+    This is the whole per-chunk logic, shared by the sequential and the
+    parallel path — the safety architecture (per-chunk verification with
+    invariants A/B/C, then salvage, then hinted retries) is identical no
+    matter how many workers run. Chunks are independent: the result text is
+    ``verified_chunk + sep`` so reassembly is exact concatenation.
+
+    Returns (result_text, per-chunk stats delta).
+    """
+    print(f"  llm: chunk {idx}/{total} ({len(chunk)} chars) ...", flush=True)
+    chunk_start = time.monotonic()
+    best: str | None = None      # verified-safe version of this chunk
+    best_fixed = -1
+    chunk_rejections: list[str] = []
+    n_calls = 0
+
+    for attempt in range(1 + max(0, retries)):
+        hint = chunk_rejections[-1] if (attempt and chunk_rejections) else None
+        try:
+            candidate = _call_llm(
+                system_prompt, chunk, model, endpoint, api_key,
+                max_tokens=max_tokens, sampling=sampling, retry_hint=hint,
+            )
+            n_calls += 1
+        except Exception as e:  # network/model error -> keep original
+            chunk_rejections.append(f"llm error: {type(e).__name__}: {e}"[:200])
+            continue
+        if _verify_chunk(chunk, candidate) is None:
+            best, best_fixed = candidate, 1 << 30  # whole chunk verified
+            break
+        salvaged, fixed, n_total, reasons = _salvage(chunk, candidate)
+        chunk_rejections.extend(reasons[:3])
+        if fixed > best_fixed:
+            best, best_fixed = salvaged, fixed
+        if fixed >= n_total:  # every differing block verified -> done
+            break
+
+    if best is None or best_fixed <= 0:
+        result = chunk + sep
+        delta = {
+            "index": idx,
+            "rejected": True,
+            "blocks_fixed": 0,
+            "rejection": {
+                "chunk": idx,
+                "reason": "; ".join(chunk_rejections[:3]) or "no usable output",
+                "preview": chunk[:120],
+            },
+        }
+    elif best_fixed >= (1 << 30):
+        result = best + sep
+        delta = {"index": idx, "accepted": True, "blocks_fixed": 0, "rejection": None}
+    else:
+        result = best + sep
+        delta = {"index": idx, "salvaged": True, "blocks_fixed": best_fixed,
+                 "rejection": None}
+    delta["retries_used"] = max(0, n_calls - 1)
+    delta["duration"] = time.monotonic() - chunk_start
+    return result, delta
+
+
+def _apply_chunk_delta(stats: dict, delta: dict) -> None:
+    """Merge one chunk's stats delta into the global stats dict."""
+    if delta.get("accepted"):
+        stats["chunks_accepted"] += 1
+    elif delta.get("salvaged"):
+        stats["chunks_salvaged"] += 1
+        stats["blocks_fixed"] += delta["blocks_fixed"]
+    elif delta.get("rejected"):
+        stats["chunks_rejected"] += 1
+        stats["rejections"].append(delta["rejection"])
+    stats["retries_used"] += delta["retries_used"]
+
+
 def correct_with_llm(
     text: str,
     model: str,
@@ -631,6 +721,7 @@ def correct_with_llm(
     classify: bool = True,
     sampling: dict | None = None,
     retries: int = 2,
+    workers: int = 1,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass.
 
@@ -640,6 +731,11 @@ def correct_with_llm(
     applied); ``retries`` bounded regeneration attempts may follow, keeping
     the attempt that fixes the most blocks. Whatever fails verification is
     kept as the original — rejection is always safe, never silent.
+
+    ``workers`` > 1 processes chunks concurrently (ThreadPoolExecutor,
+    litellm calls are thread-safe). Safety is unaffected: every chunk still
+    goes through the same verify/salvage/retry pipeline, chunks are
+    independent and the output is reassembled strictly in original order.
     """
     text = dedupe_bullets(text)
     text, hr_removed = strip_horizontal_rules(text)
@@ -679,65 +775,68 @@ def correct_with_llm(
         "rejections": [],
     }
 
-    out_parts: list[str] = []
+    out_parts: list[str | None] = [None] * len(chunks)
     t0 = time.monotonic()
-    chunk_durations: list[float] = []
-    for i, (chunk, sep) in enumerate(chunks, 1):
-        # unconditional progress: the LLM pass is slow and the user must see
-        # that it is alive, with an ETA based on the average chunk so far
-        print(f"  llm: chunk {i}/{len(chunks)} ({len(chunk)} chars) ...", flush=True)
-        chunk_start = time.monotonic()
-        best: str | None = None      # verified-safe version of this chunk
-        best_fixed = -1
-        chunk_rejections: list[str] = []
-        n_calls = 0
 
-        for attempt in range(1 + max(0, retries)):
-            hint = chunk_rejections[-1] if (attempt and chunk_rejections) else None
-            try:
-                candidate = _call_llm(
-                    system_prompt, chunk, model, endpoint, api_key,
-                    max_tokens=max_chars * 2, sampling=sampling, retry_hint=hint,
-                )
-                n_calls += 1
-            except Exception as e:  # network/model error -> keep original
-                chunk_rejections.append(f"llm error: {type(e).__name__}: {e}"[:200])
-                continue
-            if _verify_chunk(chunk, candidate) is None:
-                best, best_fixed = candidate, 1 << 30  # whole chunk verified
-                break
-            salvaged, fixed, total, reasons = _salvage(chunk, candidate)
-            chunk_rejections.extend(reasons[:3])
-            if fixed > best_fixed:
-                best, best_fixed = salvaged, fixed
-            if fixed >= total:  # every differing block verified -> done
-                break
-
-        if best is None or best_fixed <= 0:
-            stats["chunks_rejected"] += 1
-            stats["rejections"].append(
-                {"chunk": i,
-                 "reason": "; ".join(chunk_rejections[:3]) or "no usable output",
-                 "preview": chunk[:120]}
+    if workers <= 1:
+        # Sequential path: exactly the original behaviour, including prints.
+        chunk_durations: list[float] = []
+        for i, (chunk, sep) in enumerate(chunks, 1):
+            result, delta = _run_chunk(
+                i, len(chunks), chunk, sep, system_prompt, model, endpoint,
+                api_key, max_chars * 2, sampling, retries,
             )
-            out_parts.append(chunk + sep)
-        elif best_fixed >= (1 << 30):
-            stats["chunks_accepted"] += 1
-            out_parts.append(best + sep)
-        else:
-            stats["chunks_salvaged"] += 1
-            stats["blocks_fixed"] += best_fixed
-            out_parts.append(best + sep)
-        stats["retries_used"] += max(0, n_calls - 1)
-        chunk_durations.append(time.monotonic() - chunk_start)
-        if i < len(chunks):
-            eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
+            out_parts[i - 1] = result
+            _apply_chunk_delta(stats, delta)
+            chunk_durations.append(delta["duration"])
+            # unconditional progress: the LLM pass is slow and the user must
+            # see that it is alive, with an ETA based on the avg chunk so far
+            if i < len(chunks):
+                eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
+                print(
+                    f"  llm: chunk {i}/{len(chunks)} done in "
+                    f"{_fmt_duration(delta['duration'])}  |  elapsed "
+                    f"{_fmt_duration(time.monotonic() - t0)}  |  "
+                    f"eta ~{_fmt_duration(eta)}",
+                    flush=True,
+                )
+    else:
+        # Parallel path: ThreadPoolExecutor (litellm calls are thread-safe).
+        # The executor caps in-flight requests at max_workers, so a huge doc
+        # cannot queue unbounded. Each worker merges its own stats delta under
+        # a lock; reassembly below is strictly in original chunk order.
+        workers = min(workers, len(chunks))
+        lock = threading.Lock()
+        done_count = [0]
+
+        def _worker(idx: int, chunk: str, sep: str) -> None:
+            result, delta = _run_chunk(
+                idx, len(chunks), chunk, sep, system_prompt, model, endpoint,
+                api_key, max_chars * 2, sampling, retries,
+            )
+            out_parts[idx - 1] = result
+            with lock:
+                _apply_chunk_delta(stats, delta)
+                done_count[0] += 1
+                n_done = done_count[0]
+            # unconditional progress (not gated on -v): completed-chunk count
+            # with elapsed time and an ETA from the parallel throughput so far
+            elapsed = time.monotonic() - t0
+            eta = elapsed / n_done * (len(chunks) - n_done)
             print(
-                f"  llm: chunk {i}/{len(chunks)} done in "
-                f"{_fmt_duration(chunk_durations[-1])}  |  elapsed "
-                f"{_fmt_duration(time.monotonic() - t0)}  |  "
-                f"eta ~{_fmt_duration(eta)}",
+                f"  llm: {n_done}/{len(chunks)} done, elapsed "
+                f"{_fmt_duration(elapsed)}, eta ~{_fmt_duration(eta)}",
                 flush=True,
             )
 
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [
+                ex.submit(_worker, i, chunk, sep)
+                for i, (chunk, sep) in enumerate(chunks, 1)
+            ]
+            for fut in futures:
+                fut.result()  # propagate worker exceptions
+
+    # deterministic meta.json regardless of completion order
+    stats["rejections"].sort(key=lambda r: r["chunk"])
     return "".join(out_parts), stats
