@@ -132,7 +132,12 @@ def convert_cmd(
     out_dir.mkdir(parents=True, exist_ok=True)
     typer.echo(f"source: {input}")
 
-    prune.prune(input, out_dir, verbose=True)
+    if not prune.prune(input, out_dir, verbose=True):
+        typer.echo(
+            "aborted: existing .md was not overwritten (declined) — nothing written.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     md_path, meta = convert.convert(input, out_dir, pages)
 

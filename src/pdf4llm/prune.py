@@ -31,11 +31,15 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def find_duplicates(pdf: Path) -> list[Path]:
-    """Exact-basename .docx/.txt/.md files in the PDF's own folder."""
+def find_duplicates(pdf: Path, out_dir: Path) -> list[Path]:
+    """Exact-basename .docx/.txt/.md files in the output directory.
+
+    The output dir is where the new .md (and any retired .docx/.txt) would
+    live, so conflicts are checked there — not in the PDF's source folder.
+    """
     base = pdf.stem
     out: list[Path] = []
-    for p in pdf.parent.iterdir():
+    for p in out_dir.iterdir():
         if not p.is_file():
             continue
         if p.stem == base and p.suffix.lower() in (DELETE_EXTS | OVERWRITE_EXTS):
@@ -51,9 +55,13 @@ def confirm(prompt: str) -> bool:
     return ans in ("y", "yes")
 
 
-def prune(pdf: Path, out_dir: Path, verbose: bool = True) -> None:
-    """Prompt-delete .docx/.txt and prompt-overwrite .md for exact basenames."""
-    dups = find_duplicates(pdf)
+def prune(pdf: Path, out_dir: Path, verbose: bool = True) -> bool:
+    """Prompt-delete .docx/.txt and prompt-overwrite .md for exact basenames.
+
+    Returns True to proceed with conversion, False if the user declined to
+    overwrite an existing .md (which is the output file, so we must abort).
+    """
+    dups = find_duplicates(pdf, out_dir)
     if not dups:
         if verbose:
             print("  no same-basename .docx/.txt/.md found — nothing to clean up.")
@@ -76,6 +84,9 @@ def prune(pdf: Path, out_dir: Path, verbose: bool = True) -> None:
         if not confirm(prompt):
             if verbose:
                 print(f"  skipped {p.name}")
+            if action == "overwrite":
+                # declining means we can't write our own .md output
+                return False
             continue
         try:
             digest = sha256_file(p)
@@ -92,3 +103,4 @@ def prune(pdf: Path, out_dir: Path, verbose: bool = True) -> None:
         else:
             if verbose:
                 print(f"  will overwrite {p.name} (converter rewrites it)")
+    return True

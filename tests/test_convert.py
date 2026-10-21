@@ -63,14 +63,21 @@ def test_ch32_tables(tmp_path):
 def test_find_duplicates_exact_basename(tmp_path):
     from pdf4llm import prune
 
-    pdf = tmp_path / "demo.pdf"
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    pdf = src / "demo.pdf"
     pdf.write_bytes(b"%PDF-1.4")
-    (tmp_path / "demo.docx").write_bytes(b"x")
-    (tmp_path / "demo.txt").write_bytes(b"x")
-    (tmp_path / "demo.md").write_bytes(b"# demo")
-    (tmp_path / "other.md").write_bytes(b"# other")  # no match
+    # duplicates live in the OUTPUT dir, not the source dir
+    (out / "demo.docx").write_bytes(b"x")
+    (out / "demo.txt").write_bytes(b"x")
+    (out / "demo.md").write_bytes(b"# demo")
+    (out / "other.md").write_bytes(b"# other")  # no match
+    # a same-basename file in the source dir is NOT scanned
+    (src / "demo.md").write_bytes(b"# src")
 
-    found = {p.name for p in prune.find_duplicates(pdf)}
+    found = {p.name for p in prune.find_duplicates(pdf, out)}
     assert found == {"demo.docx", "demo.txt", "demo.md"}
 
 

@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
-# pymupdf 2.x internals still import the legacy `fitz` alias; silence it.
+# pymupdf 2.x internals still import the legacy `fitz` alias and emit a
+# FutureWarning. Suppress it in this process AND in the worker subprocesses
+# the layout engine spawns (Windows uses spawn, so workers re-import from
+# scratch and do NOT inherit in-process warning filters). Setting
+# PYTHONWARNINGS in the environment reaches the child interpreters too.
+os.environ.setdefault("PYTHONWARNINGS", "ignore::FutureWarning")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import pymupdf
