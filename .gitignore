@@ -17,3 +17,6 @@ dist/
 # examples: only the small committed fixture is tracked
 examples/*
 !examples/74HC_HCT74.pdf
+
+# debug output directory
+/out
