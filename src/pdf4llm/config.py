@@ -7,15 +7,20 @@ Stored as JSON in the platform user-config dir:
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
-
-from platformdirs import user_config_dir
 
 APP = "pdf4llm"
 
 
 def config_path() -> Path:
-    return Path(user_config_dir(APP)) / "config.json"
+    """Windows: %APPDATA%/pdf4llm/config.json; POSIX: ~/.config/pdf4llm/config.json."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", "~\\AppData\\Roaming"))
+    else:
+        base = Path.home() / ".config"
+    return base / APP / "config.json"
 
 
 def load_config() -> dict:

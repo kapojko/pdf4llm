@@ -64,7 +64,9 @@ def _print_summary(meta: dict) -> None:
 
 @app.command()
 def convert_cmd(
-    input: Path = typer.Argument(..., help="Path to a single PDF file"),
+    input: Path = typer.Argument(
+        None, help="Path to a single PDF file (optional with --llm-auth)"
+    ),
     out: Path = typer.Option(
         None, "--out", "-o", help="Output directory (default: same folder as the PDF)"
     ),
@@ -85,8 +87,10 @@ def convert_cmd(
     """Convert one PDF to LLM-readable Markdown with a sanity score."""
     if llm_auth:
         _setup_llm()
+        if input is None:
+            raise typer.Exit(0)
 
-    if not input.is_file():
+    if input is None or not input.is_file():
         typer.echo(f"error: not a file: {input}", err=True)
         raise typer.Exit(2)
     if input.suffix.lower() != ".pdf":
