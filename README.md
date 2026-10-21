@@ -148,7 +148,11 @@ Then:
 pdf4llm <file.pdf> --llm --pages 1-10
 ```
 
-Chunks are processed one after another unless parallelism is available. With
+Chunks are processed one after another unless parallelism is available. The
+pass prints unconditional progress: a start line per chunk (`llm: chunk 10/104
+(1976 chars) ...`) and a completion line with the final state — `accepted`,
+`salvaged N block(s)` or `REJECTED` — plus retry/truncation counts, elapsed
+time and an ETA. With
 a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
 self-description endpoint and:
 
@@ -173,6 +177,22 @@ verify → salvage → retry pipeline, chunks are independent and the output is
 reassembled strictly in original chunk order, so the result and the meta.json
 stats are identical to the sequential run.
 
+#### Model choice (measured, 49-page datasheet, 80 chunks)
+
+| model | throughput | rejected | notes |
+|-------|-----------|----------|-------|
+| ornith-1.5-9b (dense, np4, w4) | 225 chars/s | 18/80 | baseline |
+| ling-3.0-tiny (MoE A1.3B, np8, w8) | 341 chars/s | 24–27/80 | **1.5x faster** |
+
+Both are equally safe (verifier-gated); the trade-off is repair recall: ling
+occasionally rewrites/drops whole lines, which the verifier rejects as a whole
+chunk (`candidate rewrite beyond salvage` in meta.json), so ~8% more of the
+document stays unrepaired. ling also scales to more slots (w4→w8 ≈ 1.75x;
+w16 adds nothing — GPU saturates ~8 streams), while the dense model does not.
+Rule of thumb: ling for long documents where wall-clock matters, ornith for
+quality-critical output. Rerun with `scripts/bench/` (`bench_llm_local.py`,
+`probe_quality.py`) when changing models or servers.
+
 `litellm` is the pluggable client — it works with Ollama, llama.cpp
 (llama-server), or any OpenAI-compatible endpoint.
 
@@ -181,6 +201,14 @@ stats are identical to the sequential run.
 - The request always sets `chat_template_kwargs: {enable_thinking: false}`;
   as a belt-and-braces, a leading `<think>...</think>` block is stripped from the answer
   before verification (some servers/templates ignore the flag).
+  Server side, keep the llama.cpp default `--reasoning auto` — thinking is
+  then controlled per request (verified on llama.cpp master, 2026-10, with
+  ling-3.0-tiny: enabled → reasoning arrives in `message.reasoning_content`,
+  disabled → none). Do **not** set `--reasoning on` (forces thinking for all
+  requests). If a llama.cpp build ever stops honouring the per-request flag,
+  the symptom is unmistakable — a spike of `REJECTED ... truncated x1` chunks
+  at 2–4x the usual per-chunk time (thinking burns the output-token cap) —
+  and the fix is `--reasoning off` on that server instance.
 - `max_tokens` per chunk is **capped at ~the input length** (3.5 chars/token
   + 256 margin): the pass is whitespace-only, so a healthy answer fits
   easily, while a looping model is cut off after one chunk-worth of tokens
