@@ -53,12 +53,41 @@ No subcommands. For each PDF the tool:
 3. optionally runs the `--llm` correction pass.
 4. prints a one-line sanity score and exits non-zero if it scored badly.
 
-## LLM correction
+## LLM correction (safe by construction)
 
 No PDF-extraction library ships an LLM post-processing hook, so this is a custom
-pass: the Markdown is chunked by heading/size and each chunk is sent to your
-**local OpenAI-compatible LLM** (via **litellm**) to fix broken line breaks and
-split words while preserving tables, pipe characters, `0x…` and `\d+x\d+` tokens.
+pass. It is built so that a hallucinating model **cannot** corrupt the document —
+safety is enforced by an algorithmic verifier, never by trusting the model:
+
+1. **Classification** — the document head is classified (datasheet/reference
+   manual vs general) by the LLM, with a keyword-heuristic fallback; any
+   ambiguity or error defaults to the strict technical prompt. This only
+   selects the prompt — never the safety rules.
+2. **Constrained edits** — the model may only perform whitespace-level fixes:
+   join split words (`D-t yp e` → `D-type`), subscript joins (`V CC` → `VCC`,
+   `T amb` → `Tamb`), part-number hyphen joins (`SOT108 - 1` → `SOT108-1`),
+   false line-break removal. Nothing else.
+3. **Algorithmic verifier** (per chunk, non-negotiable):
+   - *Invariant A*: whitespace-stripped input and output are byte-identical —
+     catches any inserted/deleted/reordered content character (rephrasing,
+     translation, "helpful" completions).
+   - *Invariant B*: table rows keep their cell count; cell edits are checked
+     individually (most datasheet data lives in cells).
+   - *Invariant C*: a removed whitespace run is only allowed where a whitelist
+     says the join cannot corrupt a value (`letter|letter`, `digit|-`,
+     `.|digit`, …). Digit-digit and digit/symbol joins (`2 0` → `20`,
+     `0x30 08` → `0x3008`, `V CC + 0.5` → `VCC+ 0.5`, `25 °C` → `25°C`) are
+     structurally forbidden.
+4. **Recovery** — a rejected chunk is not simply discarded: it goes through
+   line/block-level **salvage** (only independently verified pieces are
+   applied, the rest reverts), then up to `llm_retries` regeneration attempts
+   with a rejection-reason hint, keeping the best. Whatever still fails
+   verification stays as the original — rejection is always safe, never
+   silent. All decisions are logged to `meta.json` (`llm` section:
+   classification, accepted/salvaged/rejected counts, per-chunk reasons).
+
+A duplicated-bullet cleanup (`- • x` → `- x`) runs deterministically before the
+LLM pass — no model involvement.
 
 Set credentials once:
 
@@ -67,7 +96,11 @@ pdf4llm --llm-auth
 ```
 
 Saved to the user config dir (Windows: `%APPDATA%\pdf4llm\config.json`,
-POSIX: `~/.config/pdf4llm\config.json`) as `{endpoint, api_key, model}`. Then:
+POSIX: `~/.config/pdf4llm\config.json`) as `{endpoint, api_key, model}`.
+Optional keys: `llm_sampling` (dict forwarded to the model; defaults to the
+Ornith-1.5-9B card's precise-coding set: `temperature 0.6, top_p 0.95,
+top_k 20, min_p 0.0, presence_penalty 0.0`) and `llm_retries` (default 1).
+Then:
 
 ```powershell
 pdf4llm <file.pdf> --llm --pages 1-10

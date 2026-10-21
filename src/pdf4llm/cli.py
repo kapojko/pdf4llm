@@ -153,11 +153,23 @@ def convert_cmd(
             )
             raise typer.Exit(3)
         text = md_path.read_text(encoding="utf-8")
-        text = llm.correct_with_llm(text, model, endpoint, api_key, verbose=verbose)
+        text, llm_stats = llm.correct_with_llm(
+            text, model, endpoint, api_key, verbose=verbose,
+            sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 1)),
+        )
         md_path.write_text(text, encoding="utf-8")
-        meta["llm"] = True
+        meta["llm"] = llm_stats
         meta["checks"] = checks.run_checks(text, meta["page_chars"])
         convert.write_meta(meta)
+
+        if llm_stats.get("chunks_rejected") or llm_stats.get("chunks_salvaged"):
+            typer.echo(
+                f"  llm: {llm_stats['chunks_accepted']}/{llm_stats['chunks_total']} "
+                f"chunks accepted, {llm_stats.get('chunks_salvaged', 0)} salvaged "
+                f"({llm_stats.get('blocks_fixed', 0)} blocks fixed), "
+                f"{llm_stats['chunks_rejected']} rejected "
+                "(originals kept — see meta.json)"
+            )
 
     _print_summary(meta)
 
