@@ -8,7 +8,27 @@ dependencies = [
     "pymupdf>=2.0",
     "typer>=0.12",
     "litellm>=1.50",
+    "onnxruntime-gpu>=1.20",
 ]
+
+[project.optional-dependencies]
+# NVIDIA CUDA runtime DLLs for onnxruntime-gpu (Windows). Without these the
+# CUDA execution provider fails to load (cublasLt64_13.dll missing) and the
+# layout engine silently falls back to CPU:
+#   uv tool install . --extra cuda
+# NOTE: pinned to the newest releases that still ship Windows wheels
+# (nvidia-cublas >=13.8.1 is Linux-only; the -cu13 wrappers are stubs on
+# Windows). cuFFT is omitted — the CUDA EP loads without it and this model
+# needs no FFT ops.
+cuda = [
+    "nvidia-cuda-runtime>=13.4,<14",
+    "nvidia-cublas>=13.8.0.4,<13.8.1",
+    "nvidia-cudnn-cu13>=9.10,<10",
+]
+# Windows on AMD/Intel GPUs (also Intel XPU via DirectX 12). Conflicts with
+# onnxruntime-gpu — install one or the other, never both:
+#   uv tool install . --extra directml
+directml = ["onnxruntime-directml>=1.20"]
 
 [project.scripts]
 pdf4llm = "pdf4llm.cli:app"
@@ -27,6 +47,12 @@ packages = ["src/pdf4llm"]
 
 [tool.hatch.version]
 path = "src/pdf4llm/__init__.py"
+
+[tool.uv]
+# pymupdf pulls the CPU-only onnxruntime transitively; the override below
+# excludes it everywhere (marker can never be true) so the GPU build above
+# is the single onnxruntime in the environment.
+override-dependencies = ["onnxruntime; sys_platform == 'never'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -362,7 +362,7 @@ def test_parallel_reassembles_in_order_and_merges_stats(monkeypatch):
 
     def fake_call(system_prompt, chunk, *a, **kw):
         calls.append(chunk)
-        return _fixed(chunk)
+        return _fixed(chunk), None
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
 
@@ -380,11 +380,11 @@ def test_parallel_reassembles_in_order_and_merges_stats(monkeypatch):
 
 def test_parallel_output_identical_to_sequential(monkeypatch):
     def fake_call(system_prompt, chunk, model, endpoint, api_key,
-                  max_tokens, sampling=None, retry_hint=None):
+                  sampling=None, retry_hint=None):
         # first attempt 'hallucinates' -> exercises salvage; retry hint path
         if retry_hint is None and "Ordering" in chunk:
-            return chunk + " extra hallucinated content"
-        return _fixed(chunk)
+            return chunk + " extra hallucinated content", None
+        return _fixed(chunk), None
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
     out1, stats1 = llm.correct_with_llm(
@@ -411,13 +411,13 @@ def test_parallel_completions_out_of_order_still_ordered(monkeypatch):
                  enumerate(llm.chunk_markdown(_prep(PAR_TEXT), MAXC), 1)}
 
     def fake_call(system_prompt, chunk, model, endpoint, api_key,
-                  max_tokens, sampling=None, retry_hint=None):
+                  sampling=None, retry_hint=None):
         # make LATER chunks finish FIRST so completion order != chunk order
         delay = max(1.0 - 0.15 * chunk_idx[chunk], 0.05)
         _time.sleep(delay)
         with order_lock:
             order.append(chunk_idx[chunk])
-        return _fixed(chunk)
+        return _fixed(chunk), None
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
     out, stats = llm.correct_with_llm(
@@ -429,7 +429,7 @@ def test_parallel_completions_out_of_order_still_ordered(monkeypatch):
 
 def test_parallel_rejections_carry_chunk_indices(monkeypatch):
     def fake_call(system_prompt, chunk, *a, **kw):
-        return "totally unrelated hallucinated text"  # invariant A fails,
+        return "totally unrelated hallucinated text", None  # invariant A fails,
         # salvage yields nothing -> rejected, original kept
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
@@ -449,7 +449,7 @@ def test_workers_default_is_one(monkeypatch):
 
     def fake_call(system_prompt, chunk, *a, **kw):
         seen.append(chunk)
-        return chunk
+        return chunk, None
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
     out, stats = llm.correct_with_llm(
@@ -597,7 +597,7 @@ def test_correct_with_llm_records_swappy_and_auto_workers(monkeypatch):
             "models": [{"key": "m", "contextSize": 36864, "slots": 4}]}
     monkeypatch.setattr(llm, "probe_swappy", lambda ep, ak: info)
     monkeypatch.setattr(llm, "_call_llm",
-                        lambda system_prompt, chunk, *a, **kw: _fixed(chunk))
+                        lambda system_prompt, chunk, *a, **kw: (_fixed(chunk), None))
     out, stats = llm.correct_with_llm(
         PAR_TEXT, "m", "http://x", "k", verbose=False, classify=False,
         max_chars=MAXC)   # workers=None -> auto: min(4 slots, 4) = 4
@@ -622,6 +622,60 @@ def test_split_sampling_standard_vs_extra():
     assert std["temperature"] == 0.6
     assert "top_k" in extra and "min_p" in extra
     assert "top_k" not in std
+
+
+# ---------------------------------------------------------------------------
+# output token cap (loop killer) + thinking strip
+# ---------------------------------------------------------------------------
+
+def test_output_token_cap_is_close_to_input_size():
+    # a 2000-char chunk is ~570 input tokens; the cap must be tight (not the
+    # old 2x-chars = 4000-token budget) but leave margin for fence/hint error
+    cap = llm.output_token_cap(2000)
+    assert 570 < cap < 900
+    assert llm.output_token_cap(0) == llm._OUT_MARGIN_TOKENS + 1
+
+
+def test_run_chunk_caps_max_tokens(monkeypatch):
+    seen = {}
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        seen["kwargs"] = kw
+        return chunk, None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    result, delta = llm._run_chunk(
+        1, 1, "some chunk", "", "sys", "m", "http://x", "k", None, 0)
+    assert delta["accepted"]
+    # no max_tokens argument is passed at all: _call_llm computes the cap
+    # itself from the content length
+    assert "max_tokens" not in seen["kwargs"]
+
+
+def test_run_chunk_records_truncation(monkeypatch):
+    def fake_call(system_prompt, chunk, *a, **kw):
+        # 'looping' model: answer cut off mid-text by the output cap
+        return chunk[: len(chunk) // 2], "length"
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    result, delta = llm._run_chunk(
+        1, 1, "text alpha beta", "", "sys", "m", "http://x", "k", None, 0)
+    assert delta["rejected"] and delta["truncated"] == 1
+    assert any("finish_reason=length" in r for r in
+               delta["rejection"]["reason"].split("; "))
+    assert result == "text alpha beta"        # original kept
+
+
+def test_strip_thinking_blocks():
+    open_tag = "<" + "think>"
+    close_tag = "<" + "/" + "think>"
+    body = "Dual D-type flip-flop"
+    assert llm._strip_thinking(
+        f"{open_tag}reasoning here{close_tag}\n{body}") == body
+    assert llm._strip_thinking(
+        f"  {open_tag}a{close_tag} {open_tag}b{close_tag}\n{body}") == body
+    assert llm._strip_thinking(f"{open_tag}never closed") == ""
+    assert llm._strip_thinking(body) == body
 
 
 # ---------------------------------------------------------------------------

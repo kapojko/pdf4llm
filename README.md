@@ -15,11 +15,15 @@ LLM-readable Markdown for use as context in schematic / firmware development.
 ## Install
 
 ```powershell
-.\build_install.ps1
+.\build_install.ps1            # NVIDIA (CUDA): default, installs the CUDA runtime DLLs
+.\build_install.ps1 -DirectML  # AMD / Intel (incl. Intel XPU on Windows)
 ```
 
 Uses `uv tool install` (isolated env + a `pdf4llm` command on PATH) and copies the
-shim into `C:\Programs\Util`. Requires `uv` on PATH.
+shim into `C:\Programs\Util`. Requires `uv` on PATH. The default install includes
+the NVIDIA CUDA runtime DLLs (`nvidia-cublas` / `nvidia-cuda-runtime` /
+`nvidia-cudnn-cu13`) — a ~1 GB one-time download; `-DirectML` swaps them for
+`onnxruntime-directml` (the two GPU runtimes conflict, so pick one per machine).
 
 To develop in-repo instead:
 
@@ -44,12 +48,13 @@ exit results); the final exit code is the worst per-file code.
 | `--pages A-B,12,15` | page subset (useful for short LLM tests) |
 | `--locate FOLDER` | treat `input` as a file **name** and search for it recursively in FOLDER; must match exactly one file (case-insensitive) or the run aborts with the match list. Uses an index file (`.pdf4llm_locate.idx`) inside FOLDER so repeat runs skip the slow recursive scan (big win on network shares); a missing or vanished match triggers one automatic rebuild, and all inputs are matched from a single scan |
 | `--locate-rebuild` | force a fresh `--locate` scan and rewrite the index file in FOLDER |
-| `--copy FOLDER` | after conversion, additionally copy the final `.md` into FOLDER (created if missing); if the file exists there, ask y/N — or overwrite silently with `--force` |
+| `--copy FOLDER` | after the (optional) LLM pass, additionally copy the **final** `.md` into FOLDER (created if missing); if the file exists there, ask y/N — or overwrite silently with `--force` |
 | `--force` | skip all y/N confirmations (delete / overwrite / copy-overwrite); actions are still logged to `.pdf4llm_prune.log` |
 | `--dry-run` | show the full plan (locate result, cleanup actions, output/meta/copy paths) without converting, writing, deleting or prompting |
 | `--version` | print the pdf4llm version and exit |
 | `--llm` | run local-LLM broken-text correction (default **off**) |
 | `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 4)`), else 1; an explicit value overrides the server |
+| `--llm-chunk-chars N` | max chunk size (chars) for the LLM pass; default **2000** (config key `llm_chunk_chars`). Smaller chunks are more stable on small local models |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
@@ -61,7 +66,33 @@ No subcommands. For each PDF the tool:
    written to `.pdf4llm_prune.log`.
 2. converts to `<basename>.md` (**UTF-8, no BOM**) + `<basename>.meta.json`.
 3. optionally runs the `--llm` correction pass.
-4. prints a one-line sanity score and exits non-zero if it scored badly.
+4. optionally copies the final `.md` with `--copy`.
+5. prints a one-line sanity score and exits non-zero if it scored badly.
+
+## Layout engine GPU acceleration
+
+The neural layout analyzer (BoxRFDGNN, pymupdf 2.x) runs on the **GPU by
+default**: the GPU-enabled `onnxruntime-gpu` is a direct dependency and the
+engine is always started with `use_gpu=True` (CPU is the automatic fallback).
+
+- **NVIDIA (CUDA)** — the CUDA runtime DLLs are *not* bundled by the
+  `onnxruntime-gpu` wheel. Without them the provider fails to load and
+  conversion falls back to CPU (a loud warning is printed at startup).
+  Install the runtime DLLs once:
+  ```powershell
+  .\build_install.ps1                 # adds nvidia-cublas/cuda-runtime/cudnn (default)
+  # or manually: uv tool install --force . --with nvidia-cublas==13.8.0.4 \
+  #     --with nvidia-cuda-runtime --with nvidia-cudnn-cu13
+  ```
+- **AMD / Intel (Windows, incl. Intel XPU)** — install the `directml` variant
+  instead (`build_install.ps1 -DirectML`); never install both GPU runtimes.
+  DirectML only works in the main process (pymupdf's worker processes cannot
+  inherit it), so conversion then runs single-threaded — noted at startup.
+- If no GPU provider is available at all, the run starts with a `WARNING:
+  layout engine ... running on CPU` on stderr — treat it as a broken setup,
+  not a normal mode.
+- The conversion prints progress (`converting N/M pages ...` / `done in ...`);
+  the first page batch also includes the model load.
 
 ## LLM correction (safe by construction)
 
@@ -109,7 +140,8 @@ Saved to the user config dir (Windows: `%APPDATA%\pdf4llm\config.json`,
 POSIX: `~/.config/pdf4llm\config.json`) as `{endpoint, api_key, model}`.
 Optional keys: `llm_sampling` (dict forwarded to the model; defaults to the
 Ornith-1.5-9B card's precise-coding set: `temperature 0.6, top_p 0.95,
-top_k 20, min_p 0.0, presence_penalty 0.0`) and `llm_retries` (default 2).
+top_k 20, min_p 0.0, presence_penalty 0.0`), `llm_retries` (default 2) and
+`llm_chunk_chars` (default 2000; same as `--llm-chunk-chars`).
 Then:
 
 ```powershell
@@ -142,6 +174,21 @@ stats are identical to the sequential run.
 
 `litellm` is the pluggable client — it works with Ollama, llama.cpp
 (llama-server), or any OpenAI-compatible endpoint.
+
+### Loop / runaway-generation protection
+
+- The request always sets `chat_template_kwargs: {enable_thinking: false}`;
+  as a belt-and-braces, a leading `<think>...</think>` block is stripped from the answer
+  before verification (some servers/templates ignore the flag).
+- `max_tokens` per chunk is **capped at ~the input length** (3.5 chars/token
+  + 256 margin): the pass is whitespace-only, so a healthy answer fits
+  easily, while a looping model is cut off after one chunk-worth of tokens
+  instead of burning thousands. The truncated output then fails verification
+  and the normal salvage/retry machinery runs. Truncated calls are counted
+  in `meta.json` (`llm.truncated_calls`).
+- Chunking default is a deliberately small 2000 chars (`--llm-chunk-chars`),
+  which keeps small local models (e.g. 9B) on-task and makes per-chunk
+  failures cheap.
 
 ## Sanity checks (per output)
 

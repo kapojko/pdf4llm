@@ -345,6 +345,34 @@ DEFAULT_SAMPLING: dict = {
 # like top_k / min_p).
 _STANDARD_SAMPLING_KEYS = {"temperature", "top_p", "presence_penalty", "frequency_penalty"}
 
+# Output token cap. The pass is whitespace-only, so the model's output is by
+# definition ~the length of its input. Capping max_tokens at ~input tokens
+# means a looping (or secretly reasoning) model is cut off after one
+# chunk-worth of tokens instead of burning a huge budget; the truncated
+# output then fails verification (invariant A) and the usual salvage/retry
+# machinery takes over. This is what terminates false loops cheaply.
+_OUT_MARGIN_TOKENS = 256  # code fence + retry hint + estimator error
+
+
+def output_token_cap(n_chars: int) -> int:
+    """max_tokens for one chunk: ~input tokens (3.5 chars/token) + margin."""
+    return math.ceil(max(1, n_chars) / _CHARS_PER_TOKEN) + _OUT_MARGIN_TOKENS
+
+
+# Belt-and-braces against reasoning output: the request already sends
+# chat_template_kwargs {enable_thinking: false}, but some servers/templates
+# ignore it. A leading <think>...</think> block is stripped before
+# verification; an unclosed <think> means the output is all thinking.
+_THINK_BLOCK_RE = re.compile(r"^(?:\s*<think>.*?</think>)+\s*", re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove a leading <think>...</think> block (or an all-thinking output)."""
+    text = _THINK_BLOCK_RE.sub("", text)
+    if text.lstrip().startswith("<think>"):
+        return ""
+    return text
+
 # ---------------------------------------------------------------------------
 # Algorithmic verification
 # ---------------------------------------------------------------------------
@@ -476,8 +504,8 @@ def _split_sampling(sampling: dict) -> tuple[dict, dict]:
 
 
 def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
-              api_key: str, max_tokens: int, sampling: dict | None = None,
-              retry_hint: str | None = None) -> str:
+              api_key: str, sampling: dict | None = None,
+              retry_hint: str | None = None) -> tuple[str, str | None]:
     import litellm  # lazy import
 
     litellm.suppress_debug_info = True
@@ -489,6 +517,8 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
             f"it changed non-whitespace content ({retry_hint}). Only whitespace-"
             "level fixes are allowed; everything else must stay byte-identical."
         )
+    # max_tokens is capped at ~the input length (output_token_cap): a looping
+    # model is cut off quickly and the truncated output is rejected/salvaged.
     resp = litellm.completion(
         model=f"openai/{model}",
         messages=[
@@ -497,12 +527,13 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
         ],
         api_base=endpoint,
         api_key=api_key,
-        max_tokens=max_tokens,
+        max_tokens=output_token_cap(len(user_content)),
         timeout=300,
         extra_body={**extra, "chat_template_kwargs": {"enable_thinking": False}},
         **std,
     )
-    return (resp.choices[0].message.content or "").strip()
+    finish = getattr(resp.choices[0], "finish_reason", None)
+    return (resp.choices[0].message.content or "").strip(), finish
 
 
 def _verify_line_in_context(o_lines: list[str], idx: int, c_line: str) -> str | None:
@@ -635,7 +666,6 @@ def _run_chunk(
     model: str,
     endpoint: str,
     api_key: str,
-    max_tokens: int,
     sampling: dict | None,
     retries: int,
 ) -> tuple[str, dict]:
@@ -647,6 +677,12 @@ def _run_chunk(
     matter how many workers run. Chunks are independent: the result text is
     ``verified_chunk + sep`` so reassembly is exact concatenation.
 
+    max_tokens is capped at ~the input length (output_token_cap): the task is
+    whitespace-only editing, so a healthy answer fits easily, while a looping
+    model is cut off after one chunk-worth of tokens instead of burning the
+    old 2x-chars budget; the truncated output then fails verification and the
+    normal salvage/retry machinery runs.
+
     Returns (result_text, per-chunk stats delta).
     """
     print(f"  llm: chunk {idx}/{total} ({len(chunk)} chars) ...", flush=True)
@@ -655,18 +691,25 @@ def _run_chunk(
     best_fixed = -1
     chunk_rejections: list[str] = []
     n_calls = 0
+    truncated = 0
 
     for attempt in range(1 + max(0, retries)):
         hint = chunk_rejections[-1] if (attempt and chunk_rejections) else None
         try:
-            candidate = _call_llm(
+            candidate, finish = _call_llm(
                 system_prompt, chunk, model, endpoint, api_key,
-                max_tokens=max_tokens, sampling=sampling, retry_hint=hint,
+                sampling=sampling, retry_hint=hint,
             )
             n_calls += 1
         except Exception as e:  # network/model error -> keep original
             chunk_rejections.append(f"llm error: {type(e).__name__}: {e}"[:200])
             continue
+        candidate = _strip_thinking(candidate)
+        if finish == "length":
+            truncated += 1
+            chunk_rejections.append(
+                "output truncated (finish_reason=length) — output token cap hit"
+            )
         if _verify_chunk(chunk, candidate) is None:
             best, best_fixed = candidate, 1 << 30  # whole chunk verified
             break
@@ -697,6 +740,7 @@ def _run_chunk(
         delta = {"index": idx, "salvaged": True, "blocks_fixed": best_fixed,
                  "rejection": None}
     delta["retries_used"] = max(0, n_calls - 1)
+    delta["truncated"] = truncated
     delta["duration"] = time.monotonic() - chunk_start
     return result, delta
 
@@ -712,6 +756,7 @@ def _apply_chunk_delta(stats: dict, delta: dict) -> None:
         stats["chunks_rejected"] += 1
         stats["rejections"].append(delta["rejection"])
     stats["retries_used"] += delta["retries_used"]
+    stats["truncated_calls"] += delta.get("truncated", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +886,7 @@ def correct_with_llm(
     endpoint: str,
     api_key: str,
     verbose: bool = True,
-    max_chars: int = 6000,
+    max_chars: int = 2000,
     classify: bool = True,
     sampling: dict | None = None,
     retries: int = 2,
@@ -855,6 +900,10 @@ def correct_with_llm(
     applied); ``retries`` bounded regeneration attempts may follow, keeping
     the attempt that fixes the most blocks. Whatever fails verification is
     kept as the original — rejection is always safe, never silent.
+
+    ``max_chars`` is the chunk size; the default (2000) is deliberately small
+    so that small local models stay on-task — smaller chunks mean a shorter
+    effective output horizon and cheaper per-chunk failures.
 
     ``workers`` > 1 processes chunks concurrently (ThreadPoolExecutor,
     litellm calls are thread-safe). Safety is unaffected: every chunk still
@@ -916,6 +965,7 @@ def correct_with_llm(
         "chunks_rejected": 0,
         "blocks_fixed": 0,
         "retries_used": 0,
+        "truncated_calls": 0,
         "rejections": [],
     }
     if swappy_entry is not None:
@@ -935,7 +985,7 @@ def correct_with_llm(
         for i, (chunk, sep) in enumerate(chunks, 1):
             result, delta = _run_chunk(
                 i, len(chunks), chunk, sep, system_prompt, model, endpoint,
-                api_key, max_chars * 2, sampling, retries,
+                api_key, sampling, retries,
             )
             out_parts[i - 1] = result
             _apply_chunk_delta(stats, delta)
@@ -963,7 +1013,7 @@ def correct_with_llm(
         def _worker(idx: int, chunk: str, sep: str) -> None:
             result, delta = _run_chunk(
                 idx, len(chunks), chunk, sep, system_prompt, model, endpoint,
-                api_key, max_chars * 2, sampling, retries,
+                api_key, sampling, retries,
             )
             out_parts[idx - 1] = result
             with lock:

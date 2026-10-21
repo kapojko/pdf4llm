@@ -284,8 +284,8 @@ def convert_cmd(
     ),
     copy_to: Path = typer.Option(
         None, "--copy", metavar="FOLDER",
-        help="Additionally copy the final .md into FOLDER (created if missing; "
-             "existing file: ask y/N, or overwrite with --force)",
+        help="Additionally copy the final (post-LLM) .md into FOLDER (created "
+             "if missing; existing file: ask y/N, or overwrite with --force)",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
@@ -309,6 +309,12 @@ def convert_cmd(
         help="Parallel LLM chunk requests. Default: auto from llama-swappy info "
              "(min(slots, 4)), else 1. Explicit value overrides the server.",
     ),
+    llm_chunk_chars: int = typer.Option(
+        None, "--llm-chunk-chars", min=200,
+        help="Max chunk size (chars) for the LLM pass. Default: 2000 (config "
+             "key llm_chunk_chars). Smaller chunks are more stable on small "
+             "models.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Convert one or more PDFs to LLM-readable Markdown with a sanity score."""
@@ -329,7 +335,8 @@ def convert_cmd(
             _process_one(
                 pdf, out=out, force=force, copy_to=copy_to, dry_run=dry_run,
                 pages=pages, llm_flag=llm_flag, model=model,
-                llm_workers=llm_workers, verbose=verbose,
+                llm_workers=llm_workers, llm_chunk_chars=llm_chunk_chars,
+                verbose=verbose,
             )
         )
     raise typer.Exit(max(codes))
@@ -345,6 +352,7 @@ def _process_one(
     llm_flag: bool,
     model: str | None,
     llm_workers: int | None,
+    llm_chunk_chars: int | None,
     verbose: bool,
 ) -> int:
     """Convert one PDF; returns the exit code for this file (0 = ok)."""
@@ -389,9 +397,6 @@ def _process_one(
         typer.echo(f"error: cannot read PDF {pdf.name}: {e}", err=True)
         return 2
 
-    if copy_to is not None:
-        _copy_output(md_path, copy_to, force)
-
     if llm_flag:
         c = cfg.load_config()
         endpoint = c.get("endpoint")
@@ -403,12 +408,13 @@ def _process_one(
                 err=True,
             )
             return 3
+        chunk_chars = llm_chunk_chars or int(c.get("llm_chunk_chars", 2000))
         text = md_path.read_text(encoding="utf-8")
         try:
             text, llm_stats = llm.correct_with_llm(
                 text, model, endpoint, api_key, verbose=verbose,
                 sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
-                workers=llm_workers,
+                workers=llm_workers, max_chars=chunk_chars,
             )
         except llm.LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)
@@ -426,6 +432,10 @@ def _process_one(
                 f"{llm_stats['chunks_rejected']} rejected "
                 "(originals kept — see meta.json)"
             )
+
+    # --copy comes LAST: the copy must be of the final (post-LLM) .md
+    if copy_to is not None:
+        _copy_output(md_path, copy_to, force)
 
     _print_summary(meta)
 

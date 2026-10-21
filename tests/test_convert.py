@@ -127,3 +127,53 @@ def test_score_penalizes_no_headings():
     bad = checks.run_checks("just text", [100, 100])
     good = checks.run_checks("# H\n| a | b |\n0x1234", [100, 100])
     assert bad["score"] < good["score"]
+
+
+# ---------------------------------------------------------------------------
+# GPU setup for the layout engine (_gpu_setup)
+# ---------------------------------------------------------------------------
+
+def _providers(monkeypatch, providers):
+    import onnxruntime as ort
+    monkeypatch.setattr(ort, "get_available_providers", lambda: providers)
+
+
+def test_gpu_setup_cuda_no_note(monkeypatch):
+    import onnxruntime as ort
+    from pdf4llm import convert as cv
+
+    _providers(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(cv, "_cuda_dlls_ok", lambda: True)
+    n, note = cv._gpu_setup()
+    assert n == 4 and note == ""
+
+
+def test_gpu_setup_cuda_dlls_missing_warns(monkeypatch):
+    import onnxruntime as ort
+    from pdf4llm import convert as cv
+
+    _providers(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(cv, "_cuda_dlls_ok", lambda: False)
+    n, note = cv._gpu_setup()
+    assert n == 4
+    assert "cuda" in note.lower() and "cpu" in note.lower()
+
+
+def test_gpu_setup_cpu_fallback_warns(monkeypatch):
+    # no GPU provider at all -> loud CPU warning (degraded setup)
+    import onnxruntime as ort
+    from pdf4llm import convert as cv
+
+    _providers(monkeypatch, ["CPUExecutionProvider"])
+    n, note = cv._gpu_setup()
+    assert n == 4
+    assert "CPU" in note and "WARNING" in note
+
+
+def test_gpu_setup_directml_single_process(monkeypatch):
+    import onnxruntime as ort
+    from pdf4llm import convert as cv
+
+    _providers(monkeypatch, ["DmlExecutionProvider", "CPUExecutionProvider"])
+    n, note = cv._gpu_setup()
+    assert n == 1 and "DirectML" in note
