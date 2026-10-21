@@ -1,0 +1,30 @@
+[project]
+name = "pdf4llm"
+version = "0.1.0"
+description = "Single-file PDF -> Markdown converter for datasheets / hardware manuals, with optional local-LLM broken-text correction."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf>=2.0",
+    "typer>=0.12",
+    "litellm>=1.50",
+    "platformdirs>=4.0",
+]
+
+[project.scripts]
+pdf4llm = "pdf4llm.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdf4llm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
