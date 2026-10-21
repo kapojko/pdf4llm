@@ -65,7 +65,7 @@ def prune(pdf: Path, out_dir: Path, verbose: bool = True) -> bool:
     if not dups:
         if verbose:
             print("  no same-basename .docx/.txt/.md found — nothing to clean up.")
-        return
+        return True
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / ".pdf4llm_prune.log"
