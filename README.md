@@ -31,14 +31,22 @@ uv run pdf4llm <file.pdf>
 ## Usage
 
 ```
-pdf4llm <input.pdf> [options]
+pdf4llm <input.pdf> [more.pdf ...] [options]
 ```
+
+Multiple input PDFs are processed independently (per-file prompts, per-file
+exit results); the final exit code is the worst per-file code.
 
 | Flag | Purpose |
 |------|---------|
-| `input` | one PDF file (positional) |
+| `input` | one or more PDF files (positional) |
 | `-o/--out DIR` | output dir, **default = same folder as the PDF** |
 | `--pages A-B,12,15` | page subset (useful for short LLM tests) |
+| `--locate FOLDER` | treat `input` as a file **name** and search for it recursively in FOLDER; must match exactly one file (case-insensitive) or the run aborts with the match list |
+| `--copy FOLDER` | after conversion, additionally copy the final `.md` into FOLDER (created if missing); if the file exists there, ask y/N — or overwrite silently with `--force` |
+| `--force` | skip all y/N confirmations (delete / overwrite / copy-overwrite); actions are still logged to `.pdf4llm_prune.log` |
+| `--dry-run` | show the full plan (locate result, cleanup actions, output/meta/copy paths) without converting, writing, deleting or prompting |
+| `--version` | print the pdf4llm version and exit |
 | `--llm` | run local-LLM broken-text correction (default **off**) |
 | `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 4)`), else 1; an explicit value overrides the server |
 | `--llm-auth` | interactively set & save LLM credentials |
@@ -47,9 +55,9 @@ pdf4llm <input.pdf> [options]
 
 No subcommands. For each PDF the tool:
 1. scans its own folder for **exact-basename** `.docx`/`.txt` (delete) and `.md`
-   (overwrite), asking a **mandatory per-file y/N** (shows both file sizes; no
-   `--yes` bypass). An undo record (path + sha256 + size) is written to
-   `.pdf4llm_prune.log`.
+   (overwrite), asking a **mandatory per-file y/N** (shows both file sizes;
+   bypass only with `--force`). An undo record (path + sha256 + size) is
+   written to `.pdf4llm_prune.log`.
 2. converts to `<basename>.md` (**UTF-8, no BOM**) + `<basename>.meta.json`.
 3. optionally runs the `--llm` correction pass.
 4. prints a one-line sanity score and exits non-zero if it scored badly.

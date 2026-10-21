@@ -1,24 +1,31 @@
-"""pdf4llm CLI — single-file PDF -> Markdown converter.
+"""pdf4llm CLI — PDF -> Markdown converter.
 
 No subcommands. One command:
-    pdf4llm <input.pdf> [options]
+    pdf4llm <input.pdf> [more.pdf ...] [options]
 
-Flow:
-  1. validate the input PDF
+Flow (per input PDF):
+  1. validate the input PDF (--locate can find it by name in a folder)
   2. prompt-delete same-basename .docx/.txt and prompt-overwrite .md
+     (skip all prompts with --force; --dry-run only reports them)
   3. convert to Markdown (+ .meta.json), UTF-8 no BOM
   4. optional --llm broken-text correction
-  5. print a one-line sanity score; exit non-zero if it scored badly
+  5. optional --copy of the .md into an additional folder
+  6. print a one-line sanity score; exit non-zero if it scored badly
+
+With multiple inputs every file is processed independently; the final
+exit code is the worst (highest) per-file exit code.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import getpass
+import shutil
 
+import pymupdf
 import typer
 
-from . import checks, config as cfg, convert, llm, prune
+from . import __version__, checks, config as cfg, convert, llm, prune
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -75,6 +82,68 @@ def _setup_llm() -> None:
     )
 
 
+def _locate_file(input: Path, folder: Path) -> Path:
+    """Find a file named like `input` recursively under `folder`.
+
+    Matching is case-insensitive on the file NAME only (any subfolder).
+    Exactly one match is required; otherwise exit with the match list.
+    """
+    folder = folder.expanduser().resolve()
+    if input.parent != Path("."):
+        typer.echo(
+            f"error: --locate takes a file NAME, not a path: {input}", err=True,
+        )
+        raise typer.Exit(2)
+    if not folder.is_dir():
+        typer.echo(f"error: --locate folder not found: {folder}", err=True)
+        raise typer.Exit(2)
+    target = input.name.lower()
+    matches = sorted(
+        p for p in folder.rglob("*")
+        if p.is_file() and p.name.lower() == target
+    )
+    if not matches:
+        typer.echo(
+            f"error: --locate: no file named '{input.name}' found under {folder}",
+            err=True,
+        )
+        raise typer.Exit(2)
+    if len(matches) > 1:
+        typer.echo(
+            f"error: --locate: multiple matches for '{input.name}' under {folder}:",
+            err=True,
+        )
+        for m in matches:
+            typer.echo(f"  {m}", err=True)
+        typer.echo(
+            "narrow the search folder (or rename files) so exactly one matches.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    return matches[0]
+
+
+def _copy_output(md_path: Path, copy_to: Path, force: bool) -> None:
+    """Copy the finished .md into an additional output folder (created if needed).
+
+    If the target file exists, the same overwrite rules as elsewhere apply:
+    ask y/N, or overwrite silently with --force. Declining only skips the
+    copy — the primary output is already written.
+    """
+    copy_dir = copy_to.expanduser().resolve()
+    copy_dir.mkdir(parents=True, exist_ok=True)
+    dest = copy_dir / md_path.name
+    if dest.resolve() == md_path.resolve():
+        typer.echo(f"  copy skipped: source and target are the same: {dest}", err=True)
+        return
+    if dest.exists() and not force:
+        if not prune.confirm(f"{dest.name} exists in {copy_dir}. Overwrite? [y/N] "):
+            typer.echo(f"  copy skipped (declined): {dest}", err=True)
+            return
+    shutil.copyfile(md_path, dest)
+    typer.echo(f"  copied: {dest}")
+
+
 def _print_summary(meta: dict) -> None:
     ch = meta["checks"]
     typer.echo(
@@ -93,13 +162,42 @@ def _print_summary(meta: dict) -> None:
         typer.echo("  warning: 0 headings — extraction likely failed")
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"pdf4llm {__version__}")
+        raise typer.Exit()
+
+
 @app.command()
 def convert_cmd(
-    input: Path = typer.Argument(
-        None, help="Path to a single PDF file (optional with --llm-auth)"
+    inputs: list[Path] = typer.Argument(
+        None, help="Path(s) to PDF file(s) (optional with --llm-auth)"
+    ),
+    version: bool = typer.Option(
+        None, "--version", callback=_version_callback, is_eager=True,
+        help="Show the pdf4llm version and exit.",
     ),
     out: Path = typer.Option(
         None, "--out", "-o", help="Output directory (default: same folder as the PDF)"
+    ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Skip all y/N confirmations (delete/overwrite/copy-overwrite)",
+    ),
+    locate: Path = typer.Option(
+        None, "--locate", metavar="FOLDER",
+        help="Treat INPUT as a file NAME and search for it recursively in FOLDER "
+             "(must match exactly one file)",
+    ),
+    copy_to: Path = typer.Option(
+        None, "--copy", metavar="FOLDER",
+        help="Additionally copy the final .md into FOLDER (created if missing; "
+             "existing file: ask y/N, or overwrite with --force)",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Show what would be done (locate result, cleanup, output and copy "
+             "paths) without converting, writing, deleting or prompting",
     ),
     llm_flag: bool = typer.Option(
         False, "--llm", help="Run local-LLM broken-text correction (default off)"
@@ -120,31 +218,86 @@ def convert_cmd(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
-    """Convert one PDF to LLM-readable Markdown with a sanity score."""
+    """Convert one or more PDFs to LLM-readable Markdown with a sanity score."""
     if llm_auth:
         _setup_llm()
-        if input is None:
+        if not inputs:
             raise typer.Exit(0)
-
-    if input is None or not input.is_file():
-        typer.echo(f"error: not a file: {input}", err=True)
-        raise typer.Exit(2)
-    if input.suffix.lower() != ".pdf":
-        typer.echo(f"error: not a PDF: {input}", err=True)
+    if not inputs:
+        typer.echo("error: no input file(s) given", err=True)
         raise typer.Exit(2)
 
-    out_dir = (out if out else input.parent).resolve()
+    if locate is not None:
+        inputs = [_locate_file(i, locate) for i in inputs]
+
+    codes: list[int] = []
+    for pdf in inputs:
+        codes.append(
+            _process_one(
+                pdf, out=out, force=force, copy_to=copy_to, dry_run=dry_run,
+                pages=pages, llm_flag=llm_flag, model=model,
+                llm_workers=llm_workers, verbose=verbose,
+            )
+        )
+    raise typer.Exit(max(codes))
+
+
+def _process_one(
+    pdf: Path,
+    out: Path | None,
+    force: bool,
+    copy_to: Path | None,
+    dry_run: bool,
+    pages: str | None,
+    llm_flag: bool,
+    model: str | None,
+    llm_workers: int | None,
+    verbose: bool,
+) -> int:
+    """Convert one PDF; returns the exit code for this file (0 = ok)."""
+    if not pdf.is_file():
+        typer.echo(f"error: not a file: {pdf}", err=True)
+        return 2
+    if pdf.suffix.lower() != ".pdf":
+        typer.echo(f"error: not a PDF: {pdf}", err=True)
+        return 2
+
+    out_dir = (out if out else pdf.parent).resolve()
+    md_planned = out_dir / (pdf.stem + ".md")
+    typer.echo(f"source: {pdf}")
+
+    if dry_run:
+        prune.prune(pdf, out_dir, verbose=True, force=force, dry_run=True)
+        typer.echo(f"  would write: {md_planned}")
+        typer.echo(f"  would write: {md_planned.with_suffix('.meta.json')}")
+        if llm_flag:
+            typer.echo("  would run: --llm broken-text correction")
+        if copy_to is not None:
+            dest = copy_to.expanduser().resolve() / md_planned.name
+            note = (
+                "  (exists — would ask to overwrite; --force skips the ask)"
+                if dest.exists() else ""
+            )
+            typer.echo(f"  would copy to: {dest}{note}")
+        typer.echo("  dry-run: nothing written, deleted, or overwritten.")
+        return 0
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    typer.echo(f"source: {input}")
-
-    if not prune.prune(input, out_dir, verbose=True):
+    if not prune.prune(pdf, out_dir, verbose=True, force=force):
         typer.echo(
             "aborted: existing .md was not overwritten (declined) — nothing written.",
             err=True,
         )
-        raise typer.Exit(1)
+        return 1
 
-    md_path, meta = convert.convert(input, out_dir, pages)
+    try:
+        md_path, meta = convert.convert(pdf, out_dir, pages)
+    except pymupdf.FileDataError as e:
+        typer.echo(f"error: cannot read PDF {pdf.name}: {e}", err=True)
+        return 2
+
+    if copy_to is not None:
+        _copy_output(md_path, copy_to, force)
 
     if llm_flag:
         c = cfg.load_config()
@@ -156,7 +309,7 @@ def convert_cmd(
                 "error: --llm requires LLM config. Run once with --llm-auth.",
                 err=True,
             )
-            raise typer.Exit(3)
+            return 3
         text = md_path.read_text(encoding="utf-8")
         try:
             text, llm_stats = llm.correct_with_llm(
@@ -166,7 +319,7 @@ def convert_cmd(
             )
         except llm.LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)
-            raise typer.Exit(4)
+            return 4
         md_path.write_text(text, encoding="utf-8")
         meta["llm"] = llm_stats
         meta["checks"] = checks.run_checks(text, meta["page_chars"])
@@ -183,8 +336,7 @@ def convert_cmd(
 
     _print_summary(meta)
 
-    score = meta["checks"]["score"]
-    raise typer.Exit(0 if score >= 40 else 1)
+    return 0 if meta["checks"]["score"] >= 40 else 1
 
 
 if __name__ == "__main__":
