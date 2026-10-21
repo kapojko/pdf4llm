@@ -69,9 +69,5 @@ def fetch_models(endpoint: str, api_key: str) -> list[str]:
 
 
 def mask(value: str) -> str:
-    """Mask an API key for display."""
-    if not value:
-        return ""
-    if len(value) <= 6:
-        return "***"
-    return f"{value[:3]}***{value[-3:]}"
+    """Mask an API key for display (never reveal any of it)."""
+    return "***" if value else ""

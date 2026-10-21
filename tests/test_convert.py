@@ -98,11 +98,20 @@ def test_setup_llm_picks_model(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "fetch_models", lambda e, k: ["model-a", "model-b"])
     answers = iter(["http://h/v1", "key", "2"])  # endpoint, key, pick #2
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **k: next(answers))
     cli._setup_llm()
 
     c = config.load_config()
     assert c["model"] == "model-b"
     assert c["endpoint"] == "http://h/v1"
+
+
+def test_mask_hides_key():
+    from pdf4llm import config
+
+    assert config.mask("") == ""
+    assert config.mask("supersecretkey") == "***"
+    assert "supersecretkey" not in config.mask("supersecretkey")
 
 
 def test_score_penalizes_no_headings():

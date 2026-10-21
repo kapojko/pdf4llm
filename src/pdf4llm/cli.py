@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import getpass
+
 import typer
 
 from . import checks, config as cfg, convert, llm, prune
@@ -32,7 +34,10 @@ def _setup_llm() -> None:
         f"endpoint (base url, e.g. http://127.0.0.1:11434/v1) "
         f"[{c.get('endpoint', '')}]: "
     ).strip()
-    api_key = input(f"api key [{c.get('api_key', '')}]: ").strip()
+    # getpass: the key is not echoed while typing; previous value masked.
+    api_key = getpass.getpass(
+        f"api key [{cfg.mask(c.get('api_key', ''))}]: "
+    ).strip()
     if endpoint:
         c["endpoint"] = endpoint
     if api_key:
@@ -41,19 +46,24 @@ def _setup_llm() -> None:
     endpoint = c.get("endpoint", "")
     api_key = c.get("api_key", "")
     models = cfg.fetch_models(endpoint, api_key)
+    current = c.get("model", "")
     model = ""
     if models:
         typer.echo("Available models:")
         for i, m in enumerate(models, 1):
-            typer.echo(f"  {i}. {m}")
-        choice = input(f"Select model [1-{len(models)}] (or type a name): ").strip()
+            marker = "  (current)" if m == current else ""
+            typer.echo(f"  {i}. {m}{marker}")
+        choice = input(
+            f"Select model [1-{len(models)}] "
+            f"(current: {current or 'none'}; empty keeps current): "
+        ).strip()
         if choice.isdigit() and 1 <= int(choice) <= len(models):
             model = models[int(choice) - 1]
         else:
-            model = choice
+            model = choice  # empty keeps `current`
     else:
         typer.echo("Could not fetch model list — enter the model name manually.")
-        model = input(f"model name [{c.get('model', '')}]: ").strip()
+        model = input(f"model name [{current or 'none'}]: ").strip()
     if model:
         c["model"] = model
 
