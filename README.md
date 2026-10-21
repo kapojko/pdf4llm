@@ -42,7 +42,8 @@ exit results); the final exit code is the worst per-file code.
 | `input` | one or more PDF files (positional) |
 | `-o/--out DIR` | output dir, **default = same folder as the PDF** |
 | `--pages A-B,12,15` | page subset (useful for short LLM tests) |
-| `--locate FOLDER` | treat `input` as a file **name** and search for it recursively in FOLDER; must match exactly one file (case-insensitive) or the run aborts with the match list |
+| `--locate FOLDER` | treat `input` as a file **name** and search for it recursively in FOLDER; must match exactly one file (case-insensitive) or the run aborts with the match list. Uses an index file (`.pdf4llm_locate.idx`) inside FOLDER so repeat runs skip the slow recursive scan (big win on network shares); a missing or vanished match triggers one automatic rebuild, and all inputs are matched from a single scan |
+| `--locate-rebuild` | force a fresh `--locate` scan and rewrite the index file in FOLDER |
 | `--copy FOLDER` | after conversion, additionally copy the final `.md` into FOLDER (created if missing); if the file exists there, ask y/N — or overwrite silently with `--force` |
 | `--force` | skip all y/N confirmations (delete / overwrite / copy-overwrite); actions are still logged to `.pdf4llm_prune.log` |
 | `--dry-run` | show the full plan (locate result, cleanup actions, output/meta/copy paths) without converting, writing, deleting or prompting |

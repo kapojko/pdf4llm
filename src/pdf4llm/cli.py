@@ -20,7 +20,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import getpass
+import os
 import shutil
+import time
+from datetime import datetime
 
 import pymupdf
 import typer
@@ -82,45 +85,131 @@ def _setup_llm() -> None:
     )
 
 
-def _locate_file(input: Path, folder: Path) -> Path:
-    """Find a file named like `input` recursively under `folder`.
+_LOCATE_IDX_NAME = ".pdf4llm_locate.idx"
+_LOCATE_IDX_HEADER = "pdf4llm-locate-index 1"
+
+
+def _locate_index_path(folder: Path) -> Path:
+    return folder / _LOCATE_IDX_NAME
+
+
+def _locate_build_index(folder: Path) -> dict[str, list[str]]:
+    """Walk `folder` once, write the on-disk index, return the name mapping.
+
+    The index maps lowercase file name -> list of absolute path strings, so
+    repeated --locate runs (especially over slow network shares) skip the
+    expensive recursive directory walk entirely.
+    """
+    idx_path = _locate_index_path(folder)
+    mapping: dict[str, list[str]] = {}
+    lines: list[str] = [
+        _LOCATE_IDX_HEADER,
+        f"folder={folder.as_posix()}",
+        f"built={datetime.now().isoformat(timespec='seconds')}",
+    ]
+    for root, _dirs, files in os.walk(folder):
+        for name in files:
+            if name == _LOCATE_IDX_NAME:
+                continue
+            full = os.path.join(root, name)
+            mapping.setdefault(name.lower(), []).append(full)
+            lines.append(f"{name.lower()}\t{full}")
+    tmp_path = idx_path.with_name(idx_path.name + ".tmp")
+    try:
+        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp_path, idx_path)
+    except OSError:
+        pass  # unwritable share: locate still works, just without caching
+    return mapping
+
+
+def _locate_load_index(folder: Path) -> dict[str, list[str]] | None:
+    """Load the index for `folder`; None if missing, corrupt or for another folder."""
+    try:
+        lines = _locate_index_path(folder).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    if (
+        len(lines) < 4
+        or lines[0] != _LOCATE_IDX_HEADER
+        or lines[1] != f"folder={folder.as_posix()}"
+    ):
+        return None
+    mapping: dict[str, list[str]] = {}
+    for line in lines[3:]:
+        name, sep, full = line.partition("\t")
+        if sep:
+            mapping.setdefault(name, []).append(full)
+    return mapping
+
+
+def _locate_files(inputs: list[Path], folder: Path, rebuild: bool = False) -> list[Path]:
+    """Resolve every `inputs` entry (a bare file NAME) to a path under `folder`.
 
     Matching is case-insensitive on the file NAME only (any subfolder).
-    Exactly one match is required; otherwise exit with the match list.
+    Each name must match exactly one file; otherwise exit with the match list.
+    Uses the index file inside `folder` when possible; a missing target or a
+    vanished match triggers one rebuild so new files are always found.
     """
     folder = folder.expanduser().resolve()
-    if input.parent != Path("."):
-        typer.echo(
-            f"error: --locate takes a file NAME, not a path: {input}", err=True,
-        )
-        raise typer.Exit(2)
+    for i in inputs:
+        if i.parent != Path("."):
+            typer.echo(
+                f"error: --locate takes a file NAME, not a path: {i}", err=True,
+            )
+            raise typer.Exit(2)
     if not folder.is_dir():
         typer.echo(f"error: --locate folder not found: {folder}", err=True)
         raise typer.Exit(2)
-    target = input.name.lower()
-    matches = sorted(
-        p for p in folder.rglob("*")
-        if p.is_file() and p.name.lower() == target
-    )
-    if not matches:
-        typer.echo(
-            f"error: --locate: no file named '{input.name}' found under {folder}",
-            err=True,
+
+    targets = list(dict.fromkeys(i.name.lower() for i in inputs))
+
+    index = None if rebuild else _locate_load_index(folder)
+    if index is not None:
+        fresh = all(t in index for t in targets) and all(
+            os.path.isfile(p) for t in targets for p in index[t]
         )
-        raise typer.Exit(2)
-    if len(matches) > 1:
+        if not fresh:
+            index = None  # miss or stale match -> one rebuild
+    if index is None:
+        reason = "--locate-rebuild" if rebuild else "missing or stale"
+        typer.echo(f"locate: building index for {folder} ({reason})...")
+        t0 = time.perf_counter()
+        index = _locate_build_index(folder)
+        n = sum(len(v) for v in index.values())
         typer.echo(
-            f"error: --locate: multiple matches for '{input.name}' under {folder}:",
-            err=True,
+            f"locate: index built: {n} files, {time.perf_counter() - t0:.1f}s "
+            f"({_locate_index_path(folder)})"
         )
-        for m in matches:
-            typer.echo(f"  {m}", err=True)
-        typer.echo(
-            "narrow the search folder (or rename files) so exactly one matches.",
-            err=True,
-        )
-        raise typer.Exit(2)
-    return matches[0]
+
+    results: list[Path] = []
+    for i in inputs:
+        matches = sorted(Path(p) for p in index.get(i.name.lower(), []))
+        if not matches:
+            typer.echo(
+                f"error: --locate: no file named '{i.name}' found under {folder}",
+                err=True,
+            )
+            raise typer.Exit(2)
+        if len(matches) > 1:
+            typer.echo(
+                f"error: --locate: multiple matches for '{i.name}' under {folder}:",
+                err=True,
+            )
+            for m in matches:
+                typer.echo(f"  {m}", err=True)
+            typer.echo(
+                "narrow the search folder (or rename files) so exactly one matches.",
+                err=True,
+            )
+            raise typer.Exit(2)
+        results.append(matches[0])
+    return results
+
+
+def _locate_file(input: Path, folder: Path) -> Path:
+    """Single-input convenience wrapper around `_locate_files`."""
+    return _locate_files([input], folder)[0]
 
 
 def _copy_output(md_path: Path, copy_to: Path, force: bool) -> None:
@@ -189,6 +278,10 @@ def convert_cmd(
         help="Treat INPUT as a file NAME and search for it recursively in FOLDER "
              "(must match exactly one file)",
     ),
+    locate_rebuild: bool = typer.Option(
+        False, "--locate-rebuild",
+        help="Force a fresh --locate scan, rewriting the index file in FOLDER",
+    ),
     copy_to: Path = typer.Option(
         None, "--copy", metavar="FOLDER",
         help="Additionally copy the final .md into FOLDER (created if missing; "
@@ -228,7 +321,7 @@ def convert_cmd(
         raise typer.Exit(2)
 
     if locate is not None:
-        inputs = [_locate_file(i, locate) for i in inputs]
+        inputs = _locate_files(inputs, locate, rebuild=locate_rebuild)
 
     codes: list[int] = []
     for pdf in inputs:

@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 import pymupdf
 
 from pdf4llm import __version__
-from pdf4llm.cli import _locate_file, app
+from pdf4llm.cli import (_LOCATE_IDX_NAME, _locate_file, _locate_files, app)
 from pdf4llm.prune import prune
 
 runner = CliRunner()
@@ -62,6 +62,48 @@ def test_locate_multiple_matches_exits(tmp_path: Path):
 def test_locate_rejects_path_input(tmp_path: Path):
     with pytest.raises(typer.Exit) as e:
         _locate_file(Path("sub/dir/file.pdf"), tmp_path)
+    assert e.value.exit_code == 2
+
+
+def test_locate_writes_and_reuses_index(tmp_path: Path):
+    (tmp_path / "manual.pdf").write_bytes(b"%PDF-1.4")
+    got = _locate_files([Path("manual.pdf")], tmp_path)
+    assert got == [tmp_path / "manual.pdf"]
+    idx = tmp_path / _LOCATE_IDX_NAME
+    assert idx.is_file()
+
+    # corrupt the target but keep a stale index: lookup must rebuild and find it
+    idx.write_text("pdf4llm-locate-index 1\nfolder=x\nbuilt=old\nnomatch\tpath\n")
+    (tmp_path / "new.pdf").write_bytes(b"%PDF-1.4")
+    got = _locate_files([Path("new.pdf")], tmp_path)
+    assert got == [tmp_path / "new.pdf"]
+
+
+def test_locate_index_survives_subsequent_calls(tmp_path: Path):
+    (tmp_path / "a.pdf").write_bytes(b"1")
+    (tmp_path / "b.pdf").write_bytes(b"2")
+    assert _locate_files([Path("a.pdf"), Path("b.pdf")], tmp_path) == [
+        tmp_path / "a.pdf", tmp_path / "b.pdf",
+    ]
+    mtime = (tmp_path / _LOCATE_IDX_NAME).stat().st_mtime_ns
+    # second run: index is fresh and reused, not rewritten
+    assert _locate_files([Path("b.pdf")], tmp_path) == [tmp_path / "b.pdf"]
+    assert (tmp_path / _LOCATE_IDX_NAME).stat().st_mtime_ns == mtime
+
+
+def test_locate_rebuild_flag_rescans(tmp_path: Path):
+    (tmp_path / "a.pdf").write_bytes(b"1")
+    _locate_files([Path("a.pdf")], tmp_path)
+    (tmp_path / "late.pdf").write_bytes(b"2")
+    got = _locate_files([Path("late.pdf")], tmp_path, rebuild=True)
+    assert got == [tmp_path / "late.pdf"]
+
+
+def test_locate_index_ignores_itself(tmp_path: Path):
+    (tmp_path / "a.pdf").write_bytes(b"1")
+    _locate_files([Path("a.pdf")], tmp_path)
+    with pytest.raises(typer.Exit) as e:
+        _locate_file(Path(_LOCATE_IDX_NAME), tmp_path)
     assert e.value.exit_code == 2
 
 
