@@ -12,13 +12,12 @@ try {
         throw "uv tool install failed"
     }
 
-    # `uv tool` installs the shim into its managed bin dir (on Windows:
-    # %APPDATA%\Python\Scripts\pdf4llm.exe). Copy it into the shared util dir.
-    $uvBin = Join-Path $env:APPDATA "Python\Scripts"
+    # `uv tool` installs the shim into its managed bin dir. Ask uv where that
+    # is (historically %APPDATA%\Python\Scripts, now usually %USERPROFILE%\.local\bin).
+    $uvBin = (& uv tool dir --bin).Trim()
     $shim  = Join-Path $uvBin "pdf4llm.exe"
     if (-not (Test-Path $shim)) {
-        # Fallback: ask uv where tools are installed.
-        Write-Warning "Shim not found at $shim — relying on the uv-managed PATH entry."
+        throw "Shim not found at $shim — uv tool dir --bin is wrong?"
     }
 
     $dest = "C:\Programs\Util"
