@@ -1,0 +1,121 @@
+{
+ "name": "ornith",
+ "model": "ornith-1.5-9b-np4",
+ "workers": 4,
+ "wall_secs": 416.8,
+ "accepted": 56,
+ "salvaged": 6,
+ "rejected": 18,
+ "blocks_fixed": 9,
+ "retries_used": 44,
+ "rejected_reasons": [
+  {
+   "chunk": 8,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; invariant A violated: content characters chang"
+   ]
+  },
+  {
+   "chunk": 11,
+   "reasons": [
+    "unsafe whitespace join ('\\uf06c' | 'B'): ...'\\n- \\uf06c   Boot from pr'...; unsafe whitespace join ('\\uf06c' | 'B'): ...'\\n- \\uf06c   Boot from sy'...; unsafe w"
+   ]
+  },
+  {
+   "chunk": 20,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 23,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 27,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; output truncated (finish_reason=length) — outp"
+   ]
+  },
+  {
+   "chunk": 29,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; unsafe whitespace join ('7' | '1'): ...'\\nV2.7                                                18"
+   ]
+  },
+  {
+   "chunk": 31,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; output truncated (finish_reason=length) — outp"
+   ]
+  },
+  {
+   "chunk": 36,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit"
+   ]
+  },
+  {
+   "chunk": 42,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit"
+   ]
+  },
+  {
+   "chunk": 44,
+   "reasons": [
+    "unsafe whitespace join ('D' | '='): ...'and when VDD  = 3.3V, all '...; unsafe whitespace join ('K' | '='): ...' |  | F HCLK  = 144MHz | 1'...; unsafe whitespac"
+   ]
+  },
+  {
+   "chunk": 48,
+   "reasons": [
+    "invariant A violated: content characters changed; unsafe whitespace join ('|' | '|'): ...'|  |  |  |  | V'...; unsafe whitespace join ('|' | '|'): ...'|  |  |  "
+   ]
+  },
+  {
+   "chunk": 53,
+   "reasons": [
+    "unsafe whitespace join ('|' | '|'): ...' Parameter |  | Condition '...; unsafe whitespace join ('|' | '|'): ...'libration) |  |  | 8 |  | '...; unsafe whitespac"
+   ]
+  },
+  {
+   "chunk": 54,
+   "reasons": [
+    "unsafe whitespace join ('2' | ','): ...'er, CL1 =CL2 , generally '...; unsafe whitespace join ('L' | '='): ...'formula: C_L  = CL1  x C L'...; invariant A viola"
+   ]
+  },
+  {
+   "chunk": 62,
+   "reasons": [
+    "unsafe whitespace join ('*' | 'i'): ...'\\n- 2. V *  in the above'...; unsafe whitespace join ('7' | '3'): ...'\\nV2.7                                            "
+   ]
+  },
+  {
+   "chunk": 63,
+   "reasons": [
+    "unsafe whitespace join ('s' | '('): ...'racteristics   (For PC13~PC'..."
+   ]
+  },
+  {
+   "chunk": 66,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 68,
+   "reasons": [
+    "unsafe whitespace join ('|' | '|'): ...'|  |  |  | Stan'...; non-whitespace change: '' -> '|'; unsafe whitespace join ('|' | '|'): ...'| Symbol |  | Min. | Max'"
+   ]
+  },
+  {
+   "chunk": 74,
+   "reasons": [
+    "unsafe whitespace join ('C' | '='): ...'IN when fADC  = 14MHz*\\n'...; unsafe whitespace join ('S' | '('): ...'cycle) | t_S  (us) | Maxim'...; unsafe whitespace "
+   ]
+  }
+ ]
+}

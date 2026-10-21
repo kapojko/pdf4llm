@@ -536,10 +536,10 @@ def test_resolve_workers_auto_from_slots(monkeypatch):
     notes = []
     w, entry = llm.resolve_workers("http://x", "k", "m-np4", 6000, None,
                                    note=notes.append)
-    assert w == 4 and entry["key"] == "m-np4"        # min(slots, 4)
+    assert w == 4 and entry["key"] == "m-np4"        # min(slots, 8)
     w8, _ = llm.resolve_workers("http://x", "k", "m-np8", 6000, None,
                                 note=notes.append)
-    assert w8 == 4                                    # capped at 4
+    assert w8 == 8                                    # capped at 8
     w1, _ = llm.resolve_workers("http://x", "k", "m-np1", 6000, None,
                                 note=notes.append)
     assert w1 == 1                                    # np=1 -> sequential

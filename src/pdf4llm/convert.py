@@ -205,7 +205,7 @@ def convert(pdf: Path, out_dir: Path, pages: str | None = None) -> tuple[Path, d
     n = len(idx) if idx is not None else page_count
     print(
         f"  converting {n}/{page_count} page(s) with the neural layout engine "
-        "— this can take minutes; fan noise means it is working ...",
+        "(this may take several minutes) ...",
         flush=True,
     )
     t0 = time.perf_counter()

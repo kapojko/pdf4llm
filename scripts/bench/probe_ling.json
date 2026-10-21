@@ -1,0 +1,175 @@
+{
+ "name": "ling",
+ "model": "ling-3.0-tiny-np8",
+ "workers": 8,
+ "wall_secs": 272.4,
+ "accepted": 46,
+ "salvaged": 7,
+ "rejected": 27,
+ "blocks_fixed": 10,
+ "retries_used": 44,
+ "rejected_reasons": [
+  {
+   "chunk": 1,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 3,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; invariant A violated: content characters chang"
+   ]
+  },
+  {
+   "chunk": 7,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 10,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 11,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 12,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 22,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 27,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; output truncated (finish_reason=length) — outp"
+   ]
+  },
+  {
+   "chunk": 29,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; output truncated (finish_reason=length) — outp"
+   ]
+  },
+  {
+   "chunk": 31,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; unsafe whitespace join ('7' | '1'): ...'\\nV2.7                                                19"
+   ]
+  },
+  {
+   "chunk": 36,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit"
+   ]
+  },
+  {
+   "chunk": 38,
+   "reasons": [
+    "unsafe whitespace join ('D' | '='): ...' ℃ ) and VDD  = 3.3V envir'...; unsafe whitespace join ('D' | '='): ...' ℃ ) and VDD  = 3.3V envir'..."
+   ]
+  },
+  {
+   "chunk": 42,
+   "reasons": [
+    "output truncated (finish_reason=length) — output token cap hit; invariant A violated: content characters changed; output truncated (finish_reason=length) — outp"
+   ]
+  },
+  {
+   "chunk": 43,
+   "reasons": [
+    "unsafe whitespace join ('A' | '='): ...'oltage | T A  = -40℃~85℃ |'...; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 44,
+   "reasons": [
+    "invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 46,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 50,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 57,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 58,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 60,
+   "reasons": [
+    "invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 61,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 64,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  },
+  {
+   "chunk": 65,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 66,
+   "reasons": [
+    "unsafe whitespace join ('K' | '='): ...' | f TIMxCLK  = 72MHz | 13'...; unsafe whitespace join ('K' | '='): ...' | f TIMxCLK  = 72MHz | 0 '...; unsafe whitespac"
+   ]
+  },
+  {
+   "chunk": 75,
+   "reasons": [
+    "invariant A violated: content characters changed; unsafe whitespace join ('C' | '='): ...'error | fADC  = 14MHz, RAI'...; unsafe whitespace join ('A' | '='): .."
+   ]
+  },
+  {
+   "chunk": 78,
+   "reasons": [
+    "no usable output"
+   ]
+  },
+  {
+   "chunk": 79,
+   "reasons": [
+    "invariant A violated: content characters changed; invariant A violated: content characters changed; invariant A violated: content characters changed"
+   ]
+  }
+ ]
+}

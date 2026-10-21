@@ -53,7 +53,7 @@ exit results); the final exit code is the worst per-file code.
 | `--dry-run` | show the full plan (locate result, cleanup actions, output/meta/copy paths) without converting, writing, deleting or prompting |
 | `--version` | print the pdf4llm version and exit |
 | `--llm` | run local-LLM broken-text correction (default **off**) |
-| `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 4)`), else 1; an explicit value overrides the server |
+| `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 8)`), else 1; an explicit value overrides the server |
 | `--llm-chunk-chars N` | max chunk size (chars) for the LLM pass; default **2000** (config key `llm_chunk_chars`). Smaller chunks are more stable on small local models |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--model NAME` | override LLM model (else from saved config) |
@@ -152,9 +152,10 @@ Chunks are processed one after another unless parallelism is available. With
 a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
 self-description endpoint and:
 
-- sets the number of workers automatically to `min(slots, 4)` (the GPU is
-  bandwidth-limited — more slots only thin out per-stream throughput without
-  shortening the critical path); an explicit `--llm-workers` overrides this;
+- sets the number of workers automatically to `min(slots, 8)` (measured on
+  ling-3.0-tiny-np8: w4→w8 ≈ 1.75x aggregate throughput; w16 gave no further
+  gain — the GPU saturates at ~8 streams); an explicit `--llm-workers`
+  overrides this;
 - reads the per-request `contextSize` (total `-c` divided by slots) and checks
   a rough token estimate (input + same-size output + margin, ~3.5 chars/token)
   for the **largest actual chunk** against it; if a chunk provably cannot fit,

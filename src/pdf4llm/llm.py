@@ -745,6 +745,20 @@ def _run_chunk(
     return result, delta
 
 
+def _fmt_chunk_state(delta: dict) -> str:
+    """One-line final state for a processed chunk: outcome, retries, salvage."""
+    if delta.get("accepted"):
+        state = "accepted"
+    elif delta.get("salvaged"):
+        state = f"salvaged {delta['blocks_fixed']} block(s)"
+    else:
+        state = "REJECTED"
+    if delta.get("truncated"):
+        state += f", truncated x{delta['truncated']}"
+    state += f", retries {delta['retries_used']}"
+    return state
+
+
 def _apply_chunk_delta(stats: dict, delta: dict) -> None:
     """Merge one chunk's stats delta into the global stats dict."""
     if delta.get("accepted"):
@@ -770,10 +784,11 @@ _CHARS_PER_TOKEN = 3.5
 # Slack for the system prompt, retry hint, code-fence wrapping and estimator
 # error, added on top of the estimated input+output tokens.
 _CTX_MARGIN_TOKENS = 512
-# Cap on auto-selected workers: beyond 4 slots the GPU (bandwidth-limited)
-# spends its throughput on more concurrent streams without shortening the
-# critical path.
-_MAX_AUTO_WORKERS = 4
+# Cap on auto-selected workers. Measured on ling-3.0-tiny-np8 (2026-10):
+# w4→w8 ≈ 1.75x aggregate throughput (268s vs 470s on an 80-chunk fragment);
+# w16 gave no further gain (264s) — the GPU is saturated at ~8 streams.
+# The cap only limits auto-selection; --llm-workers overrides it.
+_MAX_AUTO_WORKERS = 8
 
 
 class LlmContextError(RuntimeError):
@@ -826,7 +841,7 @@ def resolve_workers(
 ) -> tuple[int, dict | None]:
     """Probe llama-swappy; auto-set workers and check the context fit.
 
-    Worker priority: explicit ``workers`` argument > ``min(slots, 4)`` from
+    Worker priority: explicit ``workers`` argument > ``min(slots, 8)`` from
     the info endpoint > 1 (unknown server). The context check compares a
     rough input+output estimate for the largest chunk against the per-request
     contextSize reported by llama-swappy (v1.3 semantics: total -c divided
@@ -911,7 +926,7 @@ def correct_with_llm(
     independent and the output is reassembled strictly in original order.
 
     ``workers`` None (default) auto-selects from the llama-swappy info
-    endpoint: min(slots, 4), falling back to 1 when the server does not
+    endpoint: min(slots, 8), falling back to 1 when the server does not
     self-describe. When the server reports its per-request context, a rough
     input+output estimate for the largest chunk is checked against it and
     the pass is aborted (LlmContextError) when a chunk provably cannot fit.
@@ -995,7 +1010,8 @@ def correct_with_llm(
             if i < len(chunks):
                 eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
                 print(
-                    f"  llm: chunk {i}/{len(chunks)} done in "
+                    f"  llm: chunk {i}/{len(chunks)} done "
+                    f"[{_fmt_chunk_state(delta)}] in "
                     f"{_fmt_duration(delta['duration'])}  |  elapsed "
                     f"{_fmt_duration(time.monotonic() - t0)}  |  "
                     f"eta ~{_fmt_duration(eta)}",
@@ -1025,7 +1041,8 @@ def correct_with_llm(
             elapsed = time.monotonic() - t0
             eta = elapsed / n_done * (len(chunks) - n_done)
             print(
-                f"  llm: {n_done}/{len(chunks)} done, elapsed "
+                f"  llm: {n_done}/{len(chunks)} done "
+                f"[{_fmt_chunk_state(delta)}], elapsed "
                 f"{_fmt_duration(elapsed)}, eta ~{_fmt_duration(eta)}",
                 flush=True,
             )

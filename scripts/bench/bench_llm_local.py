@@ -1,0 +1,98 @@
+"""Local benchmark: ornith-1.5-9b-np4 vs ling-3.0-tiny-np8 (and worker counts).
+
+Usage: python bench_llm_local.py <name> <model-key> <workers>
+Appends one result row to bench_results.json. Per-run stdout is captured to
+bench_logs/<name>.log (the pass prints unconditional progress lines).
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+
+from pdf4llm import llm
+from pdf4llm.config import load_config
+
+NAME, MODEL, WORKERS = sys.argv[1], sys.argv[2], int(sys.argv[3])
+cfg = load_config()
+ENDPOINT, API_KEY = cfg["endpoint"], cfg["api_key"]
+
+TEXT = Path("out/CH32V208DS0 2.7 2026-06-01.md").read_text(encoding="utf-8")
+
+
+def main() -> None:
+    log_path = Path(__file__).resolve().parent / "bench_logs"; log_path.mkdir(exist_ok=True)
+    log_file = (log_path / f"{NAME}.log").open("w", encoding="utf-8")
+
+    # warm-up: first request makes llama-swappy load the model (unload first
+    # if another model is resident) — that load time must not pollute timing
+    import litellm
+    litellm.suppress_debug_info = True
+    t_load = time.perf_counter()
+    r = litellm.completion(
+        model=f"openai/{MODEL}",
+        messages=[{"role": "user", "content": "Answer with exactly: OK"}],
+        api_base=ENDPOINT, api_key=API_KEY, max_tokens=8,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    load_secs = time.perf_counter() - t_load
+    print(f"[{NAME}] warm-up reply={r.choices[0].message.content!r} "
+          f"(incl. load/switch {load_secs:.1f}s)", flush=True)
+
+    # record per-chunk deltas by wrapping _run_chunk
+    deltas: list[dict] = []
+    orig_run_chunk = llm._run_chunk
+
+    def recording_run_chunk(*a, **kw):
+        result, delta = orig_run_chunk(*a, **kw)
+        deltas.append(delta)
+        return result, delta
+
+    llm._run_chunk = recording_run_chunk
+    t0 = time.perf_counter()
+    with contextlib.redirect_stdout(log_file):
+        corrected, stats = llm.correct_with_llm(
+            TEXT, MODEL, ENDPOINT, API_KEY,
+            classify=False, workers=WORKERS,
+        )
+    wall = time.perf_counter() - t0
+    log_file.close()
+    llm._run_chunk = orig_run_chunk
+
+    # fix-quantity metrics vs the input text
+    in_lines = TEXT.split("\n")
+    out_lines = corrected.split("\n")
+    changed_lines = sum(1 for a, b in zip(in_lines, out_lines) if a != b)
+
+    result = {
+        "name": NAME, "model": MODEL, "workers": WORKERS,
+        "load_switch_secs": round(load_secs, 1),
+        "wall_secs": round(wall, 1),
+        "chars_per_sec": round(len(TEXT) / wall),
+        "chunks": len(stats["chunks_total"]) if isinstance(stats["chunks_total"], list) else stats["chunks_total"],
+        "accepted": stats["chunks_accepted"],
+        "salvaged": stats["chunks_salvaged"],
+        "rejected": stats["chunks_rejected"],
+        "blocks_fixed": stats["blocks_fixed"],
+        "retries_used": stats["retries_used"],
+        "truncated_calls": stats["truncated_calls"],
+        "changed_lines_vs_input": changed_lines,
+        "chunk_duration_secs": sorted(round(d["duration"], 1) for d in deltas),
+        "corrected_chars": len(corrected),
+    }
+    out = Path(__file__).resolve().parent / "outputs" / f"bench_{NAME}.md"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(corrected, encoding="utf-8")
+    results_file = Path(__file__).resolve().parent / "bench_results.json"
+    rows = json.loads(results_file.read_text()) if results_file.exists() else []
+    rows = [r for r in rows if r["name"] != NAME] + [result]
+    results_file.write_text(json.dumps(rows, indent=1))
+    print(json.dumps(result, indent=1), flush=True)
+
+
+if __name__ == "__main__":
+    main()

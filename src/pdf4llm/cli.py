@@ -307,7 +307,7 @@ def convert_cmd(
     llm_workers: int = typer.Option(
         None, "--llm-workers", min=1,
         help="Parallel LLM chunk requests. Default: auto from llama-swappy info "
-             "(min(slots, 4)), else 1. Explicit value overrides the server.",
+             "(min(slots, 8)), else 1. Explicit value overrides the server.",
     ),
     llm_chunk_chars: int = typer.Option(
         None, "--llm-chunk-chars", min=200,
