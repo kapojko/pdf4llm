@@ -5,31 +5,29 @@ Design (safety-first):
 1. Classification (technical vs general) picks only the *prompt* — never the
    safety rules. LLM classifier on the document head; keyword heuristic
    fallback; any ambiguity/error defaults to the strict technical prompt.
-2. The model may only perform whitespace-level edits (join split words,
-   ``V CC`` -> ``VCC``, ``SOT108 - 1`` -> ``SOT108-1``, false line breaks).
-3. Every chunk is verified algorithmically before it is accepted:
-   - Invariant A: whitespace-stripped input and output are byte-identical
-     (catches ANY inserted/deleted/reordered content character — rephrasing,
-     translation, "helpful" fixes).
-   - Invariant B: table rows keep their cell count; edits are checked
-     per cell (90% of datasheet data lives in cells).
-   - Invariant C: a deleted whitespace run is only allowed where its
-     neighbours cannot make a numeric join dangerous (digit-digit and
-     value-symbol joins are structurally forbidden, e.g. ``2 0`` -> ``20``,
-     ``0x30 08`` -> ``0x3008``, ``V CC + 0.5`` -> ``VCC+ 0.5``).
-   - Non-passing chunk is rejected as a whole and the original kept;
-     the rejection is logged into meta.json.
+2. Deterministic pre-passes (no LLM involved) remove known extraction noise
+   the models reliably try to "fix" and thereby poison chunks with:
+   horizontal rules, TOC dot leaders, duplicate bullet glyphs; plus guarded
+   subscript normalisation ('V CC' -> 'VCC', 'T amb' -> 'T_amb').
+3. Every chunk is verified algorithmically before it is accepted, on one of
+   two levels (see the verification section below):
+   - strict (default): whitespace-level edits only, with numeric-token
+     protection and table structure checks;
+   - content (--llm-content-only): letters, digits, underscores and numeric
+     values are protected; punctuation and table geometry are free.
+   Non-passing chunks are rejected as a whole, salvaged line-by-line, and
+   the original is always the fallback; rejections are logged into meta.json.
 """
 from __future__ import annotations
 
 import difflib
 import json
 import math
+import queue
 import re
 import threading
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Deterministic pre-passes (no LLM involved).
@@ -58,6 +56,29 @@ def strip_horizontal_rules(text: str) -> tuple[str, int]:
     """
     out, n = _HR_LINE_RE.subn("", text)
     return out, n
+
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-pass: TOC dot leaders (no LLM involved).
+# Extraction leaves dotted leaders in tables of contents ('Glossary
+# . . . . . . . . 71', 'Overview ...... 12'). Models treat the dot runs as
+# noise and trim or pad them — a non-whitespace change, so the whole chunk
+# fails invariant A and every retry is burned on a hopeless chunk (TOC pages
+# can be a large share of a reference manual). Collapsing runs of 4+ dots
+# (spaces allowed between the dots) to a single space removes the temptation
+# deterministically; titles and page numbers survive byte-identical. Runs of
+# exactly 3 dots (ellipsis in prose) are deliberately left alone.
+# ---------------------------------------------------------------------------
+
+_DOT_LEADER_RE = re.compile(r"(?:\.[ \t]*){4,}")
+
+
+def collapse_dot_leaders(text: str) -> tuple[str, int]:
+    """Collapse dotted TOC leaders (4+ dots, optionally space-separated).
+
+    Returns (text, collapsed_run_count).
+    """
+    return _DOT_LEADER_RE.subn(" ", text)
 
 
 _BULLET_LEAD_RE = re.compile(r"(?m)^(\s*[-*+])\s+[•\u2022]\s+")
@@ -374,73 +395,79 @@ def _strip_thinking(text: str) -> str:
     return text
 
 # ---------------------------------------------------------------------------
-# Algorithmic verification
+# Algorithmic verification (two levels)
+#
+# "strict" (default, --llm): whitespace-level edits only.
+#   Invariant A: whitespace-stripped input and output are byte-identical.
+#   Numeric-token check: digit runs with their internal separators (0.5,
+#     1:0, 1,000, 2026-03-23) and a leading sign (±, -, +, –) must survive
+#     as an ordered sequence — this is what blocks dangerous whitespace
+#     joins like '2 0' -> '20', '0x30 08' -> '0x3008', '-40' -> '40'.
+#   Invariant B: table rows keep their cell count; edits checked per cell.
+#
+# "content" (--llm-content-only): only the DATA is protected.
+#   Alphanumeric skeleton: the ordered sequence of [0-9A-Za-z_]+ runs must
+#     be identical (underscores are identifiers: OTG_HS, T_amb — protected).
+#   Numeric-token check: as above. Whitespace inside a token is normalised
+#     away, so '0 . 5' == '0.5' while '2 0' != '20'.
+#   Everything else — punctuation, ASCII decoration, whitespace, table
+#     geometry ('|' pipes) — is free to change. Letters/digits may never be
+#     inserted, deleted, reordered or recased; duplicated lines/cells are
+#     NOT collapsible (real letters would be lost).
 # ---------------------------------------------------------------------------
 
-def _join_allowed(left: str, right: str) -> bool:
-    """Whitelist: may the whitespace between `left` and `right` be removed?
+# Protected skeleton for content mode. '_' is included deliberately: it is
+# part of register/signal names (DMA_SxCR) and subscript markers (T_amb).
+_SKELETON_RE = re.compile(r"[0-9A-Za-z_]+")
 
-    This is what makes the VCC fix safe: joins are allowed exactly where no
-    numeric value can be corrupted. Any pair not listed here is rejected.
+# Numeric token: optional sign, digits, internal separators; whitespace may
+# surround the separators (extraction often spaces them out: '0 . 5').
+# '.' ',' ':' '/' only — multiplication ('x', '×', '*') is deliberately NOT
+# a separator, so '2×3' -> '23' is rejected. Signs '+-–—±' attach to the
+# token so '-40' -> '40' (temperature!) is rejected.
+_NUM_TOKEN_RE = re.compile(r"[+\-\u2013\u2014\u00b1]?\s*[0-9]+(?:\s*[.,:/]\s*[0-9]+)*")
+
+
+def _num_tokens(text: str) -> list[str]:
+    """Numeric tokens, whitespace inside each token normalised away."""
+    return [re.sub(r"\s+", "", tok) for tok in _NUM_TOKEN_RE.findall(text)]
+
+
+def _num_check(orig: str, out: str) -> str | None:
+    """Ordered numeric-token comparison. Returns a reason or None."""
+    o_toks = _num_tokens(orig)
+    c_toks = _num_tokens(out)
+    if o_toks == c_toks:
+        return None
+    for a, b in zip(o_toks, c_toks):
+        if a != b:
+            return f"numeric token changed: {a!r} -> {b!r}"
+    if len(o_toks) > len(c_toks):
+        return f"numeric token dropped: {o_toks[len(c_toks)]!r}"
+    return f"numeric token inserted: {c_toks[len(o_toks)]!r}"
+
+
+def _check_content_edit(orig: str, out: str) -> str | None:
+    """Content-mode check: skeleton + numeric tokens must be identical."""
+    o_skel = "".join(_SKELETON_RE.findall(orig))
+    c_skel = "".join(_SKELETON_RE.findall(out))
+    if o_skel != c_skel:
+        sm = difflib.SequenceMatcher(None, o_skel, c_skel, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag != "equal":
+                return (f"letters/digits changed ({tag}): "
+                        f"{o_skel[i1:i2][:40]!r} -> {c_skel[j1:j2][:40]!r}")
+        return "letters/digits changed"
+    return _num_check(orig, out)
+
+
+def _verify_chunk(orig: str, out: str, mode: str = "strict") -> str | None:
+    """Verify a whole chunk. Returns None if accepted, else a reason.
+
+    mode 'strict': whitespace-only edits (invariant A + numeric tokens +
+    table invariant B). mode 'content': data-only protection (skeleton +
+    numeric tokens; punctuation and table geometry are free).
     """
-    if left.isalpha() and right.isalpha():          # V CC, T amb, fli p
-        return True
-    if left == "-" and right.isalnum():             # SOT108 - 1
-        return True
-    if right == "-" and left.isalnum():             # SOT108 - 1
-        return True
-    if left == "." and right.isalnum():             # 2 . 5 -> 2.5, '# 3.  Ordering'
-        return True
-    if right == "." and left.isalnum():             # 2 . 5 -> 2.5
-        return True
-    if left.isalpha() and right in ".,;:!?)":        # 'V CC .' -> 'VCC.'
-        return True
-    if left in "([{" and right.isalnum():            # '( nD)' -> '(nD)'
-        return True
-    if left in "\u2014\u2013" or right in "\u2014\u2013":  # around em/en dashes
-        return True
-    return False
-
-
-def _is_ws(s: str) -> bool:
-    return all(c.isspace() for c in s)
-
-
-def _check_whitespace_edit(orig: str, out: str) -> str | None:
-    """Char-level diff check: only whitespace may change, and only safely.
-
-    Returns None if the edit is acceptable, otherwise a rejection reason.
-    """
-    sm = difflib.SequenceMatcher(None, orig, out, autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            continue
-        removed = orig[i1:i2]
-        inserted = out[j1:j2]
-        if not _is_ws(removed) or not _is_ws(inserted):
-            return f"non-whitespace change: {removed!r} -> {inserted!r}"
-        if tag == "delete" or (tag == "replace" and removed):
-            # Expand to the full whitespace run in the original so neighbour
-            # checks see real content characters on both sides.
-            a, b = i1, i2
-            while a > 0 and orig[a - 1].isspace():
-                a -= 1
-            while b < len(orig) and orig[b].isspace():
-                b += 1
-            if not _is_ws(orig[a:b]) or len(orig[a:b]) != b - a:  # defensive
-                return "internal: malformed whitespace run"
-            left = orig[a - 1] if a > 0 else ""
-            right = orig[b] if b < len(orig) else ""
-            if left and right and not _join_allowed(left, right):
-                return (
-                    f"unsafe whitespace join ({left!r} | {right!r}): "
-                    f"...{orig[max(0, a - 12):b + 12]!r}..."
-                )
-    return None
-
-
-def _verify_chunk(orig: str, out: str) -> str | None:
-    """Verify a whole chunk. Returns None if accepted, else a reason."""
     if not out.strip():
         return "empty model output"
     # Model may wrap output in a code fence — strip exactly one.
@@ -448,12 +475,17 @@ def _verify_chunk(orig: str, out: str) -> str | None:
     if m:
         out = m.group(1)
 
+    if mode == "content":
+        return _check_content_edit(orig, out)
+
+    # --- strict mode ---
     # Invariant A (whole chunk): whitespace-stripped sequences identical.
     if "".join(out.split()) != "".join(orig.split()):
         return "invariant A violated: content characters changed"
 
-    # Invariant C (neighbour rules) on the chunk as a whole.
-    reason = _check_whitespace_edit(orig, out)
+    # Numeric-token protection: blocks whitespace merges that corrupt values
+    # ('2 0' -> '20', '0x30 08' -> '0x3008', '-40' -> '40').
+    reason = _num_check(orig, out)
     if reason:
         return reason
 
@@ -468,15 +500,13 @@ def _verify_chunk(orig: str, out: str) -> str | None:
     for orow, orow_out in zip(orig_rows, out_rows):
         if orow.count("|") != orow_out.count("|"):
             return f"table cell count changed: {orow_out[:60]!r}"
-        # per-cell whitespace-only edit check
+        # per-cell whitespace-only edit check (invariant A already passed at
+        # chunk level, so stripped equality here is implied; kept as defense)
         ocells = orow.split("|")
         ncells = orow_out.split("|")
         for oc, nc in zip(ocells, ncells):
             if "".join(oc.split()) != "".join(nc.split()):
                 return f"cell content changed: {nc.strip()[:60]!r}"
-            reason = _check_whitespace_edit(oc, nc)
-            if reason:
-                return f"cell edit rejected ({reason})"
     return None
 
 
@@ -536,15 +566,18 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
     return (resp.choices[0].message.content or "").strip(), finish
 
 
-def _verify_line_in_context(o_lines: list[str], idx: int, c_line: str) -> str | None:
+def _verify_line_in_context(o_lines: list[str], idx: int, c_line: str,
+                            mode: str = "strict") -> str | None:
     """Verify a single-line replacement with neighbouring lines as context."""
     prev = o_lines[idx - 1] if idx > 0 else ""
     nxt = o_lines[idx + 1] if idx + 1 < len(o_lines) else ""
     ctx_o = prev + "\n" + o_lines[idx] + "\n" + nxt
     ctx_c = prev + "\n" + c_line + "\n" + nxt
+    if mode == "content":
+        return _check_content_edit(ctx_o, ctx_c)
     if "".join(ctx_c.split()) != "".join(ctx_o.split()):
         return "invariant A violated: content characters changed"
-    return _check_whitespace_edit(ctx_o, ctx_c)
+    return _num_check(ctx_o, ctx_c)
 
 
 def _pair_by_similarity(o_blk: list[str], c_blk: list[str],
@@ -579,7 +612,7 @@ def _pair_by_similarity(o_blk: list[str], c_blk: list[str],
     return pairs
 
 
-def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
+def _salvage(orig: str, cand: str, mode: str = "strict") -> tuple[str, int, int, list[str]]:
     """Line/block-level salvage from a rejected candidate.
 
     Line-diff original vs candidate. Every differing piece that independently
@@ -612,9 +645,9 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
                     out_lines.append(o_line)
                     continue
                 if o_line.lstrip().startswith("|") or c_line.lstrip().startswith("|"):
-                    reason = _verify_chunk(o_line, c_line)
+                    reason = _verify_chunk(o_line, c_line, mode)
                 else:
-                    reason = _verify_line_in_context(o_lines, i1 + k, c_line)
+                    reason = _verify_line_in_context(o_lines, i1 + k, c_line, mode)
                 if reason is None:
                     out_lines.append(c_line)
                     fixed += 1
@@ -627,7 +660,7 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
             # similarity so one deleted line does not poison the whole block
             o_text = "\n".join(o_blk)
             c_text = "\n".join(c_blk)
-            if c_text.strip() and _verify_chunk(o_text, c_text) is None:
+            if c_text.strip() and _verify_chunk(o_text, c_text, mode) is None:
                 out_lines.extend(c_blk)
                 fixed += 1
                 total += 1
@@ -645,9 +678,9 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str]]:
                     continue
                 abs_idx = i1 + k
                 if o_line.lstrip().startswith("|") or c_line.lstrip().startswith("|"):
-                    reason = _verify_chunk(o_line, c_line)
+                    reason = _verify_chunk(o_line, c_line, mode)
                 else:
-                    reason = _verify_line_in_context(o_lines, abs_idx, c_line)
+                    reason = _verify_line_in_context(o_lines, abs_idx, c_line, mode)
                 if reason is None:
                     out_lines.append(c_line)
                     fixed += 1
@@ -668,13 +701,14 @@ def _run_chunk(
     api_key: str,
     sampling: dict | None,
     retries: int,
+    mode: str = "strict",
 ) -> tuple[str, dict]:
     """Process ONE chunk: call -> verify -> accept / salvage -> bounded retries.
 
     This is the whole per-chunk logic, shared by the sequential and the
-    parallel path — the safety architecture (per-chunk verification with
-    invariants A/B/C, then salvage, then hinted retries) is identical no
-    matter how many workers run. Chunks are independent: the result text is
+    parallel path — the safety architecture (per-chunk verification, then
+    salvage, then hinted retries) is identical no matter how many workers
+    run. The verifier `mode` ('strict' | 'content') is passed through. Chunks are independent: the result text is
     ``verified_chunk + sep`` so reassembly is exact concatenation.
 
     max_tokens is capped at ~the input length (output_token_cap): the task is
@@ -716,7 +750,7 @@ def _run_chunk(
         if _verify_chunk(chunk, candidate) is None:
             best, best_fixed = candidate, 1 << 30  # whole chunk verified
             break
-        salvaged, fixed, n_total, reasons = _salvage(chunk, candidate)
+        salvaged, fixed, n_total, reasons = _salvage(chunk, candidate, mode)
         last_salvage_total = n_total
         chunk_rejections.extend(reasons[:3])
         if fixed > best_fixed:
@@ -771,10 +805,37 @@ def _fmt_chunk_state(delta: dict) -> str:
         state = f"salvaged {delta['blocks_fixed']} block(s)"
     else:
         state = "REJECTED"
+        # first rejection reason, trimmed: the progress line must explain WHY
+        # without digging into meta.json ('llm error: ...' here also separates
+        # verifier rejections from call failures — the latter show retries 0)
+        reason = (delta.get("rejection") or {}).get("reason") or ""
+        if reason:
+            state += f": {reason.split(';')[0][:80]}"
     if delta.get("truncated"):
         state += f", truncated x{delta['truncated']}"
     state += f", retries {delta['retries_used']}"
     return state
+
+
+def _finish_interrupted(stats: dict) -> None:
+    """Ctrl+C path: stop work and abandon the pass entirely.
+
+    A half-corrected document (some chunks fixed, others original) is worse
+    than an uncorrected one, so no result is produced: the caller keeps the
+    original pre-LLM text. Partial stats travel on LlmInterrupted.
+    """
+    done = (stats["chunks_accepted"] + stats["chunks_salvaged"]
+            + stats["chunks_rejected"])
+    stats["interrupted"] = {
+        "chunks_completed": done,
+        "chunks_pending": stats["chunks_total"] - done,
+    }
+    print(
+        f"\n  llm: interrupted — {done}/{stats['chunks_total']} chunks were "
+        "processed; the uncorrected .md is kept as-is",
+        flush=True,
+    )
+    raise LlmInterrupted(stats)
 
 
 def _apply_chunk_delta(stats: dict, delta: dict) -> None:
@@ -807,6 +868,84 @@ _CTX_MARGIN_TOKENS = 512
 # w16 gave no further gain (264s) — the GPU is saturated at ~8 streams.
 # The cap only limits auto-selection; --llm-workers overrides it.
 _MAX_AUTO_WORKERS = 8
+
+
+class LlmInterrupted(RuntimeError):
+    """The correction pass was stopped by Ctrl+C.
+
+    Carries the partial ``stats`` dict; the caller must treat the original
+    (pre-LLM) text as the result — a half-corrected document is worse than
+    an uncorrected one, so nothing is written.
+    """
+
+    def __init__(self, stats: dict) -> None:
+        super().__init__("correction pass interrupted by user")
+        self.stats = stats
+
+
+class _DaemonPool:
+    """Fixed pool of daemon worker threads with an unbounded task queue.
+
+    ThreadPoolExecutor is unsuitable here because its worker threads are
+    non-daemonic (CPython 3.9+): a Ctrl+C would block interpreter exit for
+    up to the 300 s HTTP timeout per in-flight request — the user sees a
+    dead console and a flood of tracebacks. Daemon threads die immediately
+    at interpreter exit; tasks they had already picked up are simply lost,
+    which is exactly the interrupt semantics we want (their chunks fall
+    back to the original text).
+    """
+
+    def __init__(self, n_workers: int) -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._pending = 0
+        self._error: BaseException | None = None
+        self._threads = [
+            threading.Thread(target=self._worker, daemon=True,
+                             name=f"pdf4llm-llm-{k}")
+            for k in range(max(1, n_workers))
+        ]
+        for t in self._threads:
+            t.start()
+
+    def submit(self, fn, *args) -> None:
+        self._pending += 1
+        self._queue.put((fn, args))
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            fn, args = item
+            try:
+                fn(*args)
+            except BaseException as e:  # reported by drain(), never kills the pool
+                if self._error is None:
+                    self._error = e
+            self._pending -= 1
+
+    def drain_and_shutdown(self) -> None:
+        """Wait until every submitted task ran, then stop the workers.
+
+        Re-raises the first worker exception (mirrors Future.result()).
+        Polling (not a blocking wait) keeps the main thread's Ctrl+C
+        responsive at all times.
+        """
+        while self._pending > 0:
+            time.sleep(0.05)
+        self.shutdown_now()
+        if self._error is not None:
+            raise self._error
+
+    def shutdown_now(self) -> None:
+        """Drop everything queued and tell the workers to exit."""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        for _ in self._threads:
+            self._queue.put(None)
 
 
 class LlmContextError(RuntimeError):
@@ -924,6 +1063,7 @@ def correct_with_llm(
     sampling: dict | None = None,
     retries: int = 2,
     workers: int | None = None,
+    content_only: bool = False,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass.
 
@@ -948,9 +1088,20 @@ def correct_with_llm(
     self-describe. When the server reports its per-request context, a rough
     input+output estimate for the largest chunk is checked against it and
     the pass is aborted (LlmContextError) when a chunk provably cannot fit.
+
+    Ctrl+C stops the pass instead of tearing it down: pending work is
+    cancelled, nothing is written, and LlmInterrupted is raised carrying the
+    partial stats — the caller keeps the original (pre-LLM) text.
+
+    ``content_only`` selects the relaxed verifier: only letters, digits,
+    underscores and numeric values are protected; punctuation, whitespace
+    and table geometry may change. Default False = strict (whitespace-only
+    edits). Both modes are described at the verification section above.
     """
+    mode = "content" if content_only else "strict"
     text = dedupe_bullets(text)
     text, hr_removed = strip_horizontal_rules(text)
+    text, dots_collapsed = collapse_dot_leaders(text)
 
     is_technical, source = (True, "heuristic")
     if classify:
@@ -985,6 +1136,7 @@ def correct_with_llm(
 
     stats: dict = {
         "model": model,
+        "verification_mode": mode,
         "sampling": sampling or DEFAULT_SAMPLING,
         "classification": {
             "technical": is_technical,
@@ -992,6 +1144,7 @@ def correct_with_llm(
         },
         "subscripts_normalised": sub_count,
         "horizontal_rules_removed": hr_removed,
+        "dot_leaders_collapsed": dots_collapsed,
         "chunks_total": len(chunks),
         "chunks_accepted": 0,
         "chunks_salvaged": 0,
@@ -1015,31 +1168,35 @@ def correct_with_llm(
     if workers <= 1:
         # Sequential path: exactly the original behaviour, including prints.
         chunk_durations: list[float] = []
-        for i, (chunk, sep) in enumerate(chunks, 1):
-            result, delta = _run_chunk(
-                i, len(chunks), chunk, sep, system_prompt, model, endpoint,
-                api_key, sampling, retries,
-            )
-            out_parts[i - 1] = result
-            _apply_chunk_delta(stats, delta)
-            chunk_durations.append(delta["duration"])
-            # unconditional progress: the LLM pass is slow and the user must
-            # see that it is alive, with an ETA based on the avg chunk so far
-            if i < len(chunks):
-                eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
-                print(
-                    f"  llm: chunk {i}/{len(chunks)} done "
-                    f"[{_fmt_chunk_state(delta)}] in "
-                    f"{_fmt_duration(delta['duration'])}  |  elapsed "
-                    f"{_fmt_duration(time.monotonic() - t0)}  |  "
-                    f"eta ~{_fmt_duration(eta)}",
-                    flush=True,
+        try:
+            for i, (chunk, sep) in enumerate(chunks, 1):
+                result, delta = _run_chunk(
+                    i, len(chunks), chunk, sep, system_prompt, model, endpoint,
+                    api_key, sampling, retries, mode,
                 )
+                out_parts[i - 1] = result
+                _apply_chunk_delta(stats, delta)
+                chunk_durations.append(delta["duration"])
+                # unconditional progress: the LLM pass is slow and the user must
+                # see that it is alive, with an ETA based on the avg chunk so far
+                if i < len(chunks):
+                    eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
+                    print(
+                        f"  llm: chunk {i}/{len(chunks)} done "
+                        f"[{_fmt_chunk_state(delta)}] in "
+                        f"{_fmt_duration(delta['duration'])}  |  elapsed "
+                        f"{_fmt_duration(time.monotonic() - t0)}  |  "
+                        f"eta ~{_fmt_duration(eta)}",
+                        flush=True,
+                    )
+        except KeyboardInterrupt:
+            _finish_interrupted(stats)
+            raise  # unreachable, keeps type-checkers happy
     else:
-        # Parallel path: ThreadPoolExecutor (litellm calls are thread-safe).
-        # The executor caps in-flight requests at max_workers, so a huge doc
-        # cannot queue unbounded. Each worker merges its own stats delta under
-        # a lock; reassembly below is strictly in original chunk order.
+        # Parallel path: daemon worker pool (litellm calls are thread-safe).
+        # The pool caps in-flight requests at `workers`, so a huge doc cannot
+        # queue unbounded. Each worker merges its own stats delta under a
+        # lock; reassembly below is strictly in original chunk order.
         workers = min(workers, len(chunks))
         lock = threading.Lock()
         done_count = [0]
@@ -1047,7 +1204,7 @@ def correct_with_llm(
         def _worker(idx: int, chunk: str, sep: str) -> None:
             result, delta = _run_chunk(
                 idx, len(chunks), chunk, sep, system_prompt, model, endpoint,
-                api_key, sampling, retries,
+                api_key, sampling, retries, mode,
             )
             out_parts[idx - 1] = result
             with lock:
@@ -1065,13 +1222,15 @@ def correct_with_llm(
                 flush=True,
             )
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [
-                ex.submit(_worker, i, chunk, sep)
-                for i, (chunk, sep) in enumerate(chunks, 1)
-            ]
-            for fut in futures:
-                fut.result()  # propagate worker exceptions
+        pool = _DaemonPool(workers)
+        for i, (chunk, sep) in enumerate(chunks, 1):
+            pool.submit(_worker, i, chunk, sep)
+        try:
+            pool.drain_and_shutdown()
+        except KeyboardInterrupt:
+            pool.shutdown_now()
+            _finish_interrupted(stats)
+            raise  # unreachable, keeps type-checkers happy
 
     # deterministic meta.json regardless of completion order
     stats["rejections"].sort(key=lambda r: r["chunk"])

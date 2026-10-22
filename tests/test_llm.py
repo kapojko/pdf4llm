@@ -79,21 +79,45 @@ def test_verifier_rejects_digit_digit_join():
     orig = "values 2 0 mA and more"
     out = "values 20 mA and more"
     reason = llm._verify_chunk(orig, out)
-    assert reason and "unsafe whitespace join" in reason
+    assert reason and "numeric token" in reason
 
 
 def test_verifier_rejects_hex_split_join():
     orig = "register 0x30 08 controls"
     out = "register 0x3008 controls"
     reason = llm._verify_chunk(orig, out)
-    assert reason and "unsafe whitespace join" in reason
+    assert reason and "numeric token" in reason
 
 
-def test_verifier_rejects_value_symbol_join():
+def test_verifier_accepts_value_symbol_join():
+    # the old join-whitelist rejected this; numeric-token protection is the
+    # exact rule now: the whitespace merge cannot corrupt any numeric value
     orig = "V CC + 0.5 V margin"
     out = "VCC+ 0.5 V margin"
-    reason = llm._verify_chunk(orig, out)
-    assert reason and "unsafe whitespace join" in reason
+    assert llm._verify_chunk(orig, out) is None
+
+
+def test_verifier_rejects_sign_loss():
+    # '-40' is a temperature, not decoration: the sign rides on the token.
+    # Strict mode catches it via invariant A first (non-ws change); content
+    # mode via the numeric-token check (see the content-mode test below).
+    orig = "operating range -40 to 125 C"
+    out = "operating range 40 to 125 C"
+    assert llm._verify_chunk(orig, out) is not None
+
+
+def test_verifier_accepts_spaced_decimal_join():
+    # extraction spaces out decimal points; joining is whitespace-only and
+    # the normalized numeric token is unchanged
+    orig = "voltage 0 . 5 V margin"
+    out = "voltage 0.5 V margin"
+    assert llm._verify_chunk(orig, out) is None
+
+
+def test_verifier_rejects_decimal_point_loss():
+    orig = "voltage 0.5 V margin"
+    out = "voltage 05 V margin"
+    assert llm._verify_chunk(orig, out) is not None
 
 
 def test_verifier_rejects_translation():
@@ -128,6 +152,86 @@ def test_verifier_rejects_empty_output():
 
 
 # ---------------------------------------------------------------------------
+# content mode (--llm-content-only): data-only protection
+# ---------------------------------------------------------------------------
+
+def test_content_mode_accepts_punctuation_and_decoration():
+    # dot leaders, list-dash artifacts, punctuation swaps, table geometry
+    orig = ("| 1.3 | Glossary . . . . . 71 |\n"
+            "follows: - - Mode 1 | VCC | 14 |")
+    out = ("| 1.3 | Glossary 71 |\n"
+           "follows. Mode 1 VCC 14")
+    assert llm._verify_chunk(orig, out, mode="content") is None
+
+
+def test_content_mode_accepts_table_geometry_change():
+    orig = "| V CC | 14 | supply voltage |"
+    out = "| VCC | 14 supply voltage |"
+    assert llm._verify_chunk(orig, out, mode="content") is None
+
+
+def test_content_mode_rejects_letters_change():
+    orig = "the timeout register counts 4096 cycles"
+    out = "the timeout register counts 409 cycles"
+    assert llm._verify_chunk(orig, out, mode="content") is not None
+
+
+def test_content_mode_rejects_case_change():
+    orig = "in that case the data are aligned"
+    out = "In that case the data are aligned"
+    assert llm._verify_chunk(orig, out, mode="content") is not None
+
+
+def test_content_mode_rejects_underscore_deletion():
+    orig = "the I2C_pins and internals"
+    out = "the I2Cpins and internals"
+    assert llm._verify_chunk(orig, out, mode="content") is not None
+
+
+def test_content_mode_rejects_sign_loss():
+    orig = "range -40 to 125 C"
+    out = "range 40 to 125 C"
+    assert llm._verify_chunk(orig, out, mode="content") is not None
+
+
+def test_content_mode_rejects_digit_join():
+    orig = "values 2 0 mA"
+    out = "values 20 mA"
+    reason = llm._verify_chunk(orig, out, mode="content")
+    assert reason and "numeric token" in reason
+
+
+def test_content_mode_rejects_dedup_of_duplicated_cells():
+    # duplicated TOC cells carry real letters: collapsing them deletes content
+    orig = "| 3.3.2 | Read access latency 90 | Read access latency 90 |"
+    out = "| 3.3.2 | Read access latency 90 |"
+    assert llm._verify_chunk(orig, out, mode="content") is not None
+
+
+def test_content_mode_rejects_bit_range_colon_loss():
+    orig = "TIMEOUTA[11:0] for maximum"
+    out = "TIMEOUTA[110] for maximum"
+    assert llm._verify_chunk(orig, out, mode="content") is not None
+
+
+def test_content_mode_numeric_tokens_whitespace_insensitive():
+    orig = "voltage 0 . 5 V and 1, 2, 3 list"
+    out = "voltage 0.5 V and 1,2,3 list"
+    assert llm._verify_chunk(orig, out, mode="content") is None
+
+
+def test_correct_with_llm_records_verification_mode(monkeypatch):
+    monkeypatch.setattr(llm, "_call_llm", _fixed)
+    for content_only, want in ((False, "strict"), (True, "content")):
+        _out, stats = llm.correct_with_llm(
+            PAR_TEXT, "m", "http://x", "k", verbose=False,
+            classify=False, max_chars=MAXC, workers=1,
+            content_only=content_only,
+        )
+        assert stats["verification_mode"] == want
+
+
+# ---------------------------------------------------------------------------
 # adversarial verifier cases (safety gate coverage)
 # ---------------------------------------------------------------------------
 
@@ -150,24 +254,24 @@ def test_verifier_rejects_degree_sign_removal():
     assert llm._verify_chunk(orig, out) is not None
 
 
-def test_verifier_rejects_celsius_space_join():
-    # '25 \u00b0C' -> '25\u00b0C': joining a digit to a value symbol is not whitelisted
+def test_verifier_accepts_value_symbol_space_join():
+    # permanent relaxation vs the old whitelist: deleting a space between a
+    # value and a unit symbol cannot corrupt any numeric value
     orig = "ambient temperature 25 \u00b0C typical"
     out = "ambient temperature 25\u00b0C typical"
-    reason = llm._verify_chunk(orig, out)
-    assert reason and "unsafe whitespace join" in reason
+    assert llm._verify_chunk(orig, out) is None
 
 
-def test_verifier_rejects_digit_join_across_newline():
-    # false line break between a number and the next word must never be joined
+def test_verifier_digit_join_across_newline():
+    # digit-to-letter merges are value-safe and now accepted (letters follow
+    # the digit unchanged); digit-to-digit merges corrupt the value -> blocked
     orig = "register value\n0x1F00\nnext"
     out = "register value\n0x1F00next"
-    reason = llm._verify_chunk(orig, out)
-    assert reason and "unsafe whitespace join" in reason
+    assert llm._verify_chunk(orig, out) is None
     orig2 = "write 2\n0 mA to the register"
     out2 = "write 20 mA to the register"
     reason2 = llm._verify_chunk(orig2, out2)
-    assert reason2 and "unsafe whitespace join" in reason2
+    assert reason2 and "numeric token" in reason2
 
 
 def test_verifier_rejects_model_preamble():
@@ -210,13 +314,13 @@ def test_verifier_accepts_trailing_newline_diff():
     assert llm._verify_chunk("some text", "some text\n") is None
 
 
-def test_verifier_rejects_subscript_join_in_prose_digit_context():
-    # 'I 2C' -> 'I2C' would be nice, but '2 C' -> '2C' corruption is
-    # indistinguishable from it at the character level -> both blocked.
+def test_verifier_accepts_subscript_join_in_prose_digit_context():
+    # 'I 2C' -> 'I2C' and '2 CPHA' -> '2CPHA' are value-safe whitespace
+    # merges (digits untouched as tokens); '2 0' -> '20' stays blocked by
+    # the numeric-token check, which is what actually matters
     orig = "bus I 2C clock 2 CPHA"
     out = "bus I2C clock 2CPHA"
-    reason = llm._verify_chunk(orig, out)
-    assert reason and "unsafe whitespace join" in reason
+    assert llm._verify_chunk(orig, out) is None
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +839,63 @@ def test_strip_horizontal_rules():
     assert hr_lines == []           # standalone rules gone
     assert "| --- |" in out         # table delimiter row must survive
     assert out == "A\nB\nC\nD\n| --- | \nE"
+
+
+def test_collapse_dot_leaders():
+    # spaced leaders (ST reference-manual TOC style)
+    src = "| 1.3 | Glossary . . . . . . . . 71 |"
+    out, n = llm.collapse_dot_leaders(src)
+    assert out == "| 1.3 | Glossary  71 |" and n == 1
+    # unspaced runs
+    out, n = llm.collapse_dot_leaders("Overview ...... 12")
+    assert out == "Overview  12" and n == 1
+    # title and page number survive; only the dots are collapsed
+    src = "| 14.5 | QUADSPI registers  . . . . 425 | QUADSPI registers  . . . . 425 |"
+    out, n = llm.collapse_dot_leaders(src)
+    assert out.count("QUADSPI registers") == 2 and "425" in out and n == 2
+    # 3-dot ellipsis in prose must survive
+    out, n = llm.collapse_dot_leaders("wait for it... done")
+    assert out == "wait for it... done" and n == 0
+
+
+def test_interrupt_sequential_aborts_without_result(monkeypatch):
+    def fake_call(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    with pytest.raises(llm.LlmInterrupted) as ei:
+        llm.correct_with_llm(
+            PAR_TEXT, "m", "http://x", "k", verbose=False,
+            classify=False, max_chars=MAXC, workers=1,
+        )
+    assert ei.value.stats["interrupted"]["chunks_completed"] == 0
+    assert ei.value.stats["interrupted"]["chunks_pending"] > 0
+
+
+def test_interrupt_parallel_aborts_without_result(monkeypatch):
+    def fake_call(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    with pytest.raises(llm.LlmInterrupted) as ei:
+        llm.correct_with_llm(
+            PAR_TEXT, "m", "http://x", "k", verbose=False,
+            classify=False, max_chars=MAXC, workers=2,
+        )
+    assert ei.value.stats["interrupted"]["chunks_completed"] == 0
+
+
+def test_chunk_state_line_includes_rejection_reason():
+    delta = {
+        "rejected": True,
+        "blocks_fixed": 0,
+        "rejection": {"chunk": 3, "reason": "unsafe whitespace join (':' | 'E'): ...; other", "preview": ""},
+        "retries_used": 2,
+        "truncated": 0,
+    }
+    line = llm._fmt_chunk_state(delta)
+    assert line.startswith("REJECTED: unsafe whitespace join")
+    assert "retries 2" in line and "truncated" not in line
 
 
 # ---------------------------------------------------------------------------
