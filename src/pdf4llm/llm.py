@@ -1,4 +1,4 @@
-"""Optional local-LLM broken-text correction pass, with algorithmic safety gate.
+"""Optional local-LLM broken-text correction pass (single strict mode).
 
 Design (safety-first):
 
@@ -9,14 +9,30 @@ Design (safety-first):
    the models reliably try to "fix" and thereby poison chunks with:
    horizontal rules, TOC dot leaders, duplicate bullet glyphs; plus guarded
    subscript normalisation ('V CC' -> 'VCC', 'T amb' -> 'T_amb').
-3. Every chunk is verified algorithmically before it is accepted, on one of
-   two levels (see the verification section below):
-   - strict (default): whitespace-level edits only, with numeric-token
-     protection and table structure checks;
-   - content (--llm-content-only): letters, digits, underscores and numeric
-     values are protected; punctuation and table geometry are free.
-   Non-passing chunks are rejected as a whole, salvaged line-by-line, and
-   the original is always the fallback; rejections are logged into meta.json.
+3. Structure never passes through the model:
+   - table chunks are processed at cell level: only cells whose content looks
+     defect-suspect are sent (deterministic pre-filter; ~90% of cells are
+     skipped), each batch with its row as context; the row skeleton (pipes,
+     padding, separator rows) is spliced back untouched;
+   - TOC-like chunks (every row duplicates a long cell) are skipped
+     deterministically: no model output can ever verify against them;
+   - prose chunks get ONE whole-chunk attempt (the only unit that can join
+     falsely split lines), then a deterministic line-level salvage of the
+     candidate, then batched re-asks of the disputed lines (only the
+     failed subset, up to llm_retries rounds, with a hint).
+   All unit-level requests use an indexed echo protocol ('N| text');
+   measured on a 9B/A1.3B model, they produced zero content
+   violations where whole-table chunks were rejected ~70% of the time.
+   Sampling is never overridden: server-side defaults apply unless the user
+   configures llm_sampling, and failed units are re-requested up to
+   llm_retries times with a rejection-reason hint.
+4. Every model output is verified algorithmically before any part of it is
+   accepted: canonical/whitespace-level edits only (typographic punctuation
+   classes — dashes, quotes, bullets, ellipsis — accepted in either direction
+   via a closed canonical map), numeric-token protection, table structure
+   checks. Words and numbers are physically immutable. Whatever fails
+   verification is kept as the original — rejection is always safe, never
+   silent; per-chunk outcomes are logged into meta.json.
 """
 from __future__ import annotations
 
@@ -218,7 +234,7 @@ def classify_with_llm(
         import litellm  # lazy import
 
         litellm.suppress_debug_info = True
-        std, extra = _split_sampling(sampling or DEFAULT_SAMPLING)
+        std, extra = _split_sampling(sampling or {})
         resp = litellm.completion(
             model=f"openai/{model}",
             messages=[
@@ -345,14 +361,66 @@ GENERAL_SYSTEM_PROMPT = (
 )
 
 # ---------------------------------------------------------------------------
+# Unit-level protocol prompts (line / cell echo requests)
+#
+# The echo format is the discipline: measured on ling-3.0-tiny, per-line and
+# per-cell requests produced ZERO content violations (vs ~70% rejections for
+# whole-table chunks), because a short numbered unit leaves no room for the
+# model's editorial instincts. Sampling is never overridden for these
+# requests — the server-side defaults apply unless llm_sampling is set.
+# ---------------------------------------------------------------------------
+
+_LINE_RULES = """You fix whitespace defects in text extracted from a PDF.
+Input: numbered lines 'N| text'.
+Fix ONLY false spaces inside words ('examp le' -> 'example', 'D-t yp e' ->
+'D-type', 'fli p -flo p' -> 'flip-flop').
+HARD RULES:
+- return EXACTLY the same numbered lines: same indices, same order, one line
+  of output per line of input, no extra text, no code fences;
+- never add, delete or reorder words; never change any letter, digit,
+  number, hex token (0x1A2B), unit or value; never merge or split numbers
+  ('2 0' must stay '2 0');
+- never DELETE punctuation. Dash-like characters may be rewritten as '-'
+  but never removed; bullet glyphs may be rewritten as '*';
+- if a line has no defects, return it unchanged.
+"""
+
+TECHNICAL_LINE_PROMPT = (
+    "The lines come from an electronic component datasheet or microcontroller "
+    "reference manual. Subscripts like 'VCC' and 'T_amb' are already "
+    "normalised — never change or move underscores ('_').\n" + _LINE_RULES
+)
+GENERAL_LINE_PROMPT = _LINE_RULES
+
+_CELL_RULES = """You fix false spaces in words inside table cells extracted from a PDF.
+Input: numbered cells 'N| text', then the original table row as CONTEXT.
+Fix ONLY false spaces inside words ('R es .' -> 'Res.', 'D-t yp e' ->
+'D-type'); collapse double spaces inside a cell.
+HARD RULES:
+- return EXACTLY the numbered cell lines: same indices, same order, one line
+  per cell, no extra text, no code fences; never return the context row;
+- never change any letter, digit, number, hex token, unit or value; never
+  merge or split numbers ('2 0' must stay '2 0');
+- never add or remove cell boundaries ('|');
+- if a cell has no defects, return it unchanged.
+"""
+
+TECHNICAL_CELL_PROMPT = (
+    "The cells come from an electronic component datasheet or microcontroller "
+    "reference manual (register maps, pin tables, electrical "
+    "characteristics).\n" + _CELL_RULES
+)
+GENERAL_CELL_PROMPT = _CELL_RULES
+
+# ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
 
-# Defaults follow the Ornith-1.5-9B model card's "precise coding" set (the
-# correction pass is a precision task, not free-form generation). Sampling is
-# a *yield* parameter here, not a safety one — the algorithmic verifier is the
-# safety mechanism and is independent of sampling. Override via config.json:
-#   "llm_sampling": {"temperature": 1.0, "top_p": 0.95, ...}
+# Sampling is NOT forced by the tool. When the user configures llm_sampling,
+# it is forwarded verbatim on every request; otherwise NO sampling parameters
+# are sent and the server-side defaults apply. The set below is only a
+# suggested example (from a 9B model card's 'precise coding' preset) for the
+# llm_sampling config key — never sent automatically.
 DEFAULT_SAMPLING: dict = {
     "temperature": 0.6,
     "top_p": 0.95,
@@ -366,18 +434,19 @@ DEFAULT_SAMPLING: dict = {
 # like top_k / min_p).
 _STANDARD_SAMPLING_KEYS = {"temperature", "top_p", "presence_penalty", "frequency_penalty"}
 
-# Output token cap. The pass is whitespace-only, so the model's output is by
-# definition ~the length of its input. Capping max_tokens at ~input tokens
-# means a looping (or secretly reasoning) model is cut off after one
-# chunk-worth of tokens instead of burning a huge budget; the truncated
-# output then fails verification (invariant A) and the usual salvage/retry
+# Output token cap. The task is nearly echo-like, but measured rewrites —
+# cell re-alignment, whitespace padding — can reach ~2x the input length,
+# and the previous 1x cap truncated 419/2936 calls on rm0410 (about half of
+# them completable at 4x). 2x keeps a looping (or secretly reasoning) model
+# on a short leash while letting legitimate rewrites finish; the truncated
+# output then fails verification (invariant A) and the usual salvage
 # machinery takes over. This is what terminates false loops cheaply.
 _OUT_MARGIN_TOKENS = 256  # code fence + retry hint + estimator error
 
 
 def output_token_cap(n_chars: int) -> int:
-    """max_tokens for one chunk: ~input tokens (3.5 chars/token) + margin."""
-    return math.ceil(max(1, n_chars) / _CHARS_PER_TOKEN) + _OUT_MARGIN_TOKENS
+    """max_tokens for one request: 2x input tokens (3.5 chars/token) + margin."""
+    return 2 * math.ceil(max(1, n_chars) / _CHARS_PER_TOKEN) + _OUT_MARGIN_TOKENS
 
 
 # Belt-and-braces against reasoning output: the request already sends
@@ -395,30 +464,54 @@ def _strip_thinking(text: str) -> str:
     return text
 
 # ---------------------------------------------------------------------------
-# Algorithmic verification (two levels)
+# Algorithmic verification (single strict mode)
 #
-# "strict" (default, --llm): whitespace-level edits only.
-#   Invariant A: whitespace-stripped input and output are byte-identical.
-#   Numeric-token check: digit runs with their internal separators (0.5,
-#     1:0, 1,000, 2026-03-23) and a leading sign (±, -, +, –) must survive
-#     as an ordered sequence — this is what blocks dangerous whitespace
-#     joins like '2 0' -> '20', '0x30 08' -> '0x3008', '-40' -> '40'.
-#   Invariant B: table rows keep their cell count; edits checked per cell.
-#
-# "content" (--llm-content-only): only the DATA is protected.
-#   Alphanumeric skeleton: the ordered sequence of [0-9A-Za-z_]+ runs must
-#     be identical (underscores are identifiers: OTG_HS, T_amb — protected).
-#   Numeric-token check: as above. Whitespace inside a token is normalised
-#     away, so '0 . 5' == '0.5' while '2 0' != '20'.
-#   Everything else — punctuation, ASCII decoration, whitespace, table
-#     geometry ('|' pipes) — is free to change. Letters/digits may never be
-#     inserted, deleted, reordered or recased; duplicated lines/cells are
-#     NOT collapsible (real letters would be lost).
+# Invariant A: input and output are identical after whitespace-stripping and
+#   canonicalisation — i.e. whitespace edits plus a CLOSED set of
+#   bidirectional typographic normalisations, nothing else.
+# Canonical map: dash/quote/bullet/ellipsis glyph variants map to one
+#   canonical form in BOTH directions, so the model may freely swap
+#   '–' <-> '-' while a deleted dash or a changed letter stays rejected.
+#   The map never touches [0-9A-Za-z_], so register names, constants and
+#   words are physically immutable.
+# Numeric-token check: digit runs with their internal separators (0.5,
+#   1:0, 1,000, 2026-03-23) and a leading sign (±, -, +, –) must survive
+#   as an ordered sequence — this is what blocks dangerous whitespace
+#   joins like '2 0' -> '20', '0x30 08' -> '0x3008', '-40' -> '40'.
+# Invariant B: table rows keep their cell count; edits checked per cell.
 # ---------------------------------------------------------------------------
 
-# Protected skeleton for content mode. '_' is included deliberately: it is
-# part of register/signal names (DMA_SxCR) and subscript markers (T_amb).
-_SKELETON_RE = re.compile(r"[0-9A-Za-z_]+")
+# Bidirectional canonical glyph map. Every class is meaning-preserving in
+# technical documents and never maps to or from a letter or digit:
+#   dashes (en/em/figure/minus/hyphen variants) -> '-';
+#   curly/typographic quotes and primes -> straight ' and ";
+#   ellipsis character -> '...';
+#   bullet glyphs -> '*'.
+_CANON_SUBS = {
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+    "\u2014": "-", "\u2015": "-", "\u2043": "-", "\u2212": "-",
+    "\u2018": "'", "\u2019": "'", "\u201b": "'", "\u2032": "'",
+    "\u201c": '"', "\u201d": '"', "\u201f": '"', "\u2033": '"',
+    "\u2026": "...",
+    "\u2022": "*", "\u25cf": "*", "\u25e6": "*", "\u25aa": "*",
+    "\u2023": "*",
+}
+_CANON_RE = re.compile("|".join(re.escape(c) for c in _CANON_SUBS))
+
+# escaped pipes are a markdown-table artifact ('\|' renders as '|'); models
+# reliably unescape them, which must not count as a content change
+_ESCAPED_PIPE_RE = re.compile(r"\\\|")
+
+
+def canonicalize(text: str) -> str:
+    """Map typographic glyph variants to one canonical form (see above)."""
+    return _ESCAPED_PIPE_RE.sub("|", _CANON_RE.sub(lambda m: _CANON_SUBS[m.group(0)], text))
+
+
+def _ws_canon(text: str) -> str:
+    """Whitespace-stripped canonical form (the invariant-A projection)."""
+    return canonicalize("".join(text.split()))
+
 
 # Numeric token: optional sign, digits, internal separators; whitespace may
 # surround the separators (extraction often spaces them out: '0 . 5').
@@ -429,8 +522,12 @@ _NUM_TOKEN_RE = re.compile(r"[+\-\u2013\u2014\u00b1]?\s*[0-9]+(?:\s*[.,:/]\s*[0-
 
 
 def _num_tokens(text: str) -> list[str]:
-    """Numeric tokens, whitespace inside each token normalised away."""
-    return [re.sub(r"\s+", "", tok) for tok in _NUM_TOKEN_RE.findall(text)]
+    """Numeric tokens, whitespace inside each token normalised away.
+
+    Runs on the canonicalized text so a dash swap ('—2' -> '-2') is not
+    mistaken for a sign change.
+    """
+    return [re.sub(r"\s+", "", tok) for tok in _NUM_TOKEN_RE.findall(canonicalize(text))]
 
 
 def _num_check(orig: str, out: str) -> str | None:
@@ -447,26 +544,11 @@ def _num_check(orig: str, out: str) -> str | None:
     return f"numeric token inserted: {c_toks[len(o_toks)]!r}"
 
 
-def _check_content_edit(orig: str, out: str) -> str | None:
-    """Content-mode check: skeleton + numeric tokens must be identical."""
-    o_skel = "".join(_SKELETON_RE.findall(orig))
-    c_skel = "".join(_SKELETON_RE.findall(out))
-    if o_skel != c_skel:
-        sm = difflib.SequenceMatcher(None, o_skel, c_skel, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag != "equal":
-                return (f"letters/digits changed ({tag}): "
-                        f"{o_skel[i1:i2][:40]!r} -> {c_skel[j1:j2][:40]!r}")
-        return "letters/digits changed"
-    return _num_check(orig, out)
+def _verify_pair(orig: str, out: str) -> str | None:
+    """Verify one text unit (chunk, line or cell) at the canonical level.
 
-
-def _verify_chunk(orig: str, out: str, mode: str = "strict") -> str | None:
-    """Verify a whole chunk. Returns None if accepted, else a reason.
-
-    mode 'strict': whitespace-only edits (invariant A + numeric tokens +
-    table invariant B). mode 'content': data-only protection (skeleton +
-    numeric tokens; punctuation and table geometry are free).
+    Returns None if acceptable, else a reason. Accepts whitespace edits and
+    canonical glyph swaps; rejects any other content change.
     """
     if not out.strip():
         return "empty model output"
@@ -474,18 +556,151 @@ def _verify_chunk(orig: str, out: str, mode: str = "strict") -> str | None:
     m = re.match(r"^\s*```[^\n]*\n(.*)\n```\s*$", out, re.DOTALL)
     if m:
         out = m.group(1)
-
-    if mode == "content":
-        return _check_content_edit(orig, out)
-
-    # --- strict mode ---
-    # Invariant A (whole chunk): whitespace-stripped sequences identical.
-    if "".join(out.split()) != "".join(orig.split()):
+    # Invariant A (canonical): whitespace-stripped sequences identical.
+    if _ws_canon(out) != _ws_canon(orig):
         return "invariant A violated: content characters changed"
-
     # Numeric-token protection: blocks whitespace merges that corrupt values
     # ('2 0' -> '20', '0x30 08' -> '0x3008', '-40' -> '40').
-    reason = _num_check(orig, out)
+    return _num_check(orig, out)
+
+
+# ---------------------------------------------------------------------------
+# Structure helpers: table rows, TOC-like chunks, cell surgery, and the
+# 'N| text' echo protocol used for all line- and cell-level model requests.
+# ---------------------------------------------------------------------------
+
+def _is_table_row(line: str) -> bool:
+    return line.lstrip().startswith("|")
+
+
+def _is_separator_row(line: str) -> bool:
+    """A delimiter row like '| --- | --- |' (never sent to the model)."""
+    return _is_table_row(line) and set(line) <= {"|", "-", " ", "\t"}
+
+
+def _split_row_cells(row: str) -> list[tuple[str, str, str]] | None:
+    """Split a table row into (lead_ws, core, trail_ws) per cell.
+
+    Splits on unescaped pipes only ('\\|' is an escaped literal pipe inside
+    a cell, e.g. in WCH datasheets). The parts outside the outer pipes are
+    not cells and are not returned; None for a row without the expected
+    pipe structure.
+    """
+    parts = re.split(r"(?<!\\)\|", row)
+    if len(parts) < 3:
+        return None
+    segs = []
+    for p in parts[1:-1]:
+        m = re.fullmatch(r"(\s*)(.*?)(\s*)", p, re.DOTALL)
+        segs.append((m.group(1), m.group(2), m.group(3)))
+    return segs
+
+
+def _row_cell_texts(row: str) -> list[str]:
+    segs = _split_row_cells(row)
+    return [core.strip() for _l, core, _t in segs] if segs else []
+
+
+def _splice_cells(row: str,
+                  segs: list[tuple[str, str, str]],
+                  replacements: dict[int, str]) -> str:
+    """Rebuild a row with only the given cell cores replaced (skeleton kept)."""
+    parts = re.split(r"(?<!\\)\|", row)
+    for k, new in replacements.items():
+        lead, _core, trail = segs[k]
+        parts[k + 1] = lead + new + trail
+    return "|".join(parts)
+
+
+def _is_toc_like(lines: list[str], min_long_len: int = 12) -> bool:
+    """True if the chunk is a table of contents (extracted from the PDF TOC).
+
+    TOC rows carry at most ONE distinct long cell — the entry title ending
+    in its page number — sometimes duplicated into sibling cells by the
+    extractor. Datasheet characteristic tables look similar (one long
+    description cell per row + short numeric cells), but their description
+    cells do not END with a bare page number — that signature is what
+    separates the two. Register maps have several distinct long cells per
+    row. Both non-TOC shapes are processable; the TOC shape is unfixable for
+    the model (the only 'correction' it can make is deduplication or
+    rewording, which never verifies), so it is skipped deterministically
+    instead of burning requests and retries.
+
+    Tolerant by design: up to ~10% of rows may deviate (the extractor
+    occasionally splits a title across two cells), so one malformed row does
+    not turn the whole TOC into expensive per-cell requests.
+    """
+    rows = [l for l in lines if _is_table_row(l) and not _is_separator_row(l)]
+    if not rows:
+        return False
+    saw_long = False
+    bad = 0
+    bad_limit = max(1, len(rows) // 10)
+    for row in rows:
+        distinct = {c.strip() for c in _row_cell_texts(row)
+                    if len(c.strip()) >= min_long_len}
+        if distinct and not all(_PAGE_TAIL_RE.search(c) for c in distinct):
+            bad += 1
+            if bad > bad_limit:
+                return False
+        elif distinct:
+            saw_long = True
+    return saw_long
+
+
+# A cell is defect-suspect if it may contain a falsely split word: a space
+# inside an alphabetic run. Deliberately over-eager — a clean cell that gets
+# sent anyway just verifies trivially, while a missed defect is a lost (and
+# minor) fix. All-numeric/id cells never match, which is what makes the
+# ~90% skip rate measured on rm0410 possible.
+_SUSPICIOUS_ANY = re.compile(r"[A-Za-z] [a-z]")
+_SUSPICIOUS_SHORT = re.compile(r"\b[A-Za-z] [A-Za-z]{1,2}\b")
+
+
+def _suspicious_cell(text: str) -> bool:
+    return bool(_SUSPICIOUS_ANY.search(text) or _SUSPICIOUS_SHORT.search(text))
+
+
+_IDX_LINE_RE = re.compile(r"^\s*(\d+)\s*\|\s?(.*)$")
+
+# a TOC-entry long cell ends with its page number ('Clocks  152'); a
+# datasheet description cell ('Standard operating voltage') does not
+_PAGE_TAIL_RE = re.compile(r"[.\s]*\d{1,4}\s*$")
+
+
+def _parse_indexed_lines(resp: str, want: set[int]) -> dict[int, str]:
+    """Parse a 'N| text' echo answer.
+
+    Continuation lines (no index) are appended to the previous index, so a
+    long wrapped line is not lost. The appended continuation must never
+    capture the CONTEXT block (measured failure mode: the model echoes
+    'CONTEXT: ...' after the cells, which used to poison the last cell), so
+    parsing stops at the context marker and never captures raw table rows.
+    Indices outside `want` are ignored.
+    """
+    got: dict[int, str] = {}
+    last: int | None = None
+    for raw in resp.split("\n"):
+        stripped_line = raw.strip()
+        if stripped_line.startswith(("CONTEXT", "context", "row:", "Row:")):
+            break
+        m = _IDX_LINE_RE.match(raw)
+        if m:
+            last = int(m.group(1))
+            if last in want:
+                got[last] = m.group(2)
+        elif (stripped_line and last is not None and last in want
+              and not stripped_line.startswith("|")):
+            got[last] += "\n" + raw
+    return got
+
+
+def _verify_chunk(orig: str, out: str) -> str | None:
+    """Verify a whole chunk. Returns None if accepted, else a reason.
+
+    Strict mode: canonical invariant A + numeric tokens + table invariant B.
+    """
+    reason = _verify_pair(orig, out)
     if reason:
         return reason
 
@@ -493,19 +708,19 @@ def _verify_chunk(orig: str, out: str, mode: str = "strict") -> str | None:
     out_lines = out.split("\n")
 
     # Invariant B: table rows must keep their cell count and '|' positions.
-    orig_rows = [l for l in orig_lines if l.lstrip().startswith("|")]
-    out_rows = [l for l in out_lines if l.lstrip().startswith("|")]
+    orig_rows = [l for l in orig_lines if _is_table_row(l)]
+    out_rows = [l for l in out_lines if _is_table_row(l)]
     if len(orig_rows) != len(out_rows):
         return "table row added or removed"
     for orow, orow_out in zip(orig_rows, out_rows):
         if orow.count("|") != orow_out.count("|"):
             return f"table cell count changed: {orow_out[:60]!r}"
-        # per-cell whitespace-only edit check (invariant A already passed at
-        # chunk level, so stripped equality here is implied; kept as defense)
-        ocells = orow.split("|")
-        ncells = orow_out.split("|")
+        # per-cell canonical edit check (invariant A already passed at chunk
+        # level, so equality here is implied; kept as defense in depth)
+        ocells = re.split(r"(?<!\\)\|", orow)
+        ncells = re.split(r"(?<!\\)\|", orow_out)
         for oc, nc in zip(ocells, ncells):
-            if "".join(oc.split()) != "".join(nc.split()):
+            if _ws_canon(nc) != _ws_canon(oc):
                 return f"cell content changed: {nc.strip()[:60]!r}"
     return None
 
@@ -527,7 +742,12 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _split_sampling(sampling: dict) -> tuple[dict, dict]:
-    """Split sampling config into litellm standard kwargs vs extra_body."""
+    """Split sampling config into litellm standard kwargs vs extra_body.
+
+    ``sampling`` may be empty: an empty dict means NO sampling parameters are
+    sent and the server-side defaults apply. ``DEFAULT_SAMPLING`` below is
+    kept only as a suggested example for the llm_sampling config key.
+    """
     std = {k: v for k, v in sampling.items() if k in _STANDARD_SAMPLING_KEYS}
     extra = {k: v for k, v in sampling.items() if k not in _STANDARD_SAMPLING_KEYS}
     return std, extra
@@ -539,45 +759,43 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
     import litellm  # lazy import
 
     litellm.suppress_debug_info = True
-    std, extra = _split_sampling(sampling or DEFAULT_SAMPLING)
+    std, extra = _split_sampling(sampling or {})
     user_content = chunk
     if retry_hint:
         user_content += (
-            "\n\nNOTE: your previous output for this text was REJECTED because "
-            f"it changed non-whitespace content ({retry_hint}). Only whitespace-"
-            "level fixes are allowed; everything else must stay byte-identical."
+            f"\n\nNOTE: your previous output was REJECTED ({retry_hint}). "
+            "Return the corrected text exactly as instructed: no additions, "
+            "no omissions, no format changes."
         )
     # max_tokens is capped at ~the input length (output_token_cap): a looping
     # model is cut off quickly and the truncated output is rejected/salvaged.
-    resp = litellm.completion(
-        model=f"openai/{model}",
-        messages=[
-            {"role": "system", "content": prompt_system},
-            {"role": "user", "content": user_content},
-        ],
-        api_base=endpoint,
-        api_key=api_key,
-        max_tokens=output_token_cap(len(user_content)),
-        timeout=300,
-        extra_body={**extra, "chat_template_kwargs": {"enable_thinking": False}},
-        **std,
-    )
+    try:
+        resp = litellm.completion(
+            model=f"openai/{model}",
+            messages=[
+                {"role": "system", "content": prompt_system},
+                {"role": "user", "content": user_content},
+            ],
+            api_base=endpoint,
+            api_key=api_key,
+            max_tokens=output_token_cap(len(user_content)),
+            timeout=300,
+            extra_body={**extra, "chat_template_kwargs": {"enable_thinking": False}},
+            **std,
+        )
+    except Exception as e:  # network/model error: caller keeps the original
+        return "", f"llm error: {type(e).__name__}: {e}"[:200]
     finish = getattr(resp.choices[0], "finish_reason", None)
     return (resp.choices[0].message.content or "").strip(), finish
 
 
-def _verify_line_in_context(o_lines: list[str], idx: int, c_line: str,
-                            mode: str = "strict") -> str | None:
+def _verify_line_in_context(o_lines: list[str], idx: int, c_line: str) -> str | None:
     """Verify a single-line replacement with neighbouring lines as context."""
     prev = o_lines[idx - 1] if idx > 0 else ""
     nxt = o_lines[idx + 1] if idx + 1 < len(o_lines) else ""
     ctx_o = prev + "\n" + o_lines[idx] + "\n" + nxt
     ctx_c = prev + "\n" + c_line + "\n" + nxt
-    if mode == "content":
-        return _check_content_edit(ctx_o, ctx_c)
-    if "".join(ctx_c.split()) != "".join(ctx_o.split()):
-        return "invariant A violated: content characters changed"
-    return _num_check(ctx_o, ctx_c)
+    return _verify_pair(ctx_o, ctx_c)
 
 
 def _pair_by_similarity(o_blk: list[str], c_blk: list[str],
@@ -612,21 +830,26 @@ def _pair_by_similarity(o_blk: list[str], c_blk: list[str],
     return pairs
 
 
-def _salvage(orig: str, cand: str, mode: str = "strict") -> tuple[str, int, int, list[str]]:
-    """Line/block-level salvage from a rejected candidate.
+def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str], set[int]]:
+    """Line/block-level salvage from a rejected whole-chunk candidate.
 
     Line-diff original vs candidate. Every differing piece that independently
     passes verification is applied (single lines are verified in the context
     of their neighbours; unequal-count regions are verified as whole blocks);
     everything else reverts to the original. The result is therefore always
     safe by construction, even when the candidate was hallucinated.
-    Returns (salvaged_text, pieces_fixed, pieces_total, reasons_of_failed).
+
+    Returns (salvaged_text, pieces_fixed, pieces_total, reasons,
+    failed_orig_indices) where failed_orig_indices are the 0-based original
+    line numbers the candidate tried to change (or dropped) without passing
+    verification — the input for the batched disputed-line re-ask.
     """
     o_lines = orig.split("\n")
     c_lines = cand.split("\n")
     sm = difflib.SequenceMatcher(None, o_lines, c_lines, autojunk=False)
     out_lines: list[str] = []
     reasons: list[str] = []
+    failed: set[int] = set()
     fixed = 0
     total = 0
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -643,24 +866,26 @@ def _salvage(orig: str, cand: str, mode: str = "strict") -> tuple[str, int, int,
                 total += 1
                 if not c_line.strip():
                     out_lines.append(o_line)
+                    failed.add(i1 + k)
                     continue
-                if o_line.lstrip().startswith("|") or c_line.lstrip().startswith("|"):
-                    reason = _verify_chunk(o_line, c_line, mode)
+                if _is_table_row(o_line) or _is_table_row(c_line):
+                    reason = _verify_pair(o_line, c_line)
                 else:
-                    reason = _verify_line_in_context(o_lines, i1 + k, c_line, mode)
+                    reason = _verify_line_in_context(o_lines, i1 + k, c_line)
                 if reason is None:
                     out_lines.append(c_line)
                     fixed += 1
                 else:
                     reasons.append(reason)
+                    failed.add(i1 + k)
                     out_lines.append(o_line)
         else:
-            # unequal line counts: first try the block as a whole (this handles
-            # legitimate false-line-break joins); if that fails, pair rows by
-            # similarity so one deleted line does not poison the whole block
+            # unequal line counts: first try the block as a whole (this
+            # handles legitimate false-line-break joins); if that fails, pair
+            # rows by similarity so one deleted line does not poison the block
             o_text = "\n".join(o_blk)
             c_text = "\n".join(c_blk)
-            if c_text.strip() and _verify_chunk(o_text, c_text, mode) is None:
+            if c_text.strip() and _verify_pair(o_text, c_text) is None:
                 out_lines.extend(c_blk)
                 fixed += 1
                 total += 1
@@ -671,23 +896,117 @@ def _salvage(orig: str, cand: str, mode: str = "strict") -> tuple[str, int, int,
                 c_line = c_blk[j] if j is not None else None
                 if c_line is None or o_line == c_line:
                     out_lines.append(o_line)
+                    if c_line is None and o_line.strip():
+                        failed.add(i1 + k)   # candidate dropped this line
                     continue
                 total += 1
                 if not c_line.strip():
                     out_lines.append(o_line)
+                    failed.add(i1 + k)
                     continue
                 abs_idx = i1 + k
-                if o_line.lstrip().startswith("|") or c_line.lstrip().startswith("|"):
-                    reason = _verify_chunk(o_line, c_line, mode)
+                if _is_table_row(o_line) or _is_table_row(c_line):
+                    reason = _verify_pair(o_line, c_line)
                 else:
-                    reason = _verify_line_in_context(o_lines, abs_idx, c_line, mode)
+                    reason = _verify_line_in_context(o_lines, abs_idx, c_line)
                 if reason is None:
                     out_lines.append(c_line)
                     fixed += 1
                 else:
                     reasons.append(reason)
+                    failed.add(abs_idx)
                     out_lines.append(o_line)
-    return "\n".join(out_lines), fixed, total, reasons
+    return "\n".join(out_lines), fixed, total, reasons, failed
+
+
+def _echo_units(
+    system_prompt: str,
+    payload: str,
+    context: str | None,
+    want: set[int],
+    model: str,
+    endpoint: str,
+    api_key: str,
+    sampling: dict | None,
+    hint: str | None = None,
+) -> tuple[dict[int, str], str | None]:
+    """ONE batched 'N| ...' echo request; parse the answer.
+
+    Retry rounds — for malformed replies and for units that fail verification
+    — are managed by the caller, which re-requests only the failed subset
+    with a rejection-reason hint. Sampling is whatever the user/server
+    configured (never overridden), so a failed attempt may simply recover on
+    the next one.
+
+    Returns (got: {index: text}, finish_reason).
+    """
+    user = payload + ("\n\nCONTEXT:\n" + context if context else "")
+    if hint:
+        user += ("\n\nNOTE: your previous output was REJECTED (" + hint + "). "
+                 "Return the corrected lines exactly as instructed.")
+    resp, finish = _call_llm(system_prompt, user, model, endpoint, api_key,
+                             sampling=sampling)
+    resp = _strip_thinking(resp)
+    return _parse_indexed_lines(resp, want), finish
+
+
+def _verified_rounds(
+    system_prompt: str,
+    units: dict[int, str],
+    context: str | None,
+    verify,
+    model: str,
+    endpoint: str,
+    api_key: str,
+    sampling: dict | None,
+    retries: int,
+    state: dict,
+    strip: bool = False,
+) -> tuple[dict[int, str], list[int], dict[int, str], str | None]:
+    """Send 'N|' echo requests for `units` and verify each returned text.
+
+    Retries (up to `retries` extra rounds) target only the subset that fails
+    parsing (malformed reply) or verification, with a rejection-reason hint.
+    Sampling is never overridden — a failed attempt may simply recover on the
+    next round, since the verifier, not sampling, is the safety gate.
+
+    verify(idx, new_text) -> None when the replacement is accepted.
+    Returns (accepted {idx: text}, still_failing [idx], last_fail_reasons,
+    last_finish_reason); request counters accumulate into ``state``.
+    """
+    pending = sorted(units)
+    fail_reasons: dict[int, str] = {}
+    accepted: dict[int, str] = {}
+    fin: str | None = None
+    for round_no in range(1 + max(0, retries)):
+        payload = "\n".join(f"{k}| {units[k]}" for k in pending)
+        hint = None
+        if round_no:
+            uniq = list(dict.fromkeys(fail_reasons.values()))
+            hint = "; ".join(uniq)[:150] or "malformed reply"
+        got, fin = _echo_units(system_prompt, payload, context, set(pending),
+                               model, endpoint, api_key, sampling, hint=hint)
+        state["n_calls"] += 1
+        state["retries_used"] += 1 if round_no else 0
+        state["truncated"] += 1 if fin == "length" else 0
+        if set(got) != set(pending):
+            fail_reasons = {k: "malformed reply" for k in pending}
+            continue
+        new_pending: list[int] = []
+        for k in pending:
+            new = got[k].strip() if strip else got[k]
+            if not new.strip() or new.strip() == units[k].strip():
+                continue
+            reason = verify(k, new)
+            if reason is None:
+                accepted[k] = new
+            else:
+                fail_reasons[k] = reason
+                new_pending.append(k)
+        pending = new_pending
+        if not pending:
+            break
+    return accepted, pending, fail_reasons, fin
 
 
 def _run_chunk(
@@ -696,113 +1015,216 @@ def _run_chunk(
     chunk: str,
     sep: str,
     system_prompt: str,
+    line_prompt: str,
+    cell_prompt: str,
     model: str,
     endpoint: str,
     api_key: str,
     sampling: dict | None,
     retries: int,
-    mode: str = "strict",
 ) -> tuple[str, dict]:
-    """Process ONE chunk: call -> verify -> accept / salvage -> bounded retries.
+    """Process ONE chunk: structure-aware units + per-unit verification.
 
     This is the whole per-chunk logic, shared by the sequential and the
-    parallel path — the safety architecture (per-chunk verification, then
-    salvage, then hinted retries) is identical no matter how many workers
-    run. The verifier `mode` ('strict' | 'content') is passed through. Chunks are independent: the result text is
-    ``verified_chunk + sep`` so reassembly is exact concatenation.
+    parallel path. Routing (rationale in the module docstring):
+      - TOC-like table chunks: deterministic skip, zero calls;
+      - prose chunks: one whole-chunk attempt -> deterministic line salvage
+        of the candidate -> at most one batched re-ask of the disputed lines;
+      - table/mixed chunks: per-row batches of suspect cells (the row itself
+        is the context, the skeleton is spliced back untouched) plus one
+        line-mode batch for the non-table lines.
 
-    max_tokens is capped at ~the input length (output_token_cap): the task is
-    whitespace-only editing, so a healthy answer fits easily, while a looping
-    model is cut off after one chunk-worth of tokens instead of burning the
-    old 2x-chars budget; the truncated output then fails verification and the
-    normal salvage/retry machinery runs.
+    Every unit (chunk, line, cell) is verified with `_verify_pair` (or
+    `_verify_chunk` for whole results) before it is applied, so the assembled
+    result is safe by construction; a final whole-chunk verification runs as
+    belt-and-braces. Chunks are independent: the result text is
+    ``verified_chunk + sep`` so reassembly is exact concatenation.
 
     Returns (result_text, per-chunk stats delta).
     """
     print(f"  llm: chunk {idx}/{total} ({len(chunk)} chars) ...", flush=True)
     chunk_start = time.monotonic()
-    best: str | None = None      # verified-safe version of this chunk
-    best_fixed = -1
-    chunk_rejections: list[str] = []
-    n_calls = 0
-    truncated = 0
-    last_cand_empty = False      # last attempt produced no usable text
-    last_salvage_total = 0       # differing blocks the last salvage examined
+    o_lines = chunk.split("\n")
+    out_lines = list(o_lines)
+    units_fixed = 0
+    units_total = 0
+    units_failed = 0
+    cells_sent = 0
+    cells_fixed = 0
+    reasons: list[str] = []
+    state = {"n_calls": 0, "retries_used": 0, "truncated": 0}
+    toc_skipped = False
 
-    for attempt in range(1 + max(0, retries)):
-        hint = chunk_rejections[-1] if (attempt and chunk_rejections) else None
-        try:
-            candidate, finish = _call_llm(
-                system_prompt, chunk, model, endpoint, api_key,
-                sampling=sampling, retry_hint=hint,
-            )
-            n_calls += 1
-        except Exception as e:  # network/model error -> keep original
-            chunk_rejections.append(f"llm error: {type(e).__name__}: {e}"[:200])
-            continue
+    row_idx = [i for i, l in enumerate(o_lines) if _is_table_row(l)]
+
+    if row_idx and _is_toc_like(o_lines):
+        # Deterministic skip: every row duplicates a long cell, so no model
+        # output can ever verify — dedup attempts are guaranteed rejections.
+        toc_skipped = True
+    elif not row_idx:
+        # --- prose chunk ---
+        candidate, finish = _call_llm(
+            system_prompt, chunk, model, endpoint, api_key, sampling=sampling)
+        state["n_calls"] += 1
         candidate = _strip_thinking(candidate)
-        last_cand_empty = not candidate.strip()
         if finish == "length":
-            truncated += 1
-            chunk_rejections.append(
-                "output truncated (finish_reason=length) — output token cap hit"
-            )
+            state["truncated"] += 1
+            reasons.append("whole-chunk output truncated (finish_reason=length)")
         if _verify_chunk(chunk, candidate) is None:
-            best, best_fixed = candidate, 1 << 30  # whole chunk verified
-            break
-        salvaged, fixed, n_total, reasons = _salvage(chunk, candidate, mode)
-        last_salvage_total = n_total
-        chunk_rejections.extend(reasons[:3])
-        if fixed > best_fixed:
-            best, best_fixed = salvaged, fixed
-        if fixed >= n_total:  # every differing block verified -> done
-            break
-
-    if best is None or best_fixed <= 0:
-        result = chunk + sep
-        if chunk_rejections:
-            reason = "; ".join(chunk_rejections[:3])
-        elif last_cand_empty:
-            # all attempts returned nothing usable after thinking-strip
-            reason = "empty model output"
+            out_lines = candidate.split("\n")
+            units_fixed += 1
         else:
-            # output looked plausible but diverged so far from the input
-            # (dropped/reworded lines) that nothing was pairable or verifiable
-            if last_salvage_total:
-                reason = (f"candidate rewrite beyond salvage: 0 of {last_salvage_total} "
-                          "differing block(s) verifiable")
-            else:
-                reason = ("candidate rewrite beyond salvage: no line could be "
-                          "paired to a verifiable edit (dropped/reworded lines?)")
+            salvaged, fixed, n_total, sreasons, failed_idx = _salvage(chunk, candidate)
+            out_lines = salvaged.split("\n")
+            units_fixed += fixed
+            units_total += n_total
+            reasons.extend(sreasons[:2])
+            disputed = sorted(i for i in failed_idx if o_lines[i].strip())
+            if not disputed and units_fixed == 0:
+                # the candidate was useless (empty, garbage, or an unfixed
+                # echo with junk): one batched line-mode attempt over every
+                # line as the last resort
+                disputed = [i for i, l in enumerate(o_lines) if l.strip()]
+            if disputed:
+                units = {i: o_lines[i] for i in disputed}
+                accepted, pending, fr, fin = _verified_rounds(
+                    line_prompt, units, None,
+                    lambda k, t: _verify_line_in_context(o_lines, k, t),
+                    model, endpoint, api_key, sampling, retries, state)
+                for i, new in accepted.items():
+                    out_lines[i] = new
+                    units_fixed += 1
+                if pending:
+                    units_failed += len(pending)
+                    reasons.append(fin if fin and fin.startswith("llm error")
+                                   else f"lines {pending[:4]}: {fr[pending[0]]}")
+    else:
+        # --- table/mixed chunk: cell-level work, skeleton untouched ---
+        for i in row_idx:
+            line = o_lines[i]
+            if _is_separator_row(line):
+                continue
+            if "\\|" in line:
+                # escaped literal pipes: models reliably drop the backslash,
+                # which changes the cell structure -> row never sent, skeleton
+                # keeps it verbatim
+                continue
+            segs = _split_row_cells(line)
+            if segs is None:
+                continue
+            cells = [core for _l, core, _t in segs]
+            # Cells duplicated within their row (equal to, or contained in,
+            # a sibling cell — the extractor sometimes splits a title across
+            # two cells) are extraction artifacts: the model reliably tries
+            # to deduplicate or reword them, which is a content change, so
+            # they are never sent. A duplicated cell is already identical to
+            # its sibling — there is nothing to fix in it anyway.
+            stripped = [c.strip() for c in cells]
+            keys = [re.sub(r"[^0-9a-z]+", "", c.lower()) for c in stripped]
+
+            def _is_dup(k: int) -> bool:
+                key = keys[k]
+                if len(key) < 8:
+                    return False
+                return any(j != k and key in other for j, other in enumerate(keys))
+
+            targets = [k for k, c in enumerate(cells)
+                       if _suspicious_cell(c) and not _is_dup(k)]
+            if not targets:
+                continue
+            cells_sent += len(targets)
+            units = {k: cells[k] for k in targets}
+            accepted, pending, fr, fin = _verified_rounds(
+                cell_prompt, units, "row: " + line,
+                lambda k, t: _verify_pair(cells[k], t),
+                model, endpoint, api_key, sampling, retries, state, strip=True)
+            repl: dict[int, str] = {}
+            for k, new in accepted.items():
+                repl[k] = new
+                units_fixed += 1
+                cells_fixed += 1
+            if repl:
+                out_lines[i] = _splice_cells(line, segs, repl)
+            if pending:
+                units_failed += len(pending)
+                reasons.append(fin if fin and fin.startswith("llm error")
+                               else f"row {i} cell {pending[0]}: {fr[pending[0]]}")
+        # non-table lines of a mixed chunk (headings, captions, notes)
+        prose_idx = [i for i, l in enumerate(o_lines)
+                     if l.strip() and not _is_table_row(l)]
+        if prose_idx:
+            units = {i: o_lines[i] for i in prose_idx}
+            accepted, pending, fr, fin = _verified_rounds(
+                line_prompt, units, None,
+                lambda k, t: _verify_line_in_context(o_lines, k, t),
+                model, endpoint, api_key, sampling, retries, state)
+            for i, new in accepted.items():
+                out_lines[i] = new
+                units_fixed += 1
+            if pending:
+                units_failed += len(pending)
+                reasons.append(fin if fin and fin.startswith("llm error")
+                               else f"lines {pending[:4]}: {fr[pending[0]]}")
+
+    result_body = "\n".join(out_lines)
+    if result_body != chunk:
+        # belt & braces: whatever was assembled must verify as a whole;
+        # on any internal inconsistency the original chunk is kept
+        final_reason = _verify_chunk(chunk, result_body)
+        if final_reason is not None:
+            reasons.append(f"internal: final verification failed ({final_reason})")
+            result_body = chunk
+            units_fixed = 0
+            units_failed = max(1, units_failed)
+
+    if toc_skipped:
+        delta: dict = {"index": idx, "toc_skipped": True, "accepted": False,
+                       "salvaged": False, "rejected": False, "blocks_fixed": 0,
+                       "rejection": None}
+        result = chunk + sep
+    elif units_failed == 0 and units_fixed == 0:
+        delta = {"index": idx, "accepted": True, "blocks_fixed": 0,
+                 "rejection": None}
+        result = result_body + sep
+    elif units_failed == 0:
+        delta = {"index": idx, "accepted": True, "blocks_fixed": units_fixed,
+                 "rejection": None}
+        result = result_body + sep
+    elif units_fixed > 0:
+        delta = {"index": idx, "salvaged": True, "blocks_fixed": units_fixed,
+                 "rejection": None}
+        result = result_body + sep
+    else:
+        result = chunk + sep
+        reason = "; ".join(reasons[:3]) if reasons else "no usable output"
         delta = {
             "index": idx,
             "rejected": True,
             "blocks_fixed": 0,
             "rejection": {
                 "chunk": idx,
-                "reason": reason or "no usable output",
+                "reason": reason,
                 "preview": chunk[:120],
             },
         }
-    elif best_fixed >= (1 << 30):
-        result = best + sep
-        delta = {"index": idx, "accepted": True, "blocks_fixed": 0, "rejection": None}
-    else:
-        result = best + sep
-        delta = {"index": idx, "salvaged": True, "blocks_fixed": best_fixed,
-                 "rejection": None}
-    delta["retries_used"] = max(0, n_calls - 1)
-    delta["truncated"] = truncated
+    delta["retries_used"] = state["retries_used"]
+    delta["truncated"] = state["truncated"]
+    delta["cells_sent"] = cells_sent
+    delta["cells_fixed"] = cells_fixed
     delta["duration"] = time.monotonic() - chunk_start
     return result, delta
 
 
 def _fmt_chunk_state(delta: dict) -> str:
     """One-line final state for a processed chunk: outcome, retries, salvage."""
-    if delta.get("accepted"):
+    if delta.get("toc_skipped"):
+        state = "toc-skipped (deterministic)"
+    elif delta.get("accepted"):
         state = "accepted"
+        if delta.get("blocks_fixed"):
+            state += f" ({delta['blocks_fixed']} unit(s) fixed)"
     elif delta.get("salvaged"):
-        state = f"salvaged {delta['blocks_fixed']} block(s)"
+        state = f"salvaged {delta['blocks_fixed']} unit(s)"
     else:
         state = "REJECTED"
         # first rejection reason, trimmed: the progress line must explain WHY
@@ -825,7 +1247,7 @@ def _finish_interrupted(stats: dict) -> None:
     original pre-LLM text. Partial stats travel on LlmInterrupted.
     """
     done = (stats["chunks_accepted"] + stats["chunks_salvaged"]
-            + stats["chunks_rejected"])
+            + stats["chunks_rejected"] + stats["chunks_toc_skipped"])
     stats["interrupted"] = {
         "chunks_completed": done,
         "chunks_pending": stats["chunks_total"] - done,
@@ -840,14 +1262,19 @@ def _finish_interrupted(stats: dict) -> None:
 
 def _apply_chunk_delta(stats: dict, delta: dict) -> None:
     """Merge one chunk's stats delta into the global stats dict."""
-    if delta.get("accepted"):
+    if delta.get("toc_skipped"):
+        stats["chunks_toc_skipped"] += 1
+    elif delta.get("accepted"):
         stats["chunks_accepted"] += 1
+        stats["blocks_fixed"] += delta["blocks_fixed"]
     elif delta.get("salvaged"):
         stats["chunks_salvaged"] += 1
         stats["blocks_fixed"] += delta["blocks_fixed"]
     elif delta.get("rejected"):
         stats["chunks_rejected"] += 1
         stats["rejections"].append(delta["rejection"])
+    stats["cells_sent"] += delta.get("cells_sent", 0)
+    stats["cells_fixed"] += delta.get("cells_fixed", 0)
     stats["retries_used"] += delta["retries_used"]
     stats["truncated_calls"] += delta.get("truncated", 0)
 
@@ -980,12 +1407,12 @@ def probe_swappy(endpoint: str, api_key: str, timeout: float = 3.0) -> dict | No
 def estimate_chunk_tokens(max_chunk_chars: int) -> int:
     """Rough token estimate for the largest chunk: input + output + slack.
 
-    The correction pass is whitespace-only, so the output has roughly the
-    same size as the input — hence 2x the input estimate plus a margin for
-    the system prompt, retry hint and estimator error.
+    The whole-chunk prose attempt may legitimately produce ~2x its input
+    length (measured: alignment/padding rewrites), hence 3x the input
+    estimate plus a margin for the system prompt and estimator error.
     """
     in_tokens = math.ceil(max_chunk_chars / _CHARS_PER_TOKEN)
-    return 2 * in_tokens + _CTX_MARGIN_TOKENS
+    return 3 * in_tokens + _CTX_MARGIN_TOKENS
 
 
 def resolve_workers(
@@ -1063,24 +1490,24 @@ def correct_with_llm(
     sampling: dict | None = None,
     retries: int = 2,
     workers: int | None = None,
-    content_only: bool = False,
 ) -> tuple[str, dict]:
-    """Run the guarded LLM correction pass.
+    """Run the guarded LLM correction pass (single strict mode).
 
-    Returns (corrected_text, stats). Every model output is verified
-    algorithmically: fully valid chunks are accepted as-is; rejected ones go
-    through block-level salvage (only independently verified blocks are
-    applied); ``retries`` bounded regeneration attempts may follow, keeping
-    the attempt that fixes the most blocks. Whatever fails verification is
-    kept as the original — rejection is always safe, never silent.
+    Returns (corrected_text, stats). Structure never passes through the
+    model: table chunks are processed at cell level (suspect cells only,
+    skeleton spliced back), TOC-like chunks are skipped deterministically,
+    prose chunks get one whole-chunk attempt plus line-level salvage and at
+    most one batched disputed-line re-ask. Every unit is verified
+    algorithmically (canonical whitespace-level edits + numeric tokens +
+    table structure) before it is applied; whatever fails stays as the
+    original — rejection is always safe, never silent.
 
     ``max_chars`` is the chunk size; the default (2000) is deliberately small
-    so that small local models stay on-task — smaller chunks mean a shorter
-    effective output horizon and cheaper per-chunk failures.
+    so that small local models stay on-task.
 
-    ``workers`` > 1 processes chunks concurrently (ThreadPoolExecutor,
+    ``workers`` > 1 processes chunks concurrently (daemon thread pool,
     litellm calls are thread-safe). Safety is unaffected: every chunk still
-    goes through the same verify/salvage/retry pipeline, chunks are
+    goes through the same per-unit verification pipeline, chunks are
     independent and the output is reassembled strictly in original order.
 
     ``workers`` None (default) auto-selects from the llama-swappy info
@@ -1092,13 +1519,7 @@ def correct_with_llm(
     Ctrl+C stops the pass instead of tearing it down: pending work is
     cancelled, nothing is written, and LlmInterrupted is raised carrying the
     partial stats — the caller keeps the original (pre-LLM) text.
-
-    ``content_only`` selects the relaxed verifier: only letters, digits,
-    underscores and numeric values are protected; punctuation, whitespace
-    and table geometry may change. Default False = strict (whitespace-only
-    edits). Both modes are described at the verification section above.
     """
-    mode = "content" if content_only else "strict"
     text = dedupe_bullets(text)
     text, hr_removed = strip_horizontal_rules(text)
     text, dots_collapsed = collapse_dot_leaders(text)
@@ -1109,6 +1530,8 @@ def correct_with_llm(
             text, model, endpoint, api_key, sampling=sampling
         )
     system_prompt = TECHNICAL_SYSTEM_PROMPT if is_technical else GENERAL_SYSTEM_PROMPT
+    line_prompt = TECHNICAL_LINE_PROMPT if is_technical else GENERAL_LINE_PROMPT
+    cell_prompt = TECHNICAL_CELL_PROMPT if is_technical else GENERAL_CELL_PROMPT
     sub_count = 0
     if is_technical:
         text, sub_count = fix_subscripts(text)
@@ -1136,8 +1559,7 @@ def correct_with_llm(
 
     stats: dict = {
         "model": model,
-        "verification_mode": mode,
-        "sampling": sampling or DEFAULT_SAMPLING,
+        "sampling": sampling if sampling else "server defaults",
         "classification": {
             "technical": is_technical,
             "source": source,
@@ -1149,7 +1571,10 @@ def correct_with_llm(
         "chunks_accepted": 0,
         "chunks_salvaged": 0,
         "chunks_rejected": 0,
+        "chunks_toc_skipped": 0,
         "blocks_fixed": 0,
+        "cells_sent": 0,
+        "cells_fixed": 0,
         "retries_used": 0,
         "truncated_calls": 0,
         "rejections": [],
@@ -1171,8 +1596,8 @@ def correct_with_llm(
         try:
             for i, (chunk, sep) in enumerate(chunks, 1):
                 result, delta = _run_chunk(
-                    i, len(chunks), chunk, sep, system_prompt, model, endpoint,
-                    api_key, sampling, retries, mode,
+                    i, len(chunks), chunk, sep, system_prompt, line_prompt,
+                    cell_prompt, model, endpoint, api_key, sampling, retries,
                 )
                 out_parts[i - 1] = result
                 _apply_chunk_delta(stats, delta)
@@ -1203,8 +1628,8 @@ def correct_with_llm(
 
         def _worker(idx: int, chunk: str, sep: str) -> None:
             result, delta = _run_chunk(
-                idx, len(chunks), chunk, sep, system_prompt, model, endpoint,
-                api_key, sampling, retries, mode,
+                idx, len(chunks), chunk, sep, system_prompt, line_prompt,
+                cell_prompt, model, endpoint, api_key, sampling, retries,
             )
             out_parts[idx - 1] = result
             with lock:

@@ -315,13 +315,6 @@ def convert_cmd(
              "key llm_chunk_chars). Smaller chunks are more stable on small "
              "models.",
     ),
-    llm_content_only: bool = typer.Option(
-        False, "--llm-content-only",
-        help="Relaxed LLM verification: only letters, digits, underscores and "
-             "numeric values are protected; punctuation, ASCII decoration and "
-             "table geometry may change. Default off = strict (whitespace-only "
-             "edits). Config key: llm_content_only.",
-    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Convert one or more PDFs to LLM-readable Markdown with a sanity score."""
@@ -342,7 +335,7 @@ def convert_cmd(
             pdf, out=out, force=force, copy_to=copy_to, dry_run=dry_run,
             pages=pages, llm_flag=llm_flag, model=model,
             llm_workers=llm_workers, llm_chunk_chars=llm_chunk_chars,
-            llm_content_only=llm_content_only, verbose=verbose,
+            verbose=verbose,
         )
         codes.append(code)
         if code == 130:  # user interrupt: do not start the remaining files
@@ -361,7 +354,6 @@ def _process_one(
     model: str | None,
     llm_workers: int | None,
     llm_chunk_chars: int | None,
-    llm_content_only: bool,
     verbose: bool,
 ) -> int:
     """Convert one PDF; returns the exit code for this file (0 = ok)."""
@@ -418,14 +410,12 @@ def _process_one(
             )
             return 3
         chunk_chars = llm_chunk_chars or int(c.get("llm_chunk_chars", 2000))
-        content_only = llm_content_only or bool(c.get("llm_content_only", False))
         text = md_path.read_text(encoding="utf-8")
         try:
             text, llm_stats = llm.correct_with_llm(
                 text, model, endpoint, api_key, verbose=verbose,
                 sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
                 workers=llm_workers, max_chars=chunk_chars,
-                content_only=content_only,
             )
         except llm.LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)

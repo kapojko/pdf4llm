@@ -127,6 +127,37 @@ def test_verifier_rejects_translation():
     assert reason and "invariant A" in reason
 
 
+# ---------------------------------------------------------------------------
+# adversarial verifier cases (safety gate coverage)
+# ---------------------------------------------------------------------------
+
+def test_verifier_rejects_number_reorder():
+    # swapped values pass no matter how you look at it -> invariant A
+    orig = "supply voltage from 2.0 to 6.0 V"
+    out = "supply voltage from 6.0 to 2.0 V"
+    assert llm._verify_chunk(orig, out) is not None
+
+
+def test_verifier_accepts_dash_normalization_bidirectionally():
+    # the canonical map: en/em dashes <-> '-' are interchangeable, in BOTH
+    # directions; the deleted dash below stays rejected
+    assert llm._verify_chunk("Rev. 9 \u2014 2 April 2024",
+                             "Rev. 9 - 2 April 2024") is None
+    assert llm._verify_chunk("range -40 to 125 C",
+                             "range \u201340 to 125 C") is None
+    assert llm._verify_chunk("Rev. 9 \u2014 2 April 2024",
+                             "Rev. 9 2 April 2024") is not None
+
+
+def test_verifier_accepts_quote_bullet_ellipsis_normalization():
+    assert llm.canonicalize("\u2019") == llm.canonicalize("'")
+    assert llm._verify_chunk("don\u2019t stop", "don't stop") is None
+    assert llm._verify_chunk("\u2022 item one", "* item one") is None
+    assert llm._verify_chunk("wait for it\u2026 done", "wait for it... done") is None
+    # the map never touches letters/digits: register names stay immutable
+    assert llm._verify_chunk("DMA_SxCR register", "DMA SxCR register") is not None
+
+
 def test_verifier_rejects_table_cell_count_change():
     orig = "| V CC | 14 | supply voltage |"
     out = "| VCC | 14 supply voltage |"
@@ -149,103 +180,6 @@ def test_verifier_accepts_code_fence_wrapped_output():
 
 def test_verifier_rejects_empty_output():
     assert llm._verify_chunk("some text", "") is not None
-
-
-# ---------------------------------------------------------------------------
-# content mode (--llm-content-only): data-only protection
-# ---------------------------------------------------------------------------
-
-def test_content_mode_accepts_punctuation_and_decoration():
-    # dot leaders, list-dash artifacts, punctuation swaps, table geometry
-    orig = ("| 1.3 | Glossary . . . . . 71 |\n"
-            "follows: - - Mode 1 | VCC | 14 |")
-    out = ("| 1.3 | Glossary 71 |\n"
-           "follows. Mode 1 VCC 14")
-    assert llm._verify_chunk(orig, out, mode="content") is None
-
-
-def test_content_mode_accepts_table_geometry_change():
-    orig = "| V CC | 14 | supply voltage |"
-    out = "| VCC | 14 supply voltage |"
-    assert llm._verify_chunk(orig, out, mode="content") is None
-
-
-def test_content_mode_rejects_letters_change():
-    orig = "the timeout register counts 4096 cycles"
-    out = "the timeout register counts 409 cycles"
-    assert llm._verify_chunk(orig, out, mode="content") is not None
-
-
-def test_content_mode_rejects_case_change():
-    orig = "in that case the data are aligned"
-    out = "In that case the data are aligned"
-    assert llm._verify_chunk(orig, out, mode="content") is not None
-
-
-def test_content_mode_rejects_underscore_deletion():
-    orig = "the I2C_pins and internals"
-    out = "the I2Cpins and internals"
-    assert llm._verify_chunk(orig, out, mode="content") is not None
-
-
-def test_content_mode_rejects_sign_loss():
-    orig = "range -40 to 125 C"
-    out = "range 40 to 125 C"
-    assert llm._verify_chunk(orig, out, mode="content") is not None
-
-
-def test_content_mode_rejects_digit_join():
-    orig = "values 2 0 mA"
-    out = "values 20 mA"
-    reason = llm._verify_chunk(orig, out, mode="content")
-    assert reason and "numeric token" in reason
-
-
-def test_content_mode_rejects_dedup_of_duplicated_cells():
-    # duplicated TOC cells carry real letters: collapsing them deletes content
-    orig = "| 3.3.2 | Read access latency 90 | Read access latency 90 |"
-    out = "| 3.3.2 | Read access latency 90 |"
-    assert llm._verify_chunk(orig, out, mode="content") is not None
-
-
-def test_content_mode_rejects_bit_range_colon_loss():
-    orig = "TIMEOUTA[11:0] for maximum"
-    out = "TIMEOUTA[110] for maximum"
-    assert llm._verify_chunk(orig, out, mode="content") is not None
-
-
-def test_content_mode_numeric_tokens_whitespace_insensitive():
-    orig = "voltage 0 . 5 V and 1, 2, 3 list"
-    out = "voltage 0.5 V and 1,2,3 list"
-    assert llm._verify_chunk(orig, out, mode="content") is None
-
-
-def test_correct_with_llm_records_verification_mode(monkeypatch):
-    monkeypatch.setattr(llm, "_call_llm", _fixed)
-    for content_only, want in ((False, "strict"), (True, "content")):
-        _out, stats = llm.correct_with_llm(
-            PAR_TEXT, "m", "http://x", "k", verbose=False,
-            classify=False, max_chars=MAXC, workers=1,
-            content_only=content_only,
-        )
-        assert stats["verification_mode"] == want
-
-
-# ---------------------------------------------------------------------------
-# adversarial verifier cases (safety gate coverage)
-# ---------------------------------------------------------------------------
-
-def test_verifier_rejects_number_reorder():
-    # swapped values pass no matter how you look at it -> invariant A
-    orig = "supply voltage from 2.0 to 6.0 V"
-    out = "supply voltage from 6.0 to 2.0 V"
-    assert llm._verify_chunk(orig, out) is not None
-
-
-def test_verifier_rejects_unicode_lookalike_dash():
-    orig = "Rev. 9 \u2014 2 April 2024"
-    out = "Rev. 9 - 2 April 2024"
-    assert llm._verify_chunk(orig, out) is not None
 
 
 def test_verifier_rejects_degree_sign_removal():
@@ -357,6 +291,109 @@ def test_classify_heuristic_general():
 
 
 # ---------------------------------------------------------------------------
+# structure helpers: TOC-like detection, cell surgery, echo protocol parsing
+# ---------------------------------------------------------------------------
+
+def test_is_toc_like():
+    toc = [
+        "## Contents",
+        "|  | 3.3.2 | Read access latency   90 | Read access latency   90 |  |",
+        "| --- | --- | --- | --- | --- |",
+        "|  | 3.3.3 | Write access latency   91 | Write access latency   91 |  |",
+        "|  | 5.2 |  | Clocks  152 |  |  |",
+    ]
+    assert llm._is_toc_like(toc)
+    # datasheet characteristic tables look structurally similar (one long
+    # description cell + short numeric cells) but descriptions do not end
+    # with a page number -> processed, not skipped
+    assert not llm._is_toc_like([
+        "| Symbol | Parameter | Condition | Min. | Max. | Unit |",
+        "| VDD | Standard operating voltage | Use USB or ETH | 3.0 | 3.6 | V |",
+        "| F_HCLK | Internal HB clock frequency | - | 0 | 144 | MHz |",
+    ])
+    # rows with two DISTINCT long cells are register-map rows, not TOC
+    # entries; two of them in a chunk -> not a TOC (one deviating row is
+    # tolerated as an extractor split-title artifact)
+    assert not llm._is_toc_like(
+        toc[:2] + ["| 1 | Reset controller (RCC) | Reset and system control |",
+                   "| 2 | Clock controller (RCC) | Clocks and system control |"])
+    # a chunk of only-short rows carries nothing TOC-like (and nothing fixable)
+    assert not llm._is_toc_like(
+        ["| 0 | 1 |", "| 2 | 3 |", "plain prose"])
+    assert not llm._is_toc_like(["plain prose", "lines"])
+
+
+def test_split_and_splice_row_cells():
+    row = "| V CC | 14 | supply voltage |"
+    segs = llm._split_row_cells(row)
+    assert [c for _l, c, _t in segs] == ["V CC", "14", "supply voltage"]
+    out = llm._splice_cells(row, segs, {0: "VCC"})
+    assert out == "| VCC | 14 | supply voltage |"
+    # padding (lead/trail whitespace) is preserved from the skeleton
+    row2 = "|A x [7:0]  |  0x08 |"
+    segs2 = llm._split_row_cells(row2)
+    out2 = llm._splice_cells(row2, segs2, {0: "Ax[7:0]"})
+    assert out2 == "|Ax[7:0]  |  0x08 |"
+
+
+def test_parse_indexed_lines():
+    resp = "junk header\n0| Boundary address\n3| Register map\n9| ignored index"
+    got = llm._parse_indexed_lines(resp, {0, 3})
+    assert got == {0: "Boundary address", 3: "Register map"}
+    # continuation lines append to the previous index (wrapped long line)
+    got2 = llm._parse_indexed_lines("1| first part\ncontinued here", {1})
+    assert got2 == {1: "first part\ncontinued here"}
+    # the CONTEXT block is never captured, even when the model echoes it
+    # (measured failure mode on CH32V208DS0)
+    got3 = llm._parse_indexed_lines(
+        "1| Internal HB clock frequency\nCONTEXT:\nrow: | F HCLK | Internal HB clock frequency |",
+        {1})
+    assert got3 == {1: "Internal HB clock frequency"}
+    # a raw echoed table row is never captured as a continuation either
+    got4 = llm._parse_indexed_lines(
+        "1| Internal HB clock frequency\n| F HCLK | Internal HB clock frequency |",
+        {1})
+    assert got4 == {1: "Internal HB clock frequency"}
+
+
+def test_escaped_pipes_handling():
+    # cell-level: unescaping '\|' is canonical (not a content change)
+    assert llm._verify_pair(r"\| V IO_x \|", r"| V IO_x |") is None
+    # row-level: the model dropping '\|' changes the cell structure -> rejected
+    assert llm._verify_chunk(r"| \| V IO_x \| | x |",
+                             r"| | V IO_x | | x |") is not None
+
+
+def test_run_chunk_never_sends_rows_with_escaped_pipes(monkeypatch):
+    def must_not_call(*a, **kw):
+        raise AssertionError("rows with escaped pipes must not be sent")
+
+    monkeypatch.setattr(llm, "_call_llm", must_not_call)
+    row = r"| \| V IO_x \| | Variations between different I/O pins |"
+    result, delta = llm._run_chunk(
+        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
+    assert result == row
+    assert delta["accepted"] and delta["cells_sent"] == 0
+
+
+def test_split_row_cells_escaped_pipes():
+    row = r"| \| V IO_x \| | Variations between pins |"
+    segs = llm._split_row_cells(row)
+    assert len(segs) == 2
+    assert "V IO_x" in segs[0][1] and "\\|" in segs[0][1]
+    out = llm._splice_cells(row, segs, {0: "V IO_x"})
+    assert out == r"| V IO_x | Variations between pins |"
+
+
+def test_suspicious_cell():
+    assert llm._suspicious_cell("R es . Res.")
+    assert llm._suspicious_cell("Boundary address")
+    assert not llm._suspicious_cell("0x4002 3800")
+    assert not llm._suspicious_cell("[31:21] Reserved")
+    assert not llm._suspicious_cell("14")
+
+
+# ---------------------------------------------------------------------------
 # block-level salvage
 # ---------------------------------------------------------------------------
 
@@ -372,19 +409,20 @@ def test_salvage_keeps_good_lines_drops_bad():
         "excess of VCC.\n"
         "*Table 1. Ordering info*"
     )
-    salvaged, fixed, total, _reasons = llm._salvage(orig, cand)
+    salvaged, fixed, total, _reasons, failed = llm._salvage(orig, cand)
     assert "excess of VCC." in salvaged          # good fix kept
     assert "Ordering info" in salvaged           # good fix kept
     assert "D-t yp e" in salvaged                # hallucinated line reverted
     assert "edge-triggered." not in salvaged
     assert fixed == 2 and total == 3
+    assert failed == {0}                          # the reverted line is disputed
 
 
 def test_salvage_is_always_safe():
     # no matter what the candidate is, every surviving line must pass verify
     orig = "values 2 0 mA here\nand V CC supply"
     cand = "values 20 mA here\nand VCC supply"
-    salvaged, fixed, total, _ = llm._salvage(orig, cand)
+    salvaged, fixed, total, _ = llm._salvage(orig, cand)[:4]
     assert fixed == 1 and total == 2     # digit-digit reverted, VCC kept
     assert "2 0 mA" in salvaged
     assert "VCC supply" in salvaged
@@ -394,7 +432,7 @@ def test_salvage_is_always_safe():
 def test_salvage_handles_line_join_blocks():
     orig = "text that was\nfalsely split\nend"
     cand = "text that was falsely split\nend"
-    salvaged, fixed, _total, _ = llm._salvage(orig, cand)
+    salvaged, fixed, _total, _ = llm._salvage(orig, cand)[:4]
     assert fixed == 1
     assert salvaged == "text that was falsely split\nend"
 
@@ -402,15 +440,16 @@ def test_salvage_handles_line_join_blocks():
 def test_salvage_rejects_inserted_content_block():
     orig = "alpha beta"
     cand = "alpha beta gamma delta"
-    salvaged, fixed, _total, _ = llm._salvage(orig, cand)
+    salvaged, fixed, _total, _ = llm._salvage(orig, cand)[:4]
     assert fixed == 0
     assert salvaged == orig
 
 
-def test_salvage_empty_candidate_keeps_original():
+def test_salvage_empty_candidate_marks_all_lines_disputed():
     orig = "line one\nline two"
-    salvaged, fixed, _total, _ = llm._salvage(orig, "")
+    salvaged, fixed, _total, _r, failed = llm._salvage(orig, "")
     assert salvaged == orig and fixed == 0
+    assert failed == {0, 1}
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +524,13 @@ def test_parallel_reassembles_in_order_and_merges_stats(monkeypatch):
 def test_parallel_output_identical_to_sequential(monkeypatch):
     def fake_call(system_prompt, chunk, model, endpoint, api_key,
                   sampling=None, retry_hint=None):
-        # first attempt 'hallucinates' -> exercises salvage; retry hint path
-        if retry_hint is None and "Ordering" in chunk:
+        # first whole-chunk attempt on the 'Ordering' chunk returns the text
+        # plus a hallucinated tail -> exercises salvage; the line-level echo
+        # request (numbered lines) gets a clean fixed answer
+        if retry_hint is None and "N|" not in chunk and "Ordering" in chunk:
             return chunk + " extra hallucinated content", None
+        if "N|" in chunk:
+            return _fixed(chunk), None
         return _fixed(chunk), None
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
@@ -711,10 +754,11 @@ def test_correct_with_llm_records_swappy_and_auto_workers(monkeypatch):
 
 
 def test_estimate_chunk_tokens_sanity():
-    # ~3.5 chars/token in, same-size out, plus margin
+    # ~3.5 chars/token in, up to 2x-size out (measured padding rewrites),
+    # plus margin
     assert llm.estimate_chunk_tokens(0) == llm._CTX_MARGIN_TOKENS
     need = llm.estimate_chunk_tokens(6000)
-    assert 2 * (6000 / 4) < need < 2 * (6000 / 3) + 512 + 1
+    assert 3 * (6000 / 4) < need < 3 * (6000 / 3) + 512 + 1
 
 
 # ---------------------------------------------------------------------------
@@ -733,14 +777,15 @@ def test_split_sampling_standard_vs_extra():
 # ---------------------------------------------------------------------------
 
 def test_output_token_cap_is_close_to_input_size():
-    # a 2000-char chunk is ~570 input tokens; the cap must be tight (not the
-    # old 2x-chars = 4000-token budget) but leave margin for fence/hint error
+    # a 2000-char chunk is ~572 input tokens; the cap is 2x input + margin:
+    # measured rewrites (cell padding) reach ~2x, so 1x truncated 419/2936
+    # calls on rm0410 while 4x only wasted tokens on hopeless chunks
     cap = llm.output_token_cap(2000)
-    assert 570 < cap < 900
-    assert llm.output_token_cap(0) == llm._OUT_MARGIN_TOKENS + 1
+    assert 1100 < cap < 1700
+    assert llm.output_token_cap(0) == 2 * 1 + llm._OUT_MARGIN_TOKENS
 
 
-def test_run_chunk_caps_max_tokens(monkeypatch):
+def test_run_chunk_prose_passes_without_extra_kwargs(monkeypatch):
     seen = {}
 
     def fake_call(system_prompt, chunk, *a, **kw):
@@ -749,25 +794,168 @@ def test_run_chunk_caps_max_tokens(monkeypatch):
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
     result, delta = llm._run_chunk(
-        1, 1, "some chunk", "", "sys", "m", "http://x", "k", None, 0)
+        1, 1, "some chunk", "", "sys", "line", "cell", "m", "http://x", "k",
+        None, 0)
     assert delta["accepted"]
     # no max_tokens argument is passed at all: _call_llm computes the cap
     # itself from the content length
     assert "max_tokens" not in seen["kwargs"]
 
 
-def test_run_chunk_records_truncation(monkeypatch):
+def test_run_chunk_prose_truncated_then_disputed_re_ask(monkeypatch):
+    calls = []
+
     def fake_call(system_prompt, chunk, *a, **kw):
-        # 'looping' model: answer cut off mid-text by the output cap
-        return chunk[: len(chunk) // 2], "length"
+        calls.append((system_prompt[:20], chunk))
+        if "0|" not in chunk:
+            return chunk[: len(chunk) // 2], "length"  # truncated whole-chunk
+        return "0| text alpha beta", None
 
     monkeypatch.setattr(llm, "_call_llm", fake_call)
     result, delta = llm._run_chunk(
-        1, 1, "text alpha beta", "", "sys", "m", "http://x", "k", None, 0)
-    assert delta["rejected"] and delta["truncated"] == 1
-    assert any("finish_reason=length" in r for r in
-               delta["rejection"]["reason"].split("; "))
-    assert result == "text alpha beta"        # original kept
+        1, 1, "text alpha  beta", "", "sys", "line", "cell", "m", "http://x",
+        "k", None, 0)
+    # the truncated whole-chunk answer fails, salvage fails, and the disputed
+    # line re-ask returns a verified fix
+    assert delta["accepted"] and delta["blocks_fixed"] >= 1
+    assert delta["truncated"] == 1
+    assert result == "text alpha beta"
+
+
+def test_run_chunk_toc_like_chunk_is_skipped_without_calls(monkeypatch):
+    def must_not_call(*a, **kw):
+        raise AssertionError("TOC-like chunks must not be sent to the model")
+
+    monkeypatch.setattr(llm, "_call_llm", must_not_call)
+    toc = ("\n".join([
+        "|  | 3.3.2 | Read access latency   90 | Read access latency   90 |  |",
+        "| --- | --- | --- | --- | --- |",
+        "|  | 3.3.3 | Write access latency   91 | Write access latency   91 |  |",
+    ]))
+    result, delta = llm._run_chunk(
+        1, 1, toc, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
+    assert result == toc
+    assert delta["toc_skipped"]
+
+
+def test_run_chunk_table_cells_spliced_into_skeleton(monkeypatch):
+    row = "| R es . | 14 | 0x08 |"
+    fixed_row = "| Res. | 14 | 0x08 |"
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        assert "CONTEXT:" in chunk           # the row rides along as context
+        assert "0| R es ." in chunk          # only the suspicious cell is sent
+        return "0| Res.", None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    result, delta = llm._run_chunk(
+        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
+    assert result == fixed_row
+    assert delta["accepted"] and delta["cells_sent"] == 1
+    assert delta["cells_fixed"] == 1 and delta["blocks_fixed"] == 1
+
+
+def test_run_chunk_duplicated_cells_are_never_sent(monkeypatch):
+    # TOC-shaped chunks (one distinct long cell per row, optionally duplicated
+    # into siblings) are skipped: the model can only 'deduplicate' or reword
+    # them, which is always rejected -> zero calls
+    def must_not_call(*a, **kw):
+        raise AssertionError("TOC-shaped chunks must not be sent to the model")
+
+    monkeypatch.setattr(llm, "_call_llm", must_not_call)
+    row = "|  | 5.2 |  | Clock gating control  152 | Clock gating control  152 |  |"
+    result, delta = llm._run_chunk(
+        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
+    assert result == row
+    assert delta["toc_skipped"] and delta["cells_sent"] == 0
+
+
+def test_run_chunk_dedup_does_not_block_real_defect_cells(monkeypatch):
+    row = "| [31:21] Reserved | [31:21] Reserved | R es . output |"
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        assert "Reserved" not in chunk.split("CONTEXT:")[0]  # dups not sent
+        assert "2| R es . output" in chunk
+        return "2| Res. output", None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    result, delta = llm._run_chunk(
+        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
+    assert result == "| [31:21] Reserved | [31:21] Reserved | Res. output |"
+    assert delta["cells_sent"] == 1 and delta["cells_fixed"] == 1
+
+
+def test_run_chunk_failed_cell_recovered_by_hinted_retry(monkeypatch):
+    # a content-level failure is not final: with retries >= 1 the failed cell
+    # is re-requested with a rejection-reason hint, and sampling is passed
+    # through verbatim (never forced to 0)
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append((chunk, kw.get("sampling")))
+        if len(calls) == 1:
+            return "2| Res", None              # mangled -> verification fails
+        assert "REJECTED" in chunk             # retry carries the reason hint
+        return "2| Res. output", None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    sampling = {"temperature": 1.0}
+    result, delta = llm._run_chunk(
+        1, 1, "| [31:21] Reserved | [31:21] Reserved | R es . output |", "",
+        "sys", "line", "cell", "m", "http://x", "k", sampling, 1)
+    assert delta["accepted"] and delta["cells_fixed"] == 1
+    assert delta["retries_used"] == 1
+    assert result == "| [31:21] Reserved | [31:21] Reserved | Res. output |"
+    # sampling forwarded verbatim, no temperature override
+    assert calls[0][1] == {"temperature": 1.0}
+    assert calls[1][1] == {"temperature": 1.0}
+
+
+def test_correct_with_llm_sends_no_sampling_when_unconfigured(monkeypatch):
+    seen = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        seen.append(kw.get("sampling"))
+        return chunk, None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    _out, _stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False,
+        classify=False, max_chars=MAXC, workers=1)
+    # no llm_sampling configured -> NO sampling parameters are sent at all;
+    # server-side defaults apply (never overridden by the tool)
+    assert seen and all(s is None for s in seen)
+
+
+def test_correct_with_llm_forwards_configured_sampling_verbatim(monkeypatch):
+    seen = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        seen.append(kw.get("sampling"))
+        return chunk, None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    sampling = {"temperature": 1.0, "top_k": 40}
+    _out, stats = llm.correct_with_llm(
+        PAR_TEXT, "m", "http://x", "k", verbose=False, classify=False,
+        max_chars=MAXC, workers=1, sampling=sampling)
+    assert seen and all(s == sampling for s in seen)
+    assert stats["sampling"] == sampling
+
+
+def test_run_chunk_rejects_unfixable_cell_and_keeps_original(monkeypatch):
+    row = "| R es . | 14 |"
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        # model 'deduplicates'/'mangles' the cell -> verification must reject
+        return "0| Res", None
+
+    monkeypatch.setattr(llm, "_call_llm", fake_call)
+    result, delta = llm._run_chunk(
+        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
+    assert result == row                    # original kept
+    assert delta["rejected"]
+    assert delta["cells_fixed"] == 0
 
 
 def test_strip_thinking_blocks():
@@ -906,7 +1094,7 @@ def test_salvage_survives_deleted_horizontal_rule():
     orig = "---\n\n| V CC | 14 | supply voltage |\n| 2RD | 13 | reset |\n\n---"
     # model deleted the FIRST '---' but fixed cells
     cand = "\n| VCC | 14 | supply voltage |\n| 2RD | 13 | reset |\n\n---"
-    salvaged, fixed, _total, _r = llm._salvage(orig, cand)
+    salvaged, fixed, _total, _r, _failed = llm._salvage(orig, cand)
     assert "---" in salvaged                     # rule preserved from orig
     assert "| VCC | 14 | supply voltage |" in salvaged  # good row fix applied
     assert "| 2RD | 13 | reset |" in salvaged
@@ -916,6 +1104,6 @@ def test_salvage_survives_deleted_horizontal_rule():
 def test_salvage_line_join_still_works():
     orig = "text that was\nfalsely split\nend"
     cand = "text that was falsely split\nend"
-    salvaged, fixed, _total, _ = llm._salvage(orig, cand)
+    salvaged, fixed, _total, _ = llm._salvage(orig, cand)[:4]
     assert fixed == 1
     assert salvaged == "text that was falsely split\nend"

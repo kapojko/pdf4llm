@@ -55,7 +55,6 @@ exit results); the final exit code is the worst per-file code.
 | `--llm` | run local-LLM broken-text correction (default **off**) |
 | `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 8)`), else 1; an explicit value overrides the server |
 | `--llm-chunk-chars N` | max chunk size (chars) for the LLM pass; default **2000** (config key `llm_chunk_chars`). Smaller chunks are more stable on small local models |
-| `--llm-content-only` | relaxed LLM verification: only letters, digits, underscores and numeric values are protected; punctuation, ASCII decoration and table geometry may change (config key `llm_content_only`) |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
@@ -109,29 +108,43 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
    fixes: join split words (`D-t yp e` → `D-type`), subscript joins
    (`V CC` → `VCC`, `T amb` → `T_amb`), part-number hyphen joins
    (`SOT108 - 1` → `SOT108-1`), false line-break removal. Nothing else.
-3. **Algorithmic verifier** (per chunk, non-negotiable) — two levels:
-   - *strict* (default): whitespace-level edits only. Whitespace-stripped
-     input and output must be byte-identical (invariant A), numeric tokens
-     must survive as an ordered sequence, and table rows keep their cell
-     count (invariant B). The numeric-token check blocks whitespace merges
-     that would corrupt a value (`2 0` → `20`, `0x30 08` → `0x3008`,
-     `-40` → `40`); harmless joins (`25 °C` → `25°C`, `VCC + 0.5`) pass.
-   - *content* (`--llm-content-only` or config `llm_content_only`): only the
-     DATA is protected — the ordered sequence of letters, digits and
-     underscores (`0-9A-Za-z_`) plus numeric tokens (digits with their
-     internal separators and sign: `0.5`, `11:0`, `-40`, `0x020000`) must be
-     byte-identical; everything else — punctuation, ASCII decoration,
-     whitespace, table geometry — may change. Letters/digits can never be
-     inserted, deleted, reordered or recased; duplicated lines/cells are not
-     collapsible. Use for noisy pseudo-ASCII documents (dot leaders,
-     decoration artifacts) where strict mode rejects too much.
-4. **Recovery** — a rejected chunk is not simply discarded: it goes through
-   line/block-level **salvage** (only independently verified pieces are
-   applied, the rest reverts), then up to `llm_retries` regeneration attempts
-   with a rejection-reason hint, keeping the best. Whatever still fails
-   verification stays as the original — rejection is always safe, never
-   silent. All decisions are logged to `meta.json` (`llm` section:
-   classification, accepted/salvaged/rejected counts, per-chunk reasons).
+3. **Structure never passes through the model** — the pass is
+   structure-aware, and the granularity matches where a small model is
+   actually reliable:
+   - *table chunks* are processed at **cell level**: a deterministic
+     pre-filter sends only cells that look defect-suspect (measured on a
+     1942-page reference manual: ~90% of cells are skipped as clean), each
+     batch with its row as context; the row skeleton — pipes, padding,
+     separator rows — is spliced back untouched, so table geometry can
+     never be damaged;
+   - *TOC-like chunks* (every table row carries at most one distinct long
+     cell — section title + page — sometimes duplicated into sibling cells;
+     a common extraction artifact in tables of contents) are **skipped
+     deterministically**: no model output can ever verify against them, so
+     no requests are spent;
+   - *prose chunks* get one whole-chunk attempt (the only unit that can join
+     falsely split lines), then a deterministic line-level salvage of the
+     candidate, then batched re-asks of the disputed lines
+     (only the failed subset, up to `llm_retries` rounds, with a hint).
+   All unit-level requests use an indexed echo protocol (`N| text`);
+   measured on a 9B/A1.3B model, they produced zero content
+   violations where whole-table chunks were rejected ~70% of the time.
+4. **Algorithmic verifier** (per unit, non-negotiable) — whitespace-level
+   edits only: input and output must be identical after whitespace-stripping
+   and a closed **canonical map** (dashes, quotes, bullets, ellipsis are
+   interchangeable in BOTH directions — the model may rewrite `–` as `-` but
+   can never delete it), numeric tokens must survive as an ordered sequence
+   (blocks `2 0` → `20`, `0x30 08` → `0x3008`, `-40` → `40`; harmless joins
+   like `25 °C` → `25°C` pass), and table rows keep their cell count.
+   The canonical map never touches `[0-9A-Za-z_]`, so register names,
+   constants and words are physically immutable.
+5. **Recovery** — a failed unit is not simply discarded: the whole-chunk
+   candidate goes through line/block-level **salvage** (only independently
+   verified pieces are applied, the rest reverts), then batched re-asks of the
+   disputed lines (only the failed subset, up to `llm_retries` rounds). Whatever still fails verification stays as
+   the original — rejection is always safe, never silent. All decisions are
+   logged to `meta.json` (`llm` section: classification, accepted/salvaged/
+   rejected/toc-skipped counts, cells sent/fixed, per-chunk reasons).
 
 Deterministic pre-passes run before the LLM pass — no model involvement:
 duplicated-bullet cleanup (`- • x` → `- x`), horizontal-rule stripping, and
@@ -146,11 +159,12 @@ pdf4llm --llm-auth
 
 Saved to the user config dir (Windows: `%APPDATA%\pdf4llm\config.json`,
 POSIX: `~/.config/pdf4llm\config.json`) as `{endpoint, api_key, model}`.
-Optional keys: `llm_sampling` (dict forwarded to the model; defaults to the
-Ornith-1.5-9B card's precise-coding set: `temperature 0.6, top_p 0.95,
-top_k 20, min_p 0.0, presence_penalty 0.0`), `llm_retries` (default 2),
-`llm_chunk_chars` (default 2000; same as `--llm-chunk-chars`) and
-`llm_content_only` (default false; same as `--llm-content-only`).
+Optional keys: `llm_sampling` (dict forwarded verbatim on every request;
+when absent, **no sampling parameters are sent** and the server-side model
+defaults apply — the tool never overrides temperature), `llm_retries`
+(default 2; a unit that fails parsing or verification is re-requested up to
+this many extra times, only the failed subset, with a rejection-reason
+hint) and `llm_chunk_chars` (default 2000; same as `--llm-chunk-chars`).
 Then:
 
 ```powershell
