@@ -226,9 +226,9 @@ reassembled strictly in original chunk order.
 
 #### Model choice
 
-Current default (configured in the repo config): **ling-3.0-tiny-np8** (MoE,
-A1.3B active). Measured on the current batched pipeline, 19-page datasheet,
-19.4k alphanumeric chars, 8 slots:
+Current default (saved user config via `--llm-auth`): **ling-3.0-tiny-np8**
+(MoE, A1.3B active). Measured on the current batched pipeline, 19-page
+datasheet, 19.4k alphanumeric chars, 8 slots:
 
 - **750 chars/s** wall (142s → 43s vs the pre-batching pipeline on the same
   document and server);
