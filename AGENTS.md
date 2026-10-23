@@ -22,7 +22,7 @@ CLI utility to convert PDF to properly formatted Markdown, for downstream LLM pr
     `llm_salvage.py` (line-level salvage of rejected candidates),
     `llm_prepass.py` (deterministic pre-passes),
     `llm_server.py` (llama-swappy probing, worker pool, interrupt/context errors).
-* `tests/` — offline test suite (122 tests; `test_llm.py` covers the LLM pass, `test_convert.py`/`test_cli_options.py` the rest).
+* `tests/` — offline test suite (`test_llm.py` covers the LLM pass, `test_convert.py`/`test_cli_options.py` the rest).
 * `scripts/` — one-off experiment & diagnostic scripts (`exp*.py`, `diag_rejections.py`, `probe_new_rules.py`); `scripts/bench/` — local model benchmarks (`bench_llm_local.py`, `probe_quality.py`).
 * `examples/` — sample documents (only the small 74HC_HCT74 fixture is committed).
 * `out/` — conversion/benchmark outputs, gitignored.

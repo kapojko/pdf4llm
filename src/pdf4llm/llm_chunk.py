@@ -2,8 +2,14 @@
 
 Splits Markdown into LLM-sized chunks whose concatenation with their
 separators reproduces the input exactly; tables are never cut mid-block.
+When a size overflow forces a break, the break is aligned to the last
+markdown heading inside the window (the heading opens the NEXT chunk, so a
+section always travels with its heading) whenever that does not produce a
+degenerately small chunk.
 """
 from __future__ import annotations
+
+import re
 
 
 
@@ -11,6 +17,9 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Chunking (line-based, structure-preserving)
 # ---------------------------------------------------------------------------
+
+_ATX_HEADING_RE = re.compile(r"#{1,6} \S")
+
 
 def chunk_markdown(text: str, max_chars: int = 6000) -> list[tuple[str, str]]:
     """Split Markdown into LLM-sized chunks WITHOUT destroying structure.
@@ -30,11 +39,23 @@ def chunk_markdown(text: str, max_chars: int = 6000) -> list[tuple[str, str]]:
         j = i  # exclusive end of the chunk
         size = 0
         sep_extra = 0  # blank lines folded into the separator after this chunk
+        last_heading = None  # break position after the last ATX heading seen
+        heading_size = 0     # accumulated size up to and incl. that heading
         while j < n:
             line_len = len(lines[j]) + 1
             if size + line_len > max_chars and j > i:
+                # size overflow: prefer a heading-aligned break (the heading
+                # then opens the next chunk together with its section) when
+                # one exists in-window and leaves a non-degenerate chunk
+                if (last_heading is not None and i < last_heading
+                        and heading_size >= max_chars * 0.35):
+                    j = last_heading
+                    sep_extra = 0
                 break
             size += line_len
+            if _ATX_HEADING_RE.match(lines[j]):
+                last_heading = j      # break position AT the heading line:
+                heading_size = size   # the heading opens the NEXT chunk
             j += 1
             # never cut inside a table block: swallow consecutive '|'-rows
             if lines[j - 1].lstrip().startswith("|"):

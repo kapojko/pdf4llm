@@ -43,16 +43,16 @@ def main() -> None:
     print(f"[{NAME}] warm-up reply={r.choices[0].message.content!r} "
           f"(incl. load/switch {load_secs:.1f}s)", flush=True)
 
-    # record per-chunk deltas by wrapping _run_chunk
+    # record per-chunk deltas by wrapping _apply_chunk_delta (called once per
+    # chunk at drain time in the batched pipeline)
     deltas: list[dict] = []
-    orig_run_chunk = llm_run._run_chunk
+    orig_apply = llm_run._apply_chunk_delta
 
-    def recording_run_chunk(*a, **kw):
-        result, delta = orig_run_chunk(*a, **kw)
+    def recording_apply(stats, delta):
         deltas.append(delta)
-        return result, delta
+        return orig_apply(stats, delta)
 
-    llm_run._run_chunk = recording_run_chunk
+    llm_run._apply_chunk_delta = recording_apply
     t0 = time.perf_counter()
     with contextlib.redirect_stdout(log_file):
         corrected, stats = llm_run.correct_with_llm(
@@ -61,7 +61,7 @@ def main() -> None:
         )
     wall = time.perf_counter() - t0
     log_file.close()
-    llm_run._run_chunk = orig_run_chunk
+    llm_run._apply_chunk_delta = orig_apply
 
     # fix-quantity metrics vs the input text
     in_lines = TEXT.split("\n")
@@ -81,7 +81,10 @@ def main() -> None:
         "retries_used": stats["retries_used"],
         "truncated_calls": stats["truncated_calls"],
         "changed_lines_vs_input": changed_lines,
-        "chunk_duration_secs": sorted(round(d["duration"], 1) for d in deltas),
+        "units_sent": stats.get("units_sent", 0),
+        "units_failed": stats.get("units_failed", 0),
+        "units_skipped": stats.get("units_skipped", 0),
+        "batches": stats.get("batches", 0),
         "corrected_chars": len(corrected),
     }
     out = Path(__file__).resolve().parent / "outputs" / f"bench_{NAME}.md"

@@ -3,17 +3,16 @@
 Status of the structure-aware `--llm` pipeline. Everything below assumes the
 verifier-first design: sampling is never overridden (server-side defaults
 unless `llm_sampling` is configured), every unit is verified before it is
-applied, failed units are retried up to `llm_retries` times (default 2) with
-a rejection-reason hint, and rejection is always safe (the original text is
+applied, failed units keep the original text after `llm_retries` extra
+attempts (default 2), and rejection is always safe (the original text is
 kept).
 
 ## Module layout (post-refactor baseline)
 
-`llm.py` has been split into focused modules (pure code motion, 122 tests
-passing unchanged): `llm_prepass`, `llm_classify`, `llm_chunk`, `llm_prompts`,
-`llm_verify`, `llm_table`, `llm_salvage`, `llm_protocol`, `llm_client`,
-`llm_server`, `llm_run`. All improvement items below work against this
-baseline; every later diff stays small and reviewable.
+`llm.py` has been split into focused modules: `llm_prepass`, `llm_classify`,
+`llm_chunk`, `llm_prompts`, `llm_verify`, `llm_table`, `llm_salvage`,
+`llm_protocol`, `llm_client`, `llm_server`, `llm_run` (plus `llm_batch`,
+the cross-chunk batch scheduler).
 
 ## Open investigation (highest priority, before tuning anything)
 
@@ -30,119 +29,67 @@ Next steps:
 - run the same file with `--llm-workers 1` vs 8 — if failures cluster in the
   parallel path, suspect server-side state under 8 streams first.
 
-## Decided improvements (post-refactor, in implementation order)
+## Decided improvements
 
-### 1. Cross-chunk batch aggregation (main throughput lever)
+### 1. Cross-chunk batch aggregation — DONE
 
-Decouple the verification unit (cell/line — stays small) from the request
-unit. Maintain global queues of suspect units across all chunks, with an
-index registry mapping global index → (chunk, local unit, kind); pack
-requests from the queues.
+Implemented in `llm_batch.py` (`Unit` registry, kind-separated global
+queues, batch packer ~5k fragment chars, CONTEXT row once per row-group,
+pure global requeue failure semantics, per-unit NOTE hints, drain phase,
+per-ordinal failure log for drift measurement). Producers (scan + whole-chunk
+prose attempts) and batch requests share the worker pool via a priority heap
+(batches interleave with producers). Chunk final states are computed at
+drain time; safety gates unchanged.
 
-- **Kind-separated**: never mix cells and prose lines in one call (one call =
-  one task type = simpler prompt for a small model).
-- **Batch size**: start at ~5k chars of *fragments* per call (context rows
-  attached once per row-group, not per cell). Slot context is 24k, so input
-  is not the constraint — generated output length is.
-- **Drift measurement**: log per-unit failure vs the unit's ordinal position
-  in the response. Flat → raise batch size toward 10–15k; tail-clustered →
-  the ceiling is found. Decide from data, not guesswork.
-- Long streamed echo responses are the intended workload: copy tasks give
-  near-total dflash acceptance, so echoing clean spans is nearly free.
-- Safety unchanged: per-unit verification, index-based reassembly, missing
-  indices → retry subset (existing `_verified_rounds` semantics).
+### 2. Output token cap relative to fragments — DONE
 
-### 2. Output token cap relative to fragments
+Batched echo requests cap `max_tokens` at 2x the FRAGMENT volume + margin
+(`output_cap_chars` through `_call_llm`), not the whole prompt; truncation
+handling unchanged (missing tail units are requeued).
 
-`output_token_cap` currently scales with whole-prompt input; as context per
-call grows (item 1), the cap inflates and gives degenerate input-repeat more
-runway. Cap ≈ fragments volume + margin (current 1x+256 formula applied to
-the fragment total, not the full prompt). Truncation handling unchanged.
+### 3. One-shot example in every unit prompt — DONE
 
-### 3. One-shot example in every unit prompt
+Both line and cell prompts carry one worked example (one fixed fragment +
+one clean-echoed fragment) plus the NOTE-line convention, in the system
+message.
 
-A single worked example kills the input-repeat-when-confused failure at the
-source (the model was never trained on our CONTEXT convention). Sketch:
+### 4. `<br>` split-cell repair — DONE
 
-> System: You repair text-extraction defects. You get numbered fragments,
-> sometimes with a CONTEXT block showing the surrounding row. Reply with the
-> same numbers and the fragment, fixing only split words and false
-> spaces/line-breaks. Never change words, numbers, punctuation. Never echo
-> the CONTEXT. Copy clean fragments unchanged.
->
-> Example request: `1| D-t yp e`, `2| Standard operating voltage`
-> Example reply:  `1| D-type`, `2| Standard operating voltage`
+Deterministic pre-pass joins `letter<br>lowercase` mechanically; the
+invariant-A projection strips `<br>` variants from both sides (numeric-token
+check does NOT see the projection, so `2<br>0` -> `20` stays rejected);
+lines with residual `<br>` are always admitted as batched units.
 
-One fixed fragment + one clean-echoed fragment, so both behaviours are
-shown and the reply contains nothing else. Keep instructions in the system
-message; per-call user content is only the CONTEXT block + indexed units.
+### 5. Heading-aligned chunk boundaries — DONE
 
-### 4. `<br>` split-cell repair (new repair class)
+`llm_chunk.py` aligns overflow breaks to the last ATX heading in-window
+(the heading opens the next chunk) whenever that leaves a non-degenerate
+chunk; table-swallow and paragraph-fold behaviour unchanged.
 
-Currently impossible by construction: joining `System Co<br>ntrol` deletes a
-non-whitespace token, which the whitespace-only invariant must reject.
-Introduce a narrowed edit class: the only permitted edit is replacing `<br>`
-with `""` or `" "`.
+### 6. In-document vocabulary as a SEND/SKIP filter — DONE
 
-- Verifier: strip all `<br>` from both sides, whitespace-collapse, require
-  identity; numeric-token check unchanged. One extra canonical projection in
-  `llm_verify.py`, same philosophy.
-- Deterministic pre-pass (in `llm_prepass.py`): `letter<br>lowercase` → join
-  without space. This case is mechanical and document-independent (it is
-  what `<br>` *means* in a split word), not a per-PDF rule.
-- Only ambiguous cases (capital/digit after `<br>`) go to the model, batched
-  via item 1.
-- Motivation: `Control` is searchable/embeddable, `Co<br>ntrol` is not; this
-  un-accepts a "known acceptable artifact" that matters for LLM consumption.
+`DocVocab` in `llm_batch.py`: per-document word map built after pre-passes;
+a fragment is admitted when some contiguous sub-join of its suspicious-gap
+groups occurs in the document (or when it carries residual `<br>`, double
+spaces/tabs, or is very long). Skipped units are counted (`units_skipped`),
+never edited. Not applied to targeted disputed-line re-asks of the prose
+path.
 
-### 5. Heading-aligned chunk boundaries
+### 7. Whole-chunk prose attempt: measure, then condition — HALF DONE
 
-When a chunk must split anyway, prefer splitting at markdown headings.
-Better model context, no risk. Minor, do when touching `llm_chunk.py`.
+Measurement is in place: meta.json carries `wholechunk_attempts`,
+`wholechunk_accepted`, `wholechunk_linejoin_fixes` (the unique yield).
+Still open: the conditional skip for chunks without suspicious cross-line
+patterns, gated on measured yield being near zero on real documents. (The
+paired-line unit idea remains REJECTED — see below.)
 
-### 6. In-document vocabulary as a SEND/SKIP filter (never an applier)
+### 8. Rule yield accounting and pruning — instrumentation DONE
 
-Build a word-frequency map of the document as-extracted at pass start (one
-regex pass; datasheets are highly repetitive). Use it ONLY to decide whether
-a suspicious fragment is sent to the model:
-
-- joined form occurs often in THIS document (`Re set` → `Reset` ×80) → send
-  as usual; model + verifier do their job unchanged;
-- joined form never occurs (`Power down` → `Powerdown` ×0) → probably
-  legitimate spacing → skip; saves a call and avoids "helpful" rewrites that
-  only produce rejection risk.
-
-Hard rules: the vocabulary never edits text; a wrong skip costs one unfixed
-defect (recall), never corruption; the map is rebuilt per document — nothing
-hardcoded, nothing to overfit across PDFs; on a sparse/weird document the
-behaviour degrades to the current design.
-
-### 7. Whole-chunk prose attempt: measure, then condition
-
-The whole-chunk call is the most expensive and most rejection-prone call
-type; its UNIQUE capability is cross-line word joins (everything else the
-line path does cheaper with finer salvage). From meta.json, count chunks
-where state = `accepted` AND the diff changes the line count (a join) —
-that is the whole-chunk call's unique yield.
-
-If the yield is near-zero on real documents: skip the whole-chunk attempt
-for chunks without suspicious cross-line patterns (lowercase line end +
-lowercase next-line start, no sentence punctuation) and go straight to the
-line path. Note: the paired-line unit idea was REJECTED (detection is
-unreliable on real garbage — extra whitespace / non-printables inside
-words), so the whole-chunk attempt remains the only cross-line fixer; this
-item is measurement + conditional skip, not removal.
-
-### 8. Rule yield accounting and pruning
-
-Every selection heuristic must report sent/fixed/failed in meta.json (most
-already do). Any heuristic with ~zero fix yield over several documents gets
-pruned or demoted — selection rules can't corrupt anything, so the criterion
-is purely economic. Current prime suspect: the cell pass on WCH datasheets
-(`cells_fixed` 0/365, 0/274 sent) — measure the fix/no-change/fail
-distribution once the open investigation is resolved, then decide whether
-the suspicious-cell filter over-sends or the model genuinely cannot improve
-those cells.
+meta.json now reports `units_sent/fixed/failed/skipped` per pass plus
+`cells_sent/cells_fixed` and the per-unit fail log. Still open: the actual
+prune/demote decision for zero-yield heuristics (prime suspect: the cell
+pass on WCH datasheets, `cells_fixed` 0/365, 0/274 sent) once the open
+investigation is resolved.
 
 ## Rejected ideas (recorded so they are not re-proposed)
 
@@ -167,17 +114,16 @@ those cells.
   extraction garbage; whole-chunk attempt covers the case (see item 7).
 - **Pre-built / cross-document vocabularies**: overfit risk to 1–2
   documents; per-document maps only (item 6).
+- **In-place retry rounds** (re-asking the failed subset inside the same
+  batch handler): replaced by pure global requeue — each retry gets a fresh
+  position in the echo (drift-isolated), hints stay per-unit coherent in
+  mixed-reason batches.
 
 ## Minor items (keep, low priority)
 
-- Progress label `REJECTED: ... retries 0` is confusing (`retries` counts
-  extra rounds only). Relabel to `no-recovery` or show round counts.
 - Atomic tokens (`[Figure-n](x,y,w,h)`, `(cid:...)`) are handled by
   per-unit fallback only. Add masking (placeholder substitution) if meta
   stats show them causing rejections.
-- `_verify_chunk` invariant-B per-cell check splits on unescaped pipes; the
-  defense check could use the same canonicalized projection as the run-level
-  guard for full symmetry.
 
 ## Validation still to do (requires owner approval for long runs)
 
@@ -191,24 +137,32 @@ those cells.
     baseline preserved in `*.meta.json.bak`.
 - Compare meta.json old vs new per document; watch `chunks_toc_skipped`,
   `cells_sent`/`cells_fixed`, `truncated_calls` (should stay near zero).
-- After item 1 lands: re-run the local bench (`scripts/bench/`,
-  `bench_llm_local.py`, `probe_quality.py`) — batch aggregation changes the
-  throughput/rejection trade-off the model-choice table is based on.
+- Re-run the local bench (`scripts/bench/`, `bench_llm_local.py`,
+  `probe_quality.py`) — batch aggregation changes the throughput/rejection
+  trade-off the model-choice table is based on.
 
 ## Done on this branch (for context)
 
 - Canonical verifier (bidirectional dash/quote/bullet/ellipsis map,
-  `\|` tolerance, numeric-token check on canonicalized text).
+  `\|` tolerance, numeric-token check on canonicalized text, `<br>`
+  split-marker projection).
 - 2x output token cap (was 1x; truncated 419/2936 calls on rm0410).
 - TOC-like chunk detection with deterministic skip.
 - Cell-level table processing: suspect cells only (dup/contained cells and
   escaped-pipe rows never sent), row as context, skeleton spliced back.
-- Prose: whole-chunk attempt -> line salvage -> disputed-line re-asks.
-- Echo protocol (`N| text`) with per-unit verification and hinted retry
-  rounds (`llm_retries`, default 2, failed subset only).
+- Prose: whole-chunk attempt -> line salvage -> batched disputed-line units.
+- Echo protocol (`N| text`) with per-unit verification and requeue retries.
+- Cross-chunk batch aggregation (item 1), fragment-based output cap (2),
+  worked examples (3), `<br>` repair (4), heading-aligned boundaries (5),
+  vocabulary SEND/SKIP filter (6), yield accounting (8).
+- Per-unit rejection-reason hints as NOTE lines; `retries_used` now counts
+  extra attempts across batches.
 - Sampling never overridden: no `llm_sampling` configured -> no sampling
   parameters sent at all; configured -> forwarded verbatim.
-- CLI: `--llm-content-only` removed; single strict mode.
-- Tests: 122 passing (see `tests/test_llm.py`), including adversarial
-  verifier cases, TOC detection, escaped pipes, retry-recovery, and
-  sampling pass-through.
+- CLI: `--llm-content-only` removed; single strict mode. Progress label
+  relabelled to `no-recovery after N requeue(s)`.
+- Tests: offline suite in `tests/test_llm.py` covers the batch scheduler
+  (packing, requeue exhaustion, NOTE transport, kind separation, vocab
+  filter, truncation requeue), `<br>` classes, heading-aligned chunking,
+  multi-group parsing, adversarial verifier cases, TOC detection, escaped
+  pipes, and sampling pass-through.

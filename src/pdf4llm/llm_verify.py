@@ -7,6 +7,15 @@ never touches [0-9A-Za-z_], so register names, constants and words are
 physically immutable. The numeric-token check blocks whitespace merges
 that corrupt values ('2 0' -> '20', '-40' -> '40'). Invariant B: table
 rows keep their cell count; edits are checked per cell.
+
+'<br>' split-marker edit class: PDF extraction leaves '<br>' where a
+visual line broke inside one word ('Co<br>ntrol'). The invariant-A
+projection strips all '<br>' tags from both sides, so replacing a
+'<br>' with '' or ' ' is accepted while every other edit of the tag
+(deleting surrounding letters, swapping it for '-') stays rejected.
+The numeric-token check deliberately does NOT see the projection (a
+'<br>' inside a number keeps its tokens split), so a '<br>' can never
+smuggle a '2 0' -> '20' merge through.
 """
 from __future__ import annotations
 
@@ -50,6 +59,10 @@ _CANON_SUBS = {
 }
 _CANON_RE = re.compile("|".join(re.escape(c) for c in _CANON_SUBS))
 
+# '<br>' split-marker edit class (see module docstring): stripped in the
+# invariant-A projection only — never in the numeric-token projection.
+_BR_TAG_RE = re.compile(r"(?i)<br\s*/?>")
+
 # escaped pipes are a markdown-table artifact ('\|' renders as '|'); models
 # reliably unescape them, which must not count as a content change
 _ESCAPED_PIPE_RE = re.compile(r"\\\|")
@@ -61,8 +74,13 @@ def canonicalize(text: str) -> str:
 
 
 def _ws_canon(text: str) -> str:
-    """Whitespace-stripped canonical form (the invariant-A projection)."""
-    return canonicalize("".join(text.split()))
+    """Whitespace-stripped canonical form (the invariant-A projection).
+
+    Includes the '<br>' split-marker projection: the tag is removed before
+    comparison, so 'Co<br>ntrol' -> 'Control' and -> 'Co ntrol' both verify
+    while any other edit of the tag stays rejected.
+    """
+    return canonicalize("".join(_BR_TAG_RE.sub("", text).split()))
 
 
 # Numeric token: optional sign, digits, internal separators; whitespace may

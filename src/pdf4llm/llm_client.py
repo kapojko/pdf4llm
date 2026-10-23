@@ -83,7 +83,8 @@ def _split_sampling(sampling: dict) -> tuple[dict, dict]:
 
 def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
               api_key: str, sampling: dict | None = None,
-              retry_hint: str | None = None) -> tuple[str, str | None]:
+              retry_hint: str | None = None,
+              output_cap_chars: int | None = None) -> tuple[str, str | None]:
     import litellm  # lazy import
 
     litellm.suppress_debug_info = True
@@ -95,8 +96,13 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
             "Return the corrected text exactly as instructed: no additions, "
             "no omissions, no format changes."
         )
-    # max_tokens is capped at ~the input length (output_token_cap): a looping
+    # max_tokens is capped relative to the input (output_token_cap): a looping
     # model is cut off quickly and the truncated output is rejected/salvaged.
+    # For batched echo requests the cap is relative to the FRAGMENT volume
+    # (output_cap_chars), not the whole prompt: CONTEXT rows and retry notes
+    # inflate the prompt but not the expected output, and a prompt-derived cap
+    # would give degenerate input-repeat more runway as batches grow.
+    cap_src = output_cap_chars if output_cap_chars is not None else len(user_content)
     try:
         resp = litellm.completion(
             model=f"openai/{model}",
@@ -106,7 +112,7 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
             ],
             api_base=endpoint,
             api_key=api_key,
-            max_tokens=output_token_cap(len(user_content)),
+            max_tokens=output_token_cap(cap_src),
             timeout=300,
             extra_body={**extra, "chat_template_kwargs": {"enable_thinking": False}},
             **std,

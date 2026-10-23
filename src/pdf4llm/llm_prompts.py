@@ -19,9 +19,11 @@ ALLOWED ONLY:
     correctly (deleting false line breaks so split words join is included);
 (b) collapse runs of spaces;
 (c) delete a false line break inside a paragraph, replacing it with one space
-    (or with nothing where two word halves join).
+    (or with nothing where two word halves join);
+(d) remove a '<br>' marker (or replace it with one space) where PDF
+    extraction left it inside one word ('Co<br>ntrol' -> 'Control').
 FORBIDDEN:
-- adding, deleting, reordering or changing ANY non-whitespace character;
+- adding, deleting, reordering or changing ANY other non-whitespace character;
 - removing or altering horizontal rule lines ('---' on its own line) — keep
   them byte-identical;
 - changing the spacing around em/en dashes ('—', '–') — keep it as-is;
@@ -73,7 +75,22 @@ HARD RULES:
   ('2 0' must stay '2 0');
 - never DELETE punctuation. Dash-like characters may be rewritten as '-'
   but never removed; bullet glyphs may be rewritten as '*';
+- a '<br>' marker is a false line-break artifact: remove it when it splits
+  one word ('Co<br>ntrol' -> 'Control'), otherwise keep it as-is;
 - if a line has no defects, return it unchanged.
+
+Some lines may be followed by a 'NOTE k: ...' line that describes a mistake
+in a previous rejected answer for line k. NOTE lines are not text: never
+repeat or echo them, just apply the warning to line k.
+
+Example
+input:
+1| D-t yp e
+2| Standard operating voltage
+output:
+1| D-type
+2| Standard operating voltage
+(the second line has no defects and is copied unchanged)
 """
 
 TECHNICAL_LINE_PROMPT = (
@@ -93,7 +110,25 @@ HARD RULES:
 - never change any letter, digit, number, hex token, unit or value; never
   merge or split numbers ('2 0' must stay '2 0');
 - never add or remove cell boundaries ('|');
+- a '<br>' marker is a false line-break artifact: remove it when it splits
+  one word ('Co<br>ntrol' -> 'Control'), otherwise keep it as-is;
 - if a cell has no defects, return it unchanged.
+
+A cell may be followed by a 'NOTE k: ...' line that describes a mistake in a
+previous rejected answer for cell k. NOTE lines are not text: never repeat
+or echo them, just apply the warning to cell k.
+
+Example
+input:
+1| D-t yp e
+2| Standard operating voltage
+CONTEXT:
+row: | D-t yp e | Standard operating voltage | 2 . 5 V |
+output:
+1| D-type
+2| Standard operating voltage
+(the second cell has no defects and is copied unchanged; the CONTEXT row is
+never echoed)
 """
 
 TECHNICAL_CELL_PROMPT = (

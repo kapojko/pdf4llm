@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import queue
 import re
 import threading
 import time
@@ -46,7 +45,7 @@ class LlmInterrupted(RuntimeError):
 
 
 class _DaemonPool:
-    """Fixed pool of daemon worker threads with an unbounded task queue.
+    """Fixed pool of daemon worker threads with a priority task queue.
 
     ThreadPoolExecutor is unsuitable here because its worker threads are
     non-daemonic (CPython 3.9+): a Ctrl+C would block interpreter exit for
@@ -55,12 +54,23 @@ class _DaemonPool:
     at interpreter exit; tasks they had already picked up are simply lost,
     which is exactly the interrupt semantics we want (their chunks fall
     back to the original text).
+
+    Lower priority value runs first. Batch requests use priority 0, chunk
+    producers priority 1: batches packed from already-scanned chunks must
+    not wait behind every pending producer, or requeue rounds would
+    serialize at the very end of the pass instead of overlapping with
+    producer work (the pipelining the batch scheduler depends on).
     """
 
     def __init__(self, n_workers: int) -> None:
-        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        import heapq
+        self._heapq = heapq
+        self._queue: list = []  # heap of (priority, seq, fn, args)
+        self._seq = 0
         self._pending = 0
         self._error: BaseException | None = None
+        self._closed = False
+        self._cv = threading.Condition()
         self._threads = [
             threading.Thread(target=self._worker, daemon=True,
                              name=f"pdf4llm-llm-{k}")
@@ -69,22 +79,31 @@ class _DaemonPool:
         for t in self._threads:
             t.start()
 
-    def submit(self, fn, *args) -> None:
-        self._pending += 1
-        self._queue.put((fn, args))
+    def submit(self, fn, *args, priority: int = 0) -> None:
+        with self._cv:
+            self._heapq.heappush(self._queue, (priority, self._seq, fn, args))
+            self._seq += 1
+            self._pending += 1
+            self._cv.notify()
 
     def _worker(self) -> None:
         while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            fn, args = item
+            with self._cv:
+                while not self._queue and not self._closed:
+                    self._cv.wait(0.05)
+                if self._queue:
+                    _prio, _seq, fn, args = self._heapq.heappop(self._queue)
+                elif self._closed:
+                    return
+                else:
+                    continue
             try:
                 fn(*args)
             except BaseException as e:  # reported by drain(), never kills the pool
                 if self._error is None:
                     self._error = e
-            self._pending -= 1
+            with self._cv:
+                self._pending -= 1
 
     def drain_and_shutdown(self) -> None:
         """Wait until every submitted task ran, then stop the workers.
@@ -101,13 +120,10 @@ class _DaemonPool:
 
     def shutdown_now(self) -> None:
         """Drop everything queued and tell the workers to exit."""
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
-        for _ in self._threads:
-            self._queue.put(None)
+        with self._cv:
+            self._closed = True
+            self._queue.clear()
+            self._cv.notify_all()
 
 
 class LlmContextError(RuntimeError):

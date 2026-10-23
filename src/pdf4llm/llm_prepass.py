@@ -74,6 +74,41 @@ def dedupe_bullets(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic pre-pass: '<br>' split-word joins (no LLM involved).
+# PDF extraction leaves '<br>' where a visual line broke inside one word
+# ('Co<br>ntrol'). When the next character is lowercase, the join is
+# mechanical and document-independent — it is what '<br>' MEANS in a split
+# word ('over<br>view' -> 'overview', 'R<br>es .' -> 'Res .'). Ambiguous
+# cases (uppercase/digit after the tag, e.g. 'Control<br>Register') are NOT
+# joined here; those lines are sent to the model as batched units, gated by
+# the invariant-A '<br>' projection in llm_verify.
+# ---------------------------------------------------------------------------
+
+_BR_SPLIT_RE = re.compile(r"([A-Za-z])(?i:<br\s*/?>)(?=[a-z])")
+
+
+def fix_br_word_splits(text: str) -> tuple[str, int]:
+    """Join '<br>'-split words where the next char is lowercase (mechanical).
+
+    Returns (text, joined_tag_count). Only the unambiguous class is touched;
+    every remaining '<br>' stays for the model pass.
+    """
+    return _BR_SPLIT_RE.subn(r"\1", text)
+
+
+def has_residual_br(text: str) -> bool:
+    """True if any '<br>' tag survived the mechanical pre-pass.
+
+    Such lines are always admitted to the model pass (the vocabulary filter
+    has no join candidates for them and would otherwise skip the only fix).
+    """
+    return bool(_BR_TAG_SEARCH_RE.search(text))
+
+
+_BR_TAG_SEARCH_RE = re.compile(r"(?i)<br\s*/?>")
+
+
+# ---------------------------------------------------------------------------
 # Deterministic pre-pass: subscript normalisation (no LLM involved).
 # PDF extraction flattens V_CC to 'V CC', T_amb to 'T amb', t_pd to 't pd'.
 # Normalised forms: established uppercase terms are joined ('V CC' -> 'VCC',

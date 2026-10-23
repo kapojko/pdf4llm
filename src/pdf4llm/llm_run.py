@@ -8,7 +8,8 @@ Design (safety-first):
 2. Deterministic pre-passes (no LLM involved) remove known extraction noise
    the models reliably try to "fix" and thereby poison chunks with:
    horizontal rules, TOC dot leaders, duplicate bullet glyphs; plus guarded
-   subscript normalisation ('V CC' -> 'VCC', 'T amb' -> 'T_amb').
+   subscript normalisation ('V CC' -> 'VCC', 'T amb' -> 'T_amb') and
+   mechanical '<br>' split-word joins ('Co<br>ntrol' -> 'Control').
 3. Structure never passes through the model:
    - table chunks are processed at cell level: only cells whose content looks
      defect-suspect are sent (deterministic pre-filter; ~90% of cells are
@@ -18,34 +19,42 @@ Design (safety-first):
      deterministically: no model output can ever verify against them;
    - prose chunks get ONE whole-chunk attempt (the only unit that can join
      falsely split lines), then a deterministic line-level salvage of the
-     candidate, then batched re-asks of the disputed lines (only the
-     failed subset, up to llm_retries rounds, with a hint).
-   All unit-level requests use an indexed echo protocol ('N| text');
-   measured on a 9B/A1.3B model, they produced zero content
-   violations where whole-table chunks were rejected ~70% of the time.
-   Sampling is never overridden: server-side defaults apply unless the user
-   configures llm_sampling, and failed units are re-requested up to
-   llm_retries times with a rejection-reason hint.
-4. Every model output is verified algorithmically before any part of it is
+     candidate; disputed lines are re-asked as batched units.
+4. Cross-chunk batch aggregation (llm_batch): the verification unit (cell or
+   line) is decoupled from the request unit. Suspect units from ALL chunks
+   are collected into kind-separated global queues and packed into batched
+   echo requests ('N| text', ~5k chars of fragments per call). A failed unit
+   is never retried in place: it is requeued to the END of its queue with
+   its rejection reason, up to ``llm_retries`` extra attempts, and the next
+   batch carries the reason as a per-unit NOTE line. Exhausted retries keep
+   the original text — rejection is always safe, never silent.
+5. Every model output is verified algorithmically before any part of it is
    accepted: canonical/whitespace-level edits only (typographic punctuation
    classes — dashes, quotes, bullets, ellipsis — accepted in either direction
-   via a closed canonical map), numeric-token protection, table structure
-   checks. Words and numbers are physically immutable. Whatever fails
-   verification is kept as the original — rejection is always safe, never
-   silent; per-chunk outcomes are logged into meta.json.
+   via a closed canonical map; '<br>' split-marker removal as a narrowed edit
+   class), numeric-token protection, table structure checks. Words and
+   numbers are physically immutable. Whatever fails verification is kept as
+   the original; per-chunk outcomes are logged into meta.json.
+
+A per-document word-frequency map (DocVocab) gates WHICH suspect units are
+sent: fragments whose suspicious join form never occurs in the document are
+skipped (probably legitimate spacing). The vocabulary never edits text.
 """
 from __future__ import annotations
 
 import re
 import threading
 import time
+from types import SimpleNamespace
 
+from .llm_batch import BatchScheduler, ChunkState, DocVocab
 from .llm_chunk import chunk_markdown
 from .llm_classify import classify_with_llm
 from .llm_client import _call_llm, _strip_thinking
 from .llm_prepass import (
     collapse_dot_leaders,
     dedupe_bullets,
+    fix_br_word_splits,
     fix_subscripts,
     strip_horizontal_rules,
 )
@@ -57,18 +66,16 @@ from .llm_prompts import (
     TECHNICAL_LINE_PROMPT,
     TECHNICAL_SYSTEM_PROMPT,
 )
-from .llm_protocol import _verified_rounds
 from .llm_salvage import _salvage
 from .llm_server import LlmInterrupted, _DaemonPool, resolve_workers
 from .llm_table import (
     _is_separator_row,
     _is_table_row,
     _is_toc_like,
-    _splice_cells,
     _split_row_cells,
     _suspicious_cell,
 )
-from .llm_verify import _verify_chunk, _verify_line_in_context, _verify_pair
+from .llm_verify import _verify_chunk
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -83,214 +90,134 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
-def _run_chunk(
-    idx: int,
-    total: int,
-    chunk: str,
-    sep: str,
-    system_prompt: str,
-    line_prompt: str,
-    cell_prompt: str,
-    model: str,
-    endpoint: str,
-    api_key: str,
-    sampling: dict | None,
-    retries: int,
-) -> tuple[str, dict]:
-    """Process ONE chunk: structure-aware units + per-unit verification.
+# ---------------------------------------------------------------------------
+# Chunk producers (run in the worker pool; units go to the scheduler queues)
+# ---------------------------------------------------------------------------
 
-    This is the whole per-chunk logic, shared by the sequential and the
-    parallel path. Routing (rationale in the module docstring):
-      - TOC-like table chunks: deterministic skip, zero calls;
-      - prose chunks: one whole-chunk attempt -> deterministic line salvage
-        of the candidate -> at most one batched re-ask of the disputed lines;
-      - table/mixed chunks: per-row batches of suspect cells (the row itself
-        is the context, the skeleton is spliced back untouched) plus one
-        line-mode batch for the non-table lines.
 
-    Every unit (chunk, line, cell) is verified with `_verify_pair` (or
-    `_verify_chunk` for whole results) before it is applied, so the assembled
-    result is safe by construction; a final whole-chunk verification runs as
-    belt-and-braces. Chunks are independent: the result text is
-    ``verified_chunk + sep`` so reassembly is exact concatenation.
+def _produce_chunk(sched: BatchScheduler, cfg: SimpleNamespace, idx: int) -> None:
+    """Scan ONE chunk deterministically and enqueue its suspect units.
 
-    Returns (result_text, per-chunk stats delta).
+    Prose chunks additionally get their one whole-chunk attempt here (the
+    only unit that can join falsely split lines); its disputed lines are
+    enqueued as line units. Table/mixed chunks contribute suspect cells
+    (row as context) plus vocabulary-admitted prose lines. TOC-like chunks
+    are skipped deterministically. No unit is ever sent from here — the
+    batch scheduler owns all requests.
     """
-    print(f"  llm: chunk {idx}/{total} ({len(chunk)} chars) ...", flush=True)
-    chunk_start = time.monotonic()
-    o_lines = chunk.split("\n")
-    out_lines = list(o_lines)
-    units_fixed = 0
-    units_total = 0
-    units_failed = 0
-    cells_sent = 0
-    cells_fixed = 0
-    reasons: list[str] = []
-    state = {"n_calls": 0, "retries_used": 0, "truncated": 0}
-    toc_skipped = False
-
-    row_idx = [i for i, l in enumerate(o_lines) if _is_table_row(l)]
-
-    if row_idx and _is_toc_like(o_lines):
-        # Deterministic skip: every row duplicates a long cell, so no model
-        # output can ever verify — dedup attempts are guaranteed rejections.
-        toc_skipped = True
-    elif not row_idx:
-        # --- prose chunk ---
-        candidate, finish = _call_llm(
-            system_prompt, chunk, model, endpoint, api_key, sampling=sampling)
-        state["n_calls"] += 1
-        candidate = _strip_thinking(candidate)
-        if finish == "length":
-            state["truncated"] += 1
-            reasons.append("whole-chunk output truncated (finish_reason=length)")
-        if _verify_chunk(chunk, candidate) is None:
-            out_lines = candidate.split("\n")
-            units_fixed += 1
+    cs = sched.states[idx]
+    chunk = cs.chunk
+    o_lines = cs.o_lines
+    try:
+        row_idx = [i for i, l in enumerate(o_lines) if _is_table_row(l)]
+        if row_idx and _is_toc_like(o_lines):
+            cs.toc_skipped = True
+            return
+        if not row_idx:
+            _produce_prose(sched, cfg, cs, chunk)
         else:
-            salvaged, fixed, n_total, sreasons, failed_idx = _salvage(chunk, candidate)
-            out_lines = salvaged.split("\n")
-            units_fixed += fixed
-            units_total += n_total
-            reasons.extend(sreasons[:2])
-            disputed = sorted(i for i in failed_idx if o_lines[i].strip())
-            if not disputed and units_fixed == 0:
-                # the candidate was useless (empty, garbage, or an unfixed
-                # echo with junk): one batched line-mode attempt over every
-                # line as the last resort
-                disputed = [i for i, l in enumerate(o_lines) if l.strip()]
-            if disputed:
-                units = {i: o_lines[i] for i in disputed}
-                accepted, pending, fr, fin = _verified_rounds(
-                    line_prompt, units, None,
-                    lambda k, t: _verify_line_in_context(o_lines, k, t),
-                    model, endpoint, api_key, sampling, retries, state)
-                for i, new in accepted.items():
-                    out_lines[i] = new
-                    units_fixed += 1
-                if pending:
-                    units_failed += len(pending)
-                    reasons.append(fin if fin and fin.startswith("llm error")
-                                   else f"lines {pending[:4]}: {fr[pending[0]]}")
-    else:
-        # --- table/mixed chunk: cell-level work, skeleton untouched ---
-        for i in row_idx:
-            line = o_lines[i]
-            if _is_separator_row(line):
-                continue
-            if "\\|" in line:
-                # escaped literal pipes: models reliably drop the backslash,
-                # which changes the cell structure -> row never sent, skeleton
-                # keeps it verbatim
-                continue
-            segs = _split_row_cells(line)
-            if segs is None:
-                continue
-            cells = [core for _l, core, _t in segs]
-            # Cells duplicated within their row (equal to, or contained in,
-            # a sibling cell — the extractor sometimes splits a title across
-            # two cells) are extraction artifacts: the model reliably tries
-            # to deduplicate or reword them, which is a content change, so
-            # they are never sent. A duplicated cell is already identical to
-            # its sibling — there is nothing to fix in it anyway.
-            stripped = [c.strip() for c in cells]
-            keys = [re.sub(r"[^0-9a-z]+", "", c.lower()) for c in stripped]
+            _produce_table(sched, cfg, cs, chunk, row_idx)
+    finally:
+        sched.producer_done()
 
-            def _is_dup(k: int) -> bool:
-                key = keys[k]
-                if len(key) < 8:
-                    return False
-                return any(j != k and key in other for j, other in enumerate(keys))
 
-            targets = [k for k, c in enumerate(cells)
-                       if _suspicious_cell(c) and not _is_dup(k)]
-            if not targets:
-                continue
-            cells_sent += len(targets)
-            units = {k: cells[k] for k in targets}
-            accepted, pending, fr, fin = _verified_rounds(
-                cell_prompt, units, "row: " + line,
-                lambda k, t: _verify_pair(cells[k], t),
-                model, endpoint, api_key, sampling, retries, state, strip=True)
-            repl: dict[int, str] = {}
-            for k, new in accepted.items():
-                repl[k] = new
-                units_fixed += 1
-                cells_fixed += 1
-            if repl:
-                out_lines[i] = _splice_cells(line, segs, repl)
-            if pending:
-                units_failed += len(pending)
-                reasons.append(fin if fin and fin.startswith("llm error")
-                               else f"row {i} cell {pending[0]}: {fr[pending[0]]}")
-        # non-table lines of a mixed chunk (headings, captions, notes)
-        prose_idx = [i for i, l in enumerate(o_lines)
-                     if l.strip() and not _is_table_row(l)]
-        if prose_idx:
-            units = {i: o_lines[i] for i in prose_idx}
-            accepted, pending, fr, fin = _verified_rounds(
-                line_prompt, units, None,
-                lambda k, t: _verify_line_in_context(o_lines, k, t),
-                model, endpoint, api_key, sampling, retries, state)
-            for i, new in accepted.items():
-                out_lines[i] = new
-                units_fixed += 1
-            if pending:
-                units_failed += len(pending)
-                reasons.append(fin if fin and fin.startswith("llm error")
-                               else f"lines {pending[:4]}: {fr[pending[0]]}")
+def _produce_prose(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
+                   chunk: str) -> None:
+    """Whole-chunk attempt -> deterministic line salvage -> disputed units."""
+    o_lines = cs.o_lines
+    candidate, finish = _call_llm(
+        cfg.system_prompt, chunk, cfg.model, cfg.endpoint, cfg.api_key,
+        sampling=cfg.sampling)
+    with sched.lock:
+        cfg.stats["wholechunk_attempts"] += 1
+    candidate = _strip_thinking(candidate)
+    if finish == "length":
+        cs.truncated += 1  # merged into truncated_calls at finalize
+        cs.note_reason("whole-chunk output truncated (finish_reason=length)")
+    if _verify_chunk(chunk, candidate) is None:
+        cs.out_lines = candidate.split("\n")
+        cs.units_fixed += 1
+        with sched.lock:
+            cfg.stats["wholechunk_accepted"] += 1
+            if len(cs.out_lines) != len(o_lines):
+                # the whole-chunk call's UNIQUE yield: a cross-line join
+                cfg.stats["wholechunk_linejoin_fixes"] += 1
+        return
+    salvaged, fixed, n_total, sreasons, failed_idx = _salvage(chunk, candidate)
+    cs.out_lines = salvaged.split("\n")
+    cs.units_fixed += fixed
+    cs.units_total += n_total
+    for r in sreasons[:2]:
+        cs.note_reason(r)
+    disputed = sorted(i for i in failed_idx if o_lines[i].strip())
+    if not disputed and cs.units_fixed == 0:
+        # the candidate was useless (empty, garbage, or an unfixed echo with
+        # junk): one batched line-mode attempt over every line as the last
+        # resort (targeted re-asks: NOT gated by the vocabulary filter)
+        disputed = [i for i, l in enumerate(o_lines) if l.strip()]
+    for i in disputed:
+        sched.enqueue_line(cs.index, i, o_lines[i])
 
-    result_body = "\n".join(out_lines)
-    if result_body != chunk:
-        # belt & braces: whatever was assembled must verify as a whole;
-        # on any internal inconsistency the original chunk is kept
-        final_reason = _verify_chunk(chunk, result_body)
-        if final_reason is not None:
-            reasons.append(f"internal: final verification failed ({final_reason})")
-            result_body = chunk
-            units_fixed = 0
-            units_failed = max(1, units_failed)
 
-    if toc_skipped:
-        delta: dict = {"index": idx, "toc_skipped": True, "accepted": False,
-                       "salvaged": False, "rejected": False, "blocks_fixed": 0,
-                       "rejection": None}
-        result = chunk + sep
-    elif units_failed == 0 and units_fixed == 0:
-        delta = {"index": idx, "accepted": True, "blocks_fixed": 0,
-                 "rejection": None}
-        result = result_body + sep
-    elif units_failed == 0:
-        delta = {"index": idx, "accepted": True, "blocks_fixed": units_fixed,
-                 "rejection": None}
-        result = result_body + sep
-    elif units_fixed > 0:
-        delta = {"index": idx, "salvaged": True, "blocks_fixed": units_fixed,
-                 "rejection": None}
-        result = result_body + sep
-    else:
-        result = chunk + sep
-        reason = "; ".join(reasons[:3]) if reasons else "no usable output"
-        delta = {
-            "index": idx,
-            "rejected": True,
-            "blocks_fixed": 0,
-            "rejection": {
-                "chunk": idx,
-                "reason": reason,
-                "preview": chunk[:120],
-            },
-        }
-    delta["retries_used"] = state["retries_used"]
-    delta["truncated"] = state["truncated"]
-    delta["cells_sent"] = cells_sent
-    delta["cells_fixed"] = cells_fixed
-    delta["duration"] = time.monotonic() - chunk_start
-    return result, delta
+def _produce_table(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
+                   chunk: str, row_idx: list[int]) -> None:
+    """Suspect cells (row context) + vocabulary-admitted prose lines."""
+    o_lines = cs.o_lines
+    for i in row_idx:
+        line = o_lines[i]
+        if _is_separator_row(line):
+            continue
+        if "\\|" in line:
+            # escaped literal pipes: models reliably drop the backslash,
+            # which changes the cell structure -> row never sent, skeleton
+            # keeps it verbatim
+            continue
+        segs = _split_row_cells(line)
+        if segs is None:
+            continue
+        cells = [core for _l, core, _t in segs]
+        # Cells duplicated within their row (equal to, or contained in, a
+        # sibling cell — the extractor sometimes splits a title across two
+        # cells) are extraction artifacts: the model reliably tries to
+        # deduplicate or reword them, which is a content change, so they are
+        # never sent. A duplicated cell is already identical to its sibling —
+        # there is nothing to fix in it anyway.
+        stripped = [c.strip() for c in cells]
+        keys = [re.sub(r"[^0-9a-z]+", "", c.lower()) for c in stripped]
+
+        def _is_dup(k: int) -> bool:
+            key = keys[k]
+            if len(key) < 8:
+                return False
+            return any(j != k and key in other for j, other in enumerate(keys))
+
+        targets = [k for k, c in enumerate(cells)
+                   if _suspicious_cell(c) and not _is_dup(k)]
+        for k in targets:
+            if cfg.vocab.admits(cells[k]):
+                sched.enqueue_cell(cs.index, i, k, cells[k], line)
+            else:
+                # joined form never occurs in this document: probably
+                # legitimate spacing -> skip (saves a call and avoids
+                # 'helpful' rewrites that only produce rejection risk)
+                sched.skip_unit(cs.index)
+    # non-table lines of a mixed chunk (headings, captions, notes)
+    prose_idx = [i for i, l in enumerate(o_lines)
+                 if l.strip() and not _is_table_row(l)]
+    for i in prose_idx:
+        if cfg.vocab.admits(o_lines[i]):
+            sched.enqueue_line(cs.index, i, o_lines[i])
+        else:
+            sched.skip_unit(cs.index)
+
+
+# ---------------------------------------------------------------------------
+# Stats plumbing
+# ---------------------------------------------------------------------------
 
 
 def _fmt_chunk_state(delta: dict) -> str:
-    """One-line final state for a processed chunk: outcome, retries, salvage."""
+    """One-line final state for a processed chunk: outcome, requeues."""
     if delta.get("toc_skipped"):
         state = "toc-skipped (deterministic)"
     elif delta.get("accepted"):
@@ -301,15 +228,17 @@ def _fmt_chunk_state(delta: dict) -> str:
         state = f"salvaged {delta['blocks_fixed']} unit(s)"
     else:
         state = "REJECTED"
-        # first rejection reason, trimmed: the progress line must explain WHY
-        # without digging into meta.json ('llm error: ...' here also separates
-        # verifier rejections from call failures — the latter show retries 0)
+        # first rejection reason, trimmed: the line must explain WHY without
+        # digging into meta.json ('llm error: ...' here also separates
+        # verifier rejections from call failures)
         reason = (delta.get("rejection") or {}).get("reason") or ""
         if reason:
             state += f": {reason.split(';')[0][:80]}"
+        state += ", no-recovery"
+        if delta.get("retries_used"):
+            state += f" after {delta['retries_used']} requeue(s)"
     if delta.get("truncated"):
         state += f", truncated x{delta['truncated']}"
-    state += f", retries {delta['retries_used']}"
     return state
 
 
@@ -349,8 +278,14 @@ def _apply_chunk_delta(stats: dict, delta: dict) -> None:
         stats["rejections"].append(delta["rejection"])
     stats["cells_sent"] += delta.get("cells_sent", 0)
     stats["cells_fixed"] += delta.get("cells_fixed", 0)
-    stats["retries_used"] += delta["retries_used"]
+    stats["retries_used"] += delta.get("retries_used", 0)
     stats["truncated_calls"] += delta.get("truncated", 0)
+    stats["units_skipped"] += delta.get("units_skipped", 0)
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
 
 def correct_with_llm(
@@ -370,19 +305,22 @@ def correct_with_llm(
     Returns (corrected_text, stats). Structure never passes through the
     model: table chunks are processed at cell level (suspect cells only,
     skeleton spliced back), TOC-like chunks are skipped deterministically,
-    prose chunks get one whole-chunk attempt plus line-level salvage and at
-    most one batched disputed-line re-ask. Every unit is verified
-    algorithmically (canonical whitespace-level edits + numeric tokens +
-    table structure) before it is applied; whatever fails stays as the
-    original — rejection is always safe, never silent.
+    prose chunks get one whole-chunk attempt plus line-level salvage of the
+    candidate. Suspect units from all chunks are batched across chunk
+    boundaries (kind-separated, ~5k fragment chars per call) and every unit
+    is verified algorithmically before it is applied; failures are requeued
+    up to ``retries`` extra attempts with a per-unit rejection hint, and
+    whatever still fails stays as the original — rejection is always safe,
+    never silent.
 
     ``max_chars`` is the chunk size; the default (2000) is deliberately small
     so that small local models stay on-task.
 
-    ``workers`` > 1 processes chunks concurrently (daemon thread pool,
-    litellm calls are thread-safe). Safety is unaffected: every chunk still
-    goes through the same per-unit verification pipeline, chunks are
-    independent and the output is reassembled strictly in original order.
+    ``workers`` > 1 runs chunk producers and batch requests concurrently
+    (daemon thread pool, litellm calls are thread-safe). Safety is
+    unaffected: every unit still goes through the same verification
+    pipeline, chunks are independent and the output is reassembled strictly
+    in original order.
 
     ``workers`` None (default) auto-selects from the llama-swappy info
     endpoint: min(slots, 8), falling back to 1 when the server does not
@@ -397,6 +335,7 @@ def correct_with_llm(
     text = dedupe_bullets(text)
     text, hr_removed = strip_horizontal_rules(text)
     text, dots_collapsed = collapse_dot_leaders(text)
+    text, br_joined = fix_br_word_splits(text)
 
     is_technical, source = (True, "heuristic")
     if classify:
@@ -414,8 +353,13 @@ def correct_with_llm(
             f"  llm: document classified {'technical' if is_technical else 'general'} "
             f"({source})"
             + (f"; {sub_count} subscripts normalised" if sub_count else "")
+            + (f"; {br_joined} '<br>' splits joined" if br_joined else ""),
+            flush=True,
         )
 
+    # per-document vocabulary (as-extracted, after pre-passes): SEND/SKIP
+    # filter only — it never edits text
+    vocab = DocVocab(text)
     chunks = chunk_markdown(text, max_chars)
 
     # llama-swappy probe: auto workers + rough context-sufficiency check.
@@ -439,6 +383,7 @@ def correct_with_llm(
             "source": source,
         },
         "subscripts_normalised": sub_count,
+        "br_joined": br_joined,
         "horizontal_rules_removed": hr_removed,
         "dot_leaders_collapsed": dots_collapsed,
         "chunks_total": len(chunks),
@@ -447,11 +392,22 @@ def correct_with_llm(
         "chunks_rejected": 0,
         "chunks_toc_skipped": 0,
         "blocks_fixed": 0,
+        "units_sent": 0,
+        "units_fixed": 0,
+        "units_failed": 0,
+        "units_skipped": 0,
+        "units_requeued": 0,
+        "units_fixed_after_requeue": 0,
+        "batches": 0,
         "cells_sent": 0,
         "cells_fixed": 0,
+        "wholechunk_attempts": 0,
+        "wholechunk_accepted": 0,
+        "wholechunk_linejoin_fixes": 0,
         "retries_used": 0,
         "truncated_calls": 0,
         "rejections": [],
+        "unit_fail_log": [],
     }
     if swappy_entry is not None:
         stats["swappy"] = {
@@ -460,77 +416,63 @@ def correct_with_llm(
             "context_per_request": swappy_entry.get("contextSize"),
             "workers": workers,
         }
+    if not chunks:
+        return "", stats
 
-    out_parts: list[str | None] = [None] * len(chunks)
+    states = [ChunkState(i, chunk, sep) for i, (chunk, sep) in enumerate(chunks)]
+    lock = threading.Lock()
     t0 = time.monotonic()
+    pool = _DaemonPool(workers)
 
-    if workers <= 1:
-        # Sequential path: exactly the original behaviour, including prints.
-        chunk_durations: list[float] = []
-        try:
-            for i, (chunk, sep) in enumerate(chunks, 1):
-                result, delta = _run_chunk(
-                    i, len(chunks), chunk, sep, system_prompt, line_prompt,
-                    cell_prompt, model, endpoint, api_key, sampling, retries,
-                )
-                out_parts[i - 1] = result
-                _apply_chunk_delta(stats, delta)
-                chunk_durations.append(delta["duration"])
-                # unconditional progress: the LLM pass is slow and the user must
-                # see that it is alive, with an ETA based on the avg chunk so far
-                if i < len(chunks):
-                    eta = (sum(chunk_durations) / len(chunk_durations)) * (len(chunks) - i)
-                    print(
-                        f"  llm: chunk {i}/{len(chunks)} done "
-                        f"[{_fmt_chunk_state(delta)}] in "
-                        f"{_fmt_duration(delta['duration'])}  |  elapsed "
-                        f"{_fmt_duration(time.monotonic() - t0)}  |  "
-                        f"eta ~{_fmt_duration(eta)}",
-                        flush=True,
-                    )
-        except KeyboardInterrupt:
-            _finish_interrupted(stats)
-            raise  # unreachable, keeps type-checkers happy
-    else:
-        # Parallel path: daemon worker pool (litellm calls are thread-safe).
-        # The pool caps in-flight requests at `workers`, so a huge doc cannot
-        # queue unbounded. Each worker merges its own stats delta under a
-        # lock; reassembly below is strictly in original chunk order.
-        workers = min(workers, len(chunks))
-        lock = threading.Lock()
-        done_count = [0]
+    def note(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
 
-        def _worker(idx: int, chunk: str, sep: str) -> None:
-            result, delta = _run_chunk(
-                idx, len(chunks), chunk, sep, system_prompt, line_prompt,
-                cell_prompt, model, endpoint, api_key, sampling, retries,
-            )
-            out_parts[idx - 1] = result
-            with lock:
-                _apply_chunk_delta(stats, delta)
-                done_count[0] += 1
-                n_done = done_count[0]
-            # unconditional progress (not gated on -v): completed-chunk count
-            # with elapsed time and an ETA from the parallel throughput so far
-            elapsed = time.monotonic() - t0
-            eta = elapsed / n_done * (len(chunks) - n_done)
+    cfg = SimpleNamespace(
+        system_prompt=system_prompt, model=model, endpoint=endpoint,
+        api_key=api_key, sampling=sampling, stats=stats, vocab=vocab,
+    )
+    sched = BatchScheduler(
+        states, {"cell": cell_prompt, "line": line_prompt}, vocab,
+        model=model, endpoint=endpoint, api_key=api_key, sampling=sampling,
+        retries=retries, stats=stats, lock=lock, pool=pool, note=note,
+    )
+
+    try:
+        for i in range(len(chunks)):
+            # producers are lower priority than batch requests (see
+            # _DaemonPool): batches packed from scanned chunks must interleave
+            pool.submit(_produce_chunk, sched, cfg, i, priority=1)
+        sched.run()
+        pool.drain_and_shutdown()
+    except KeyboardInterrupt:
+        pool.shutdown_now()
+        _finish_interrupted(stats)
+        raise  # unreachable, keeps type-checkers happy
+
+    results, deltas = sched.finalize()
+    for delta in deltas:
+        _apply_chunk_delta(stats, delta)
+        if verbose and (delta.get("rejected") or delta.get("salvaged")):
             print(
-                f"  llm: {n_done}/{len(chunks)} done "
-                f"[{_fmt_chunk_state(delta)}], elapsed "
-                f"{_fmt_duration(elapsed)}, eta ~{_fmt_duration(eta)}",
+                f"  llm: chunk {delta['index']}/{len(chunks)} "
+                f"[{_fmt_chunk_state(delta)}]",
                 flush=True,
             )
-
-        pool = _DaemonPool(workers)
-        for i, (chunk, sep) in enumerate(chunks, 1):
-            pool.submit(_worker, i, chunk, sep)
-        try:
-            pool.drain_and_shutdown()
-        except KeyboardInterrupt:
-            pool.shutdown_now()
-            _finish_interrupted(stats)
-            raise  # unreachable, keeps type-checkers happy
+    stats["units_fixed"] = stats["blocks_fixed"]
+    stats["duration"] = time.monotonic() - t0
+    if verbose:
+        print(
+            f"  llm: done in {_fmt_duration(stats['duration'])}: "
+            f"{len(chunks)} chunks ({stats['chunks_accepted']} accepted, "
+            f"{stats['chunks_salvaged']} salvaged, {stats['chunks_rejected']} "
+            f"rejected, {stats['chunks_toc_skipped']} toc-skipped); "
+            f"{stats['units_sent']} unit(s) sent in {stats['batches']} batch(es), "
+            f"{stats['blocks_fixed']} fixed, {stats['units_failed']} failed, "
+            f"{stats['units_skipped']} vocab-skipped",
+            flush=True,
+        )
 
     # deterministic meta.json regardless of completion order
     stats["rejections"].sort(key=lambda r: r["chunk"])
-    return "".join(out_parts), stats
+    return "".join(results), stats

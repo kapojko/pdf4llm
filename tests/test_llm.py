@@ -4,10 +4,12 @@ No network access needed — only the pure functions are exercised (the parallel
 --llm-workers path and the llama-swappy probe are tested with stubs).
 """
 import json
+import re
 
 import pytest
 
 from pdf4llm import (
+    llm_batch,
     llm_chunk,
     llm_classify,
     llm_client,
@@ -374,17 +376,18 @@ def test_escaped_pipes_handling():
                              r"| | V IO_x | | x |") is not None
 
 
-def test_run_chunk_never_sends_rows_with_escaped_pipes(monkeypatch):
+def test_run_never_sends_rows_with_escaped_pipes(monkeypatch):
     def must_not_call(*a, **kw):
         raise AssertionError("rows with escaped pipes must not be sent")
 
     monkeypatch.setattr(llm_run, "_call_llm", must_not_call)
     monkeypatch.setattr(llm_protocol, "_call_llm", must_not_call)
-    row = r"| \| V IO_x \| | Variations between different I/O pins |"
-    result, delta = llm_run._run_chunk(
-        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
-    assert result == row
-    assert delta["accepted"] and delta["cells_sent"] == 0
+    doc = r"| \| V IO_x \| | Variations between different I/O pins |"
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == doc
+    assert stats["chunks_accepted"] == 1
+    assert stats["cells_sent"] == 0
 
 
 def test_split_row_cells_escaped_pipes():
@@ -534,14 +537,12 @@ def test_parallel_reassembles_in_order_and_merges_stats(monkeypatch):
 
 def test_parallel_output_identical_to_sequential(monkeypatch):
     def fake_call(system_prompt, chunk, model, endpoint, api_key,
-                  sampling=None, retry_hint=None):
+                  sampling=None, retry_hint=None, output_cap_chars=None):
         # first whole-chunk attempt on the 'Ordering' chunk returns the text
         # plus a hallucinated tail -> exercises salvage; the line-level echo
         # request (numbered lines) gets a clean fixed answer
         if retry_hint is None and "N|" not in chunk and "Ordering" in chunk:
             return chunk + " extra hallucinated content", None
-        if "N|" in chunk:
-            return _fixed(chunk), None
         return _fixed(chunk), None
 
     monkeypatch.setattr(llm_run, "_call_llm", fake_call)
@@ -799,7 +800,7 @@ def test_output_token_cap_is_close_to_input_size():
     assert llm_client.output_token_cap(0) == 2 * 1 + llm_client._OUT_MARGIN_TOKENS
 
 
-def test_run_chunk_prose_passes_without_extra_kwargs(monkeypatch):
+def test_run_prose_passes_without_extra_kwargs(monkeypatch):
     seen = {}
 
     def fake_call(system_prompt, chunk, *a, **kw):
@@ -807,16 +808,16 @@ def test_run_chunk_prose_passes_without_extra_kwargs(monkeypatch):
         return chunk, None
 
     monkeypatch.setattr(llm_run, "_call_llm", fake_call)
-    result, delta = llm_run._run_chunk(
-        1, 1, "some chunk", "", "sys", "line", "cell", "m", "http://x", "k",
-        None, 0)
-    assert delta["accepted"]
+    out, stats = llm_run.correct_with_llm(
+        "some prose chunk", "m", "http://x", "k", verbose=False,
+        classify=False)
+    assert stats["chunks_accepted"] == 1
     # no max_tokens argument is passed at all: _call_llm computes the cap
     # itself from the content length
     assert "max_tokens" not in seen["kwargs"]
 
 
-def test_run_chunk_prose_truncated_then_disputed_re_ask(monkeypatch):
+def test_run_prose_truncated_then_disputed_re_ask(monkeypatch):
     calls = []
 
     def fake_call(system_prompt, chunk, *a, **kw):
@@ -827,17 +828,17 @@ def test_run_chunk_prose_truncated_then_disputed_re_ask(monkeypatch):
 
     monkeypatch.setattr(llm_run, "_call_llm", fake_call)
     monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
-    result, delta = llm_run._run_chunk(
-        1, 1, "text alpha  beta", "", "sys", "line", "cell", "m", "http://x",
-        "k", None, 0)
+    out, stats = llm_run.correct_with_llm(
+        "text alpha  beta", "m", "http://x", "k", verbose=False,
+        classify=False)
     # the truncated whole-chunk answer fails, salvage fails, and the disputed
-    # line re-ask returns a verified fix
-    assert delta["accepted"] and delta["blocks_fixed"] >= 1
-    assert delta["truncated"] == 1
-    assert result == "text alpha beta"
+    # line unit (batched re-ask) returns a verified fix
+    assert out == "text alpha beta"
+    assert stats["chunks_accepted"] == 1 and stats["blocks_fixed"] == 1
+    assert stats["truncated_calls"] == 1
 
 
-def test_run_chunk_toc_like_chunk_is_skipped_without_calls(monkeypatch):
+def test_run_toc_like_chunk_is_skipped_without_calls(monkeypatch):
     def must_not_call(*a, **kw):
         raise AssertionError("TOC-like chunks must not be sent to the model")
 
@@ -848,84 +849,110 @@ def test_run_chunk_toc_like_chunk_is_skipped_without_calls(monkeypatch):
         "| --- | --- | --- | --- | --- |",
         "|  | 3.3.3 | Write access latency   91 | Write access latency   91 |  |",
     ]))
-    result, delta = llm_run._run_chunk(
-        1, 1, toc, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
-    assert result == toc
-    assert delta["toc_skipped"]
+    out, stats = llm_run.correct_with_llm(
+        toc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == toc
+    assert stats["chunks_toc_skipped"] == 1
 
 
-def test_run_chunk_table_cells_spliced_into_skeleton(monkeypatch):
-    row = "| R es . | 14 | 0x08 |"
-    fixed_row = "| Res. | 14 | 0x08 |"
+# a document whose vocabulary contains the joined forms the defect cells
+# need ('Res.' appears clean elsewhere — the repetitive-datasheet premise
+# behind the SEND/SKIP vocabulary filter)
+CELL_DOC = (
+    "Register description with D-type flip-flops elsewhere.\n"
+    "| D-type | 15 | 0x09 |\n"
+    "| D-t yp e | 14 | 0x08 |"
+)
 
+
+def test_run_table_cells_spliced_into_skeleton(monkeypatch):
     def fake_call(system_prompt, chunk, *a, **kw):
         assert "CONTEXT:" in chunk           # the row rides along as context
-        assert "0| R es ." in chunk          # only the suspicious cell is sent
-        return "0| Res.", None
+        assert "0| D-t yp e" in chunk        # only the suspicious cell is sent
+        assert "0x09" not in chunk           # the clean row is never sent
+        return "0| D-type", None             # vocab hit admitted the cell
 
     monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
-    result, delta = llm_run._run_chunk(
-        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
-    assert result == fixed_row
-    assert delta["accepted"] and delta["cells_sent"] == 1
-    assert delta["cells_fixed"] == 1 and delta["blocks_fixed"] == 1
+    out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "m", "http://x", "k", verbose=False, classify=False)
+    assert "| D-type | 14 | 0x08 |" in out   # fixed cell spliced into skeleton
+    assert "| D-t yp e" not in out
+    assert stats["cells_sent"] == 1 and stats["cells_fixed"] == 1
+    assert stats["chunks_accepted"] == 1 and stats["blocks_fixed"] == 1
 
 
-def test_run_chunk_duplicated_cells_are_never_sent(monkeypatch):
-    # TOC-shaped chunks (one distinct long cell per row, optionally duplicated
-    # into siblings) are skipped: the model can only 'deduplicate' or reword
-    # them, which is always rejected -> zero calls
+def test_run_toc_shaped_rows_are_skipped_without_calls(monkeypatch):
     def must_not_call(*a, **kw):
         raise AssertionError("TOC-shaped chunks must not be sent to the model")
 
     monkeypatch.setattr(llm_run, "_call_llm", must_not_call)
     monkeypatch.setattr(llm_protocol, "_call_llm", must_not_call)
     row = "|  | 5.2 |  | Clock gating control  152 | Clock gating control  152 |  |"
-    result, delta = llm_run._run_chunk(
-        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
-    assert result == row
-    assert delta["toc_skipped"] and delta["cells_sent"] == 0
+    out, stats = llm_run.correct_with_llm(
+        row, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == row
+    assert stats["chunks_toc_skipped"] == 1 and stats["cells_sent"] == 0
 
 
-def test_run_chunk_dedup_does_not_block_real_defect_cells(monkeypatch):
-    row = "| [31:21] Reserved | [31:21] Reserved | R es . output |"
-
+def test_run_dedup_does_not_block_real_defect_cells(monkeypatch):
     def fake_call(system_prompt, chunk, *a, **kw):
         assert "Reserved" not in chunk.split("CONTEXT:")[0]  # dups not sent
-        assert "2| R es . output" in chunk
-        return "2| Res. output", None
+        assert "0| D-t yp e output" in chunk
+        return "0| D-type output", None
 
     monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
-    result, delta = llm_run._run_chunk(
-        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
-    assert result == "| [31:21] Reserved | [31:21] Reserved | Res. output |"
-    assert delta["cells_sent"] == 1 and delta["cells_fixed"] == 1
+    doc = ("Other rows carry D-type marks.\n"
+           "| [31:21] Reserved | [31:21] Reserved | D-t yp e output |")
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert "| [31:21] Reserved | [31:21] Reserved | D-type output |" in out
+    assert stats["cells_sent"] == 1 and stats["cells_fixed"] == 1
 
 
-def test_run_chunk_failed_cell_recovered_by_hinted_retry(monkeypatch):
-    # a content-level failure is not final: with retries >= 1 the failed cell
-    # is re-requested with a rejection-reason hint, and sampling is passed
-    # through verbatim (never forced to 0)
+def test_run_failed_cell_recovered_by_hinted_requeue(monkeypatch):
+    # a content-level failure is not final: the failed cell is REQUEUED (never
+    # retried in place), the next batch carries a per-unit NOTE with the
+    # rejection reason, and sampling is passed through verbatim (never forced
+    # to 0)
     calls = []
 
     def fake_call(system_prompt, chunk, *a, **kw):
         calls.append((chunk, kw.get("sampling")))
         if len(calls) == 1:
-            return "2| Res", None              # mangled -> verification fails
-        assert "REJECTED" in chunk             # retry carries the reason hint
-        return "2| Res. output", None
+            return "0| D-typ", None            # mangled -> verification fails
+        assert "REJECTED" in chunk             # the NOTE hint travels with it
+        assert "NOTE 0:" in chunk
+        return "0| D-type", None
 
     monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
     sampling = {"temperature": 1.0}
-    result, delta = llm_run._run_chunk(
-        1, 1, "| [31:21] Reserved | [31:21] Reserved | R es . output |", "",
-        "sys", "line", "cell", "m", "http://x", "k", sampling, 1)
-    assert delta["accepted"] and delta["cells_fixed"] == 1
-    assert delta["retries_used"] == 1
-    assert result == "| [31:21] Reserved | [31:21] Reserved | Res. output |"
+    out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        sampling=sampling, retries=1)
+    assert "| D-type | 14 | 0x08 |" in out
+    assert stats["cells_fixed"] == 1
+    assert stats["retries_used"] == 1 and stats["units_requeued"] == 1
     # sampling forwarded verbatim, no temperature override
     assert calls[0][1] == {"temperature": 1.0}
     assert calls[1][1] == {"temperature": 1.0}
+
+
+def test_run_requeue_exhausts_retries_and_keeps_original(monkeypatch):
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        return "0| D-typ", None                # always mangled
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        retries=2)
+    assert out == _prep(CELL_DOC)              # original kept verbatim
+    assert stats["units_requeued"] == 2        # two extra attempts...
+    assert stats["units_failed"] == 1          # ...then finalized as failed
+    assert stats["chunks_rejected"] == 1
+    assert stats["unit_fail_log"][-1]["attempt"] == 3
 
 
 def test_correct_with_llm_sends_no_sampling_when_unconfigured(monkeypatch):
@@ -960,19 +987,19 @@ def test_correct_with_llm_forwards_configured_sampling_verbatim(monkeypatch):
     assert stats["sampling"] == sampling
 
 
-def test_run_chunk_rejects_unfixable_cell_and_keeps_original(monkeypatch):
-    row = "| R es . | 14 |"
-
+def test_run_rejects_unfixable_cell_and_keeps_original(monkeypatch):
     def fake_call(system_prompt, chunk, *a, **kw):
-        # model 'deduplicates'/'mangles' the cell -> verification must reject
-        return "0| Res", None
+        # model 'deduplicates'/'mangles' the cell -> verification must reject;
+        # retries=0 -> the requeue is finalized immediately
+        return "0| D-typ", None
 
     monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
-    result, delta = llm_run._run_chunk(
-        1, 1, row, "", "sys", "line", "cell", "m", "http://x", "k", None, 0)
-    assert result == row                    # original kept
-    assert delta["rejected"]
-    assert delta["cells_fixed"] == 0
+    out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        retries=0)
+    assert out == _prep(CELL_DOC)              # original kept
+    assert stats["chunks_rejected"] == 1
+    assert stats["cells_fixed"] == 0 and stats["units_failed"] == 1
 
 
 def test_strip_thinking_blocks():
@@ -1100,7 +1127,10 @@ def test_chunk_state_line_includes_rejection_reason():
     }
     line = llm_run._fmt_chunk_state(delta)
     assert line.startswith("REJECTED: unsafe whitespace join")
-    assert "retries 2" in line and "truncated" not in line
+    assert "no-recovery after 2 requeue(s)" in line and "truncated" not in line
+    delta["retries_used"] = 0
+    assert "no-recovery" in llm_run._fmt_chunk_state(delta)
+    assert "requeue" not in llm_run._fmt_chunk_state(delta)
 
 
 # ---------------------------------------------------------------------------
@@ -1124,3 +1154,274 @@ def test_salvage_line_join_still_works():
     salvaged, fixed, _total, _ = llm_salvage._salvage(orig, cand)[:4]
     assert fixed == 1
     assert salvaged == "text that was falsely split\nend"
+
+
+# ---------------------------------------------------------------------------
+# cross-chunk batch aggregation (llm_batch): packing, kind separation,
+# vocabulary SEND/SKIP filter, requeue semantics
+# ---------------------------------------------------------------------------
+
+def _echo_unchanged(payload: str) -> str:
+    """A 'model' that echoes every numbered unit back unchanged."""
+    out = []
+    for line in payload.split("\n"):
+        if re.match(r"\s*\d+\|", line):
+            out.append(line.strip())
+    return "\n".join(out)
+
+
+MIXED_DOC = (
+    "Every device is listed here.\n"
+    "The devic e has a Reset pin.\n"
+    "| D-type | 15 | 0x09 |\n"
+    "| D-t yp e | 14 | 0x08 |"
+)
+
+
+def test_batches_never_mix_cells_and_lines(monkeypatch):
+    payloads = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        payloads.append((system_prompt[:40], chunk))
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        MIXED_DOC, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == _prep(MIXED_DOC)
+    # one cell batch + one line batch: never mixed in one call
+    assert len(payloads) == 2
+    kinds = sorted(p[0] for p in payloads)
+    assert kinds[0] != kinds[1]
+    cell_payloads = [p for p in payloads if "D-t yp e" in p[1]]
+    line_payloads = [p for p in payloads if "devic e" in p[1]]
+    assert len(cell_payloads) == 1 and len(line_payloads) == 1
+    assert "CONTEXT:" in cell_payloads[0][1]      # row context on cell batches
+    assert "CONTEXT:" not in line_payloads[0][1]  # none on line batches
+    assert "Reset pin" not in cell_payloads[0][1]  # clean prose not sent
+
+
+def test_vocab_filter_skips_nonrecurring_joins(monkeypatch):
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    # 'Power down' split-join 'Powerdown' occurs NOWHERE in the document:
+    # probably legitimate spacing -> the cell and the prose line are skipped
+    doc = ("Power down the chip now.\n"
+           "| Power down | 1 | x |\n"
+           "| Res. | 2 | y |")
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == _prep(doc)
+    assert len(calls) == 0                       # nothing was sent at all
+    assert stats["units_sent"] == 0 and stats["units_skipped"] == 2
+    assert stats["cells_sent"] == 0
+
+
+def test_vocab_filter_sends_recurring_joins(monkeypatch):
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    # 'Reset' occurs clean in this document -> the 'Re set' cell is sent
+    doc = ("Press Reset to restart.\n"
+           "| Re set | 1 | x |\n"
+           "| Reset | 2 | y |")
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == _prep(doc)
+    assert stats["cells_sent"] == 1 and stats["units_skipped"] == 1
+    assert len(calls) == 1 and "Re set" in calls[0]
+
+
+def test_batch_payload_groups_cells_of_one_row_under_one_context(monkeypatch):
+    payloads = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        payloads.append(chunk)
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    doc = ("Clean description prose that stays.\n"
+           "| D-t yp e | Re set flag | 0x08 |\n"
+           "| D-type | x | y |\n"
+           "| Reset | z | w |")
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == _prep(doc)
+    assert len(payloads) == 1
+    p = payloads[0]
+    # both suspect cells of the row share ONE context block
+    assert p.count("CONTEXT:") == 1
+    assert "0| D-t yp e" in p and "1| Re set flag" in p
+
+
+def test_batch_truncation_requeues_missing_units(monkeypatch):
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        if len(calls) == 1:
+            return "", "length"                  # truncated: nothing usable
+        return "0| D-type", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        retries=1)
+    assert "| D-type | 14 | 0x08 |" in out
+    assert stats["truncated_calls"] == 1
+    assert stats["units_requeued"] == 1 and stats["cells_fixed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# '<br>' split-marker repair (deterministic pre-pass + narrowed edit class)
+# ---------------------------------------------------------------------------
+
+def test_br_prepass_joins_lowercase_continuations():
+    text, n = llm_prepass.fix_br_word_splits(
+        "Co<br>ntrol and over<br>view, but Control<br>Register stays")
+    assert text == "Control and overview, but Control<br>Register stays"
+    assert n == 2
+    # tag variants
+    text, n = llm_prepass.fix_br_word_splits("R<br/>es and R<br />et")
+    assert text == "Res and Ret" and n == 2
+
+
+def test_br_ambiguous_case_fixed_via_batched_unit(monkeypatch):
+    def fake_call(system_prompt, chunk, *a, **kw):
+        if "0|" not in chunk:
+            return "totally unrelated garbage", None   # whole-chunk fails
+        return "0| ModeRegister selects the mode.", None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    doc = "Mode<br>Register selects the mode."
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == "ModeRegister selects the mode."
+    assert stats["chunks_accepted"] == 1
+
+
+def test_verifier_rejects_br_swap_but_accepts_removal_or_space():
+    assert llm_verify._verify_pair("A<br>B", "AB") is None
+    assert llm_verify._verify_pair("A<br>B", "A B") is None
+    assert llm_verify._verify_pair("A<br>B", "A-B") is not None
+    assert llm_verify._verify_pair("A<br>B", "ABx") is not None
+
+
+# ---------------------------------------------------------------------------
+# heading-aligned chunk boundaries
+# ---------------------------------------------------------------------------
+
+def test_chunk_break_prefers_headings():
+    doc = ("prose line one here\nprose line two here\n\n"
+           "## Heading One\n\n" + "word " * 40 + "\n\n"
+           "## Heading Two\n\n" + "word " * 40 + "\n\n" + "tail " * 40)
+    chunks = llm_chunk.chunk_markdown(doc, 120)
+    assert "".join(c + s for c, s in chunks) == doc
+    starts = [c.split("\n")[0] for c, _s in chunks]
+    # the overflow break is aligned so the heading OPENS its chunk
+    assert "## Heading One" in starts
+    assert "## Heading Two" in starts
+
+
+def test_chunk_heading_alignment_never_splits_tables():
+    doc = ("## Heading One\n\n" + "word " * 60 + "\n\n| a | b |\n| c | d |\n\nz")
+    for mc in (40, 80, 160, 400):
+        chunks = llm_chunk.chunk_markdown(doc, mc)
+        assert "".join(c + s for c, s in chunks) == doc, mc
+        for chunk, _s in chunks:
+            lines = [l for l in chunk.split("\n") if l.strip()]
+            has_table = any(l.lstrip().startswith("|") for l in lines)
+            has_prose = any(not l.lstrip().startswith("|") for l in lines)
+            assert not (has_table and has_prose), (mc, chunk)
+
+
+# ---------------------------------------------------------------------------
+# echo protocol: multi-group payloads with per-unit NOTE hints
+# ---------------------------------------------------------------------------
+
+def test_parse_indexed_lines_multi_group_with_notes():
+    resp = ("0| alpha\n"
+            "1| beta\n"
+            "NOTE 1: your previous answer was REJECTED (invariant A)\n"
+            "\n"
+            "CONTEXT:\n"
+            "row: | x | y |\n"
+            "\n"
+            "2| gamma\n")
+    got = llm_protocol._parse_indexed_lines(resp, {0, 1, 2})
+    assert got == {0: "alpha", 1: "beta", 2: "gamma"}
+    # a NOTE echoed by the model is never captured as unit text
+    got2 = llm_protocol._parse_indexed_lines(
+        "3| delta\nNOTE 3: do not echo this\n", {3})
+    assert got2 == {3: "delta"}
+
+
+def test_batch_output_cap_scales_with_fragments_not_prompt(monkeypatch):
+    caps = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        caps.append(kw.get("output_cap_chars"))
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == _prep(CELL_DOC)
+    assert len(caps) == 1
+    # the cap source is the FRAGMENT volume ('D-t yp e' = 8 chars), not the
+    # whole prompt (payload + CONTEXT row are much longer)
+    assert 0 < caps[0] < 40
+
+
+def test_wholechunk_yield_accounting(monkeypatch):
+    def fake_call(system_prompt, chunk, *a, **kw):
+        if "0|" not in chunk:
+            # accepted candidate that JOINS two lines: the whole-chunk call's
+            # unique yield (item-7 measurement)
+            return "text that was falsely split\nend of doc", None
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    doc = "text that was\nfalsely split\nend of doc"
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == "text that was falsely split\nend of doc"
+    assert stats["wholechunk_attempts"] == 1
+    assert stats["wholechunk_accepted"] == 1
+    assert stats["wholechunk_linejoin_fixes"] == 1
+
+
+def test_scheduler_packs_only_full_batches_until_drain():
+    import threading
+    states = [llm_batch.ChunkState(0, "chunk", "")]
+    sched = llm_batch.BatchScheduler(
+        states, {"cell": "p", "line": "p"}, llm_batch.DocVocab("x"),
+        model="m", endpoint="e", api_key="k", sampling=None, retries=1,
+        stats={"units_sent": 0}, lock=threading.Lock(), pool=None,
+        note=lambda m: None, batch_chars=10)
+    assert not sched._packable("cell")            # empty queue
+    sched.enqueue_cell(0, 0, 0, "abc", "| a |")
+    # producers still pending and the batch is below batch_chars: wait for
+    # more fragments instead of burning a slot on a tiny batch
+    assert not sched._packable("cell")
+    sched.enqueue_cell(0, 1, 1, "defghijklm", "| b |")
+    assert sched._packable("cell")                # >= batch_chars
+    batch = sched._pack("cell")
+    assert [u.text for u in batch] == ["abc", "defghijklm"]
+    assert not sched._packable("cell")
+    sched.producer_done()                         # drain phase: any residue goes
+    sched.enqueue_line(0, 2, "x")
+    assert sched._packable("line")
