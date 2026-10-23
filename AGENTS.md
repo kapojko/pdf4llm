@@ -20,6 +20,8 @@ CLI utility to convert PDF to properly formatted Markdown, for downstream LLM pr
     `llm_verify.py` (algorithmic verifier — the safety gate),
     `llm_table.py` (table/cell geometry, TOC detection),
     `llm_salvage.py` (line-level salvage of rejected candidates),
+    `llm_batch.py` (cross-chunk batch scheduler: unit registry, kind-separated
+    queues, batch packer, global-requeue retries, vocabulary SEND/SKIP filter),
     `llm_prepass.py` (deterministic pre-passes),
     `llm_server.py` (llama-swappy probing, worker pool, interrupt/context errors).
 * `tests/` — offline test suite (`test_llm.py` covers the LLM pass, `test_convert.py`/`test_cli_options.py` the rest).

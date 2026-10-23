@@ -124,32 +124,53 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
      no requests are spent;
    - *prose chunks* get one whole-chunk attempt (the only unit that can join
      falsely split lines), then a deterministic line-level salvage of the
-     candidate, then batched re-asks of the disputed lines
-     (only the failed subset, up to `llm_retries` rounds, with a hint).
+     candidate; disputed lines are re-asked as batched units.
    All unit-level requests use an indexed echo protocol (`N| text`);
    measured on a 9B/A1.3B model, they produced zero content
    violations where whole-table chunks were rejected ~70% of the time.
+
+   **Cross-chunk batching** — the verification unit (a cell or a line) is
+   decoupled from the request unit: suspect units from ALL chunks are
+   collected into kind-separated global queues (cells and prose lines are
+   never mixed in one call) and packed into batched echo requests of ~5k
+   chars of fragment text, with the CONTEXT row attached once per row-group.
+   A per-document word-frequency map (built after the pre-passes, used ONLY
+   as a SEND/SKIP gate — it never edits text) skips fragments whose suspicious
+   join form never occurs in the document (probably legitimate spacing),
+   cutting the number of model calls roughly threefold on repetitive
+   datasheets. A measured run on a 19-page datasheet: 77 units sent,
+   141 skipped, 0 failed.
 4. **Algorithmic verifier** (per unit, non-negotiable) — whitespace-level
    edits only: input and output must be identical after whitespace-stripping
    and a closed **canonical map** (dashes, quotes, bullets, ellipsis are
    interchangeable in BOTH directions — the model may rewrite `–` as `-` but
    can never delete it), numeric tokens must survive as an ordered sequence
    (blocks `2 0` → `20`, `0x30 08` → `0x3008`, `-40` → `40`; harmless joins
-   like `25 °C` → `25°C` pass), and table rows keep their cell count.
+   like `25 °C` → `25°C` pass), table rows keep their cell count, and the
+   `<br>` split-marker edit class is narrowly allowed: the invariant-A
+   projection strips `<br>` tags from both sides, so `Co<br>ntrol` may become
+   `Control` (or `Co ntrol`) but nothing else about the tag.
    The canonical map never touches `[0-9A-Za-z_]`, so register names,
    constants and words are physically immutable.
 5. **Recovery** — a failed unit is not simply discarded: the whole-chunk
    candidate goes through line/block-level **salvage** (only independently
-   verified pieces are applied, the rest reverts), then batched re-asks of the
-   disputed lines (only the failed subset, up to `llm_retries` rounds). Whatever still fails verification stays as
+   verified pieces are applied, the rest reverts); a unit that fails parsing
+   or verification is **requeued** — never retried in place — to the end of
+   its batch queue with its rejection reason attached, up to `llm_retries`
+   extra attempts; the next batch carries the reason as a per-unit NOTE line.
+   Whatever still fails verification stays as
    the original — rejection is always safe, never silent. All decisions are
    logged to `meta.json` (`llm` section: classification, accepted/salvaged/
-   rejected/toc-skipped counts, cells sent/fixed, per-chunk reasons).
+   rejected/toc-skipped counts, units sent/fixed/failed/skipped, batches,
+   cells sent/fixed, whole-chunk yield, per-unit failure log, per-chunk
+   reasons).
 
 Deterministic pre-passes run before the LLM pass — no model involvement:
-duplicated-bullet cleanup (`- • x` → `- x`), horizontal-rule stripping, and
+duplicated-bullet cleanup (`- • x` → `- x`), horizontal-rule stripping,
 TOC dot-leader collapsing (runs of 4+ dots → one space; models reliably try
-to trim dot leaders themselves, which poisons whole chunks).
+to trim dot leaders themselves, which poisons whole chunks), and mechanical
+`<br>` split-word joins (`Co<br>ntrol` → `Control` where the next character
+is lowercase — the ambiguous cases go to the model as batched units).
 
 Set credentials once:
 
@@ -162,20 +183,23 @@ POSIX: `~/.config/pdf4llm\config.json`) as `{endpoint, api_key, model}`.
 Optional keys: `llm_sampling` (dict forwarded verbatim on every request;
 when absent, **no sampling parameters are sent** and the server-side model
 defaults apply — the tool never overrides temperature), `llm_retries`
-(default 2; a unit that fails parsing or verification is re-requested up to
-this many extra times, only the failed subset, with a rejection-reason
-hint) and `llm_chunk_chars` (default 2000; same as `--llm-chunk-chars`).
+(default 2; a unit that fails parsing or verification is requeued up to
+this many extra times — never retried in place — and the next batch carries
+its rejection reason as a per-unit NOTE line) and `llm_chunk_chars`
+(default 2000; same as `--llm-chunk-chars`).
 Then:
 
 ```powershell
 pdf4llm <file.pdf> --llm --pages 1-10
 ```
 
-Chunks are processed one after another unless parallelism is available. The
-pass prints unconditional progress: a start line per chunk (`llm: chunk 10/104
-(1976 chars) ...`) and a completion line with the final state — `accepted`,
-`salvaged N block(s)` or `REJECTED` — plus retry/truncation counts, elapsed
-time and an ETA. With
+Chunk producers (deterministic scan + one whole-chunk prose attempt per
+prose chunk) run concurrently with the batch requests in the worker pool.
+The pass prints unconditional progress: a line per batch
+(`llm: batch 12: 20 fragment(s), 4800 chars`), a per-chunk line at the end
+for every rejected or salvaged chunk, and a totals summary — accepted /
+salvaged / rejected / toc-skipped chunks, units sent/fixed/failed/skipped,
+elapsed time. With
 a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
 self-description endpoint and:
 
@@ -195,12 +219,12 @@ server capabilities and worker count are recorded in `meta.json` (`llm.swappy`).
 With a plain OpenAI-compatible endpoint (Ollama, bare llama-server) the
 behaviour is unchanged: `--llm-workers N` for parallelism, 1 otherwise.
 
-Safety is unaffected by parallelism: every chunk still goes through the same
-verify → salvage → retry pipeline, chunks are independent and the output is
-reassembled strictly in original chunk order, so the result and the meta.json
-stats are identical to the sequential run.
+Safety is unaffected by parallelism: every unit still goes through the same
+verify-and-requeue pipeline, chunks are independent and the output is
+reassembled strictly in original chunk order.
 
-#### Model choice (measured, 49-page datasheet, 80 chunks)
+#### Model choice (measured, 49-page datasheet, 80 chunks; pre-batching pipeline —
+re-run with the current batched pass before drawing conclusions)
 
 | model | throughput | rejected | notes |
 |-------|-----------|----------|-------|
@@ -232,12 +256,14 @@ quality-critical output. Rerun with `scripts/bench/` (`bench_llm_local.py`,
   the symptom is unmistakable — a spike of `REJECTED ... truncated x1` chunks
   at 2–4x the usual per-chunk time (thinking burns the output-token cap) —
   and the fix is `--reasoning off` on that server instance.
-- `max_tokens` per chunk is **capped at ~the input length** (3.5 chars/token
-  + 256 margin): the pass is whitespace-only, so a healthy answer fits
-  easily, while a looping model is cut off after one chunk-worth of tokens
-  instead of burning thousands. The truncated output then fails verification
-  and the normal salvage/retry machinery runs. Truncated calls are counted
-  in `meta.json` (`llm.truncated_calls`).
+- `max_tokens` per request is **capped relative to the input** (2x input
+  tokens, 3.5 chars/token + 256 margin; for batched echo requests the cap
+  scales with the FRAGMENT volume, not the whole prompt — CONTEXT rows and
+  retry notes inflate the prompt but not the expected output): the pass is
+  whitespace-only, so a healthy answer fits easily, while a looping model is
+  cut off quickly instead of burning thousands of tokens. The truncated
+  output then fails verification and the normal requeue machinery runs.
+  Truncated calls are counted in `meta.json` (`llm.truncated_calls`).
 - Chunking default is a deliberately small 2000 chars (`--llm-chunk-chars`),
   which keeps small local models (e.g. 9B) on-task and makes per-chunk
   failures cheap.
@@ -254,6 +280,8 @@ quality-critical output. Rerun with `scripts/bench/` (`bench_llm_local.py`,
 
 ## Known acceptable artifacts (post-filterable)
 
-- Split table cells: `System Co<br>ntrol` in wide register tables.
 - `00` prefix on section numbers (font-encoded numbering).
 - Stray bullet glyphs, inline page headers/footers, reversed/rotated cover text.
+
+(`<br>` split cells — `System Co<br>ntrol` in wide register tables — used to
+be in this list; the current pass repairs them, see the LLM section.)
