@@ -82,10 +82,10 @@ def test_find_duplicates_exact_basename(tmp_path):
 
 
 def test_chunk_markdown_sizes():
-    from pdf4llm import llm
+    from pdf4llm import llm_chunk
 
     text = "### A\n" + ("word " * 2000) + "\n### B\n" + ("x " * 2000)
-    chunks = llm.chunk_markdown(text, max_chars=500)
+    chunks = llm_chunk.chunk_markdown(text, max_chars=500)
     assert all(len(c) <= 500 for c in chunks)
     assert len(chunks) > 1
 

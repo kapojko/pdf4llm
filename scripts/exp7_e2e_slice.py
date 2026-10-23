@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pdf4llm import config as cfg
-from pdf4llm import llm
+from pdf4llm import llm_chunk, llm_run
 
 MD = Path("examples/rm0410-stm32f76xxx-and-stm32f77xxx-advanced-armbased-32bit-mcus-stmicroelectronics.md")
 N_CHUNKS = 80
@@ -22,11 +22,11 @@ MAX_CHARS = 2000
 
 c = cfg.load_config()
 text = MD.read_text(encoding="utf-8")
-chunks = llm.chunk_markdown(text, MAX_CHARS)
+chunks = llm_chunk.chunk_markdown(text, MAX_CHARS)
 slice_text = "".join(ch + sep for ch, sep in chunks[:N_CHUNKS])
 print(f"slice: {N_CHUNKS} chunks, {len(slice_text)} chars; model={c['model']}")
 
-_out, stats = llm.correct_with_llm(
+_out, stats = llm_run.correct_with_llm(
     slice_text, c["model"], c["endpoint"], c["api_key"],
     verbose=False, sampling=c.get("llm_sampling"), workers=8,
 )

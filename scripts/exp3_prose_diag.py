@@ -8,11 +8,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pdf4llm import config as cfg
-from pdf4llm.llm import (
-    DEFAULT_SAMPLING, _strip_thinking, _verify_chunk, chunk_markdown,
+from pdf4llm.llm_chunk import chunk_markdown
+from pdf4llm.llm_client import DEFAULT_SAMPLING, _strip_thinking, output_token_cap
+from pdf4llm.llm_prepass import (
     collapse_dot_leaders, dedupe_bullets, fix_subscripts,
-    output_token_cap, strip_horizontal_rules,
+    strip_horizontal_rules,
 )
+from pdf4llm.llm_verify import _verify_chunk
 from exp2_llm_smart_chunks import BASELINE_PROMPT, call, load_chunks
 
 c = cfg.load_config()

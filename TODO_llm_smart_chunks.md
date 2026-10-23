@@ -7,45 +7,13 @@ applied, failed units are retried up to `llm_retries` times (default 2) with
 a rejection-reason hint, and rejection is always safe (the original text is
 kept).
 
-## Step 0 — refactor before any improvement (preliminary, blocking)
+## Module layout (post-refactor baseline)
 
-`llm.py` is ~1700 lines and mixes unrelated concerns. Split it into modules
-BEFORE any behavioural change, verify with the existing test suite
-(122 tests, must pass UNCHANGED — the refactor is pure code motion), commit,
-and only then start the improvement items. This keeps every later diff small
-and reviewable against a stable baseline.
-
-Target split (each file ≤ 500 lines; 1000 only in exceptional cases):
-
-- `llm_prepass.py` — deterministic pre-passes: `strip_horizontal_rules`,
-  `collapse_dot_leaders`, `dedupe_bullets`, `fix_subscripts`. Future home of
-  the deterministic `<br>` joiner (item 4 below).
-- `llm_classify.py` — `classify_heuristic`, `classify_with_llm`.
-- `llm_chunk.py` — `chunk_markdown`; future home of heading-aligned
-  boundaries (item 5).
-- `llm_prompts.py` — all prompt templates (whole-chunk / line / cell) and
-  the one-shot examples (item 2). Prompts are iterated on most often; they
-  must not be buried in logic.
-- `llm_verify.py` — canonical map, `_ws_canon`, `_num_tokens`, `_num_check`,
-  `_verify_pair`, `_verify_chunk`, `_verify_line_in_context`.
-- `llm_table.py` — row/cell geometry: `_is_table_row`, `_is_separator_row`,
-  `_split_row_cells`, `_row_cell_texts`, `_splice_cells`, `_is_toc_like`,
-  `_suspicious_cell`.
-- `llm_salvage.py` — `_pair_by_similarity`, `_salvage`.
-- `llm_protocol.py` — indexed echo protocol: `_parse_indexed_lines`,
-  `_echo_units`, `_verified_rounds`. Future home of the batch aggregator
-  (item 1).
-- `llm_client.py` — transport: `_call_llm`, `_split_sampling`,
-  `output_token_cap`, `_strip_thinking`.
-- `llm_server.py` — server capability probing and parallelism:
-  `probe_swappy`, `resolve_workers`, `estimate_chunk_tokens`, `_DaemonPool`,
-  `LlmInterrupted`, `LlmContextError`.
-- `llm_run.py` — orchestration: `_run_chunk`, stats deltas, progress
-  formatting, `correct_with_llm` entry point.
-
-Refactor rules: no behaviour change, no renames of public entry points,
-tests untouched except import paths. If a function must move with its
-helpers, move the whole cluster (verifier helpers with `_verify_pair`, etc.).
+`llm.py` has been split into focused modules (pure code motion, 122 tests
+passing unchanged): `llm_prepass`, `llm_classify`, `llm_chunk`, `llm_prompts`,
+`llm_verify`, `llm_table`, `llm_salvage`, `llm_protocol`, `llm_client`,
+`llm_server`, `llm_run`. All improvement items below work against this
+baseline; every later diff stays small and reviewable.
 
 ## Open investigation (highest priority, before tuning anything)
 

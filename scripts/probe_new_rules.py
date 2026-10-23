@@ -15,11 +15,14 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 from pdf4llm import config as cfg
-from pdf4llm.llm import (
-    DEFAULT_SAMPLING, TECHNICAL_SYSTEM_PROMPT, _strip_thinking, _verify_chunk,
-    chunk_markdown, collapse_dot_leaders, dedupe_bullets, fix_subscripts,
+from pdf4llm.llm_chunk import chunk_markdown
+from pdf4llm.llm_client import DEFAULT_SAMPLING, _strip_thinking
+from pdf4llm.llm_prepass import (
+    collapse_dot_leaders, dedupe_bullets, fix_subscripts,
     strip_horizontal_rules,
 )
+from pdf4llm.llm_prompts import TECHNICAL_SYSTEM_PROMPT
+from pdf4llm.llm_verify import _verify_chunk
 
 N_SAMPLES = int(sys.argv[1]) if len(sys.argv) > 1 else 40
 MAXC = 1000
@@ -66,7 +69,7 @@ print(f"chunks={total}, sampling {len(idxs)}")
 
 def run(i):
     chunk, _ = chunks[i]
-    from pdf4llm.llm import _call_llm
+    from pdf4llm.llm_client import _call_llm
     cand, finish = _call_llm(TECHNICAL_SYSTEM_PROMPT, chunk, c["model"], c["endpoint"], c["api_key"],
                              sampling=c.get("llm_sampling") or DEFAULT_SAMPLING)
     cand = _strip_thinking(cand)

@@ -27,7 +27,7 @@ import pymupdf
 from pymupdf.layout.MultiProcessWrapper import MultiProcessWrapper
 
 from . import checks
-from .llm import _fmt_duration
+from .llm_run import _fmt_duration
 
 _WRAPPER: MultiProcessWrapper | None = None
 _DML_PATCHED = False

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
-from pdf4llm import llm
+from pdf4llm import llm_run
 from pdf4llm.config import load_config
 
 NAME, MODEL, WORKERS = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -45,23 +45,23 @@ def main() -> None:
 
     # record per-chunk deltas by wrapping _run_chunk
     deltas: list[dict] = []
-    orig_run_chunk = llm._run_chunk
+    orig_run_chunk = llm_run._run_chunk
 
     def recording_run_chunk(*a, **kw):
         result, delta = orig_run_chunk(*a, **kw)
         deltas.append(delta)
         return result, delta
 
-    llm._run_chunk = recording_run_chunk
+    llm_run._run_chunk = recording_run_chunk
     t0 = time.perf_counter()
     with contextlib.redirect_stdout(log_file):
-        corrected, stats = llm.correct_with_llm(
+        corrected, stats = llm_run.correct_with_llm(
             TEXT, MODEL, ENDPOINT, API_KEY,
             classify=False, workers=WORKERS,
         )
     wall = time.perf_counter() - t0
     log_file.close()
-    llm._run_chunk = orig_run_chunk
+    llm_run._run_chunk = orig_run_chunk
 
     # fix-quantity metrics vs the input text
     in_lines = TEXT.split("\n")

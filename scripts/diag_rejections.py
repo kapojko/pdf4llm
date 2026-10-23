@@ -14,17 +14,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pdf4llm import config as cfg
-from pdf4llm.llm import (
-    DEFAULT_SAMPLING,
+from pdf4llm.llm_chunk import chunk_markdown
+from pdf4llm.llm_client import DEFAULT_SAMPLING, _call_llm, _strip_thinking
+from pdf4llm.llm_prepass import (
     collapse_dot_leaders,
-    _call_llm,
-    _strip_thinking,
-    _verify_chunk,
-    chunk_markdown,
     dedupe_bullets,
     fix_subscripts,
     strip_horizontal_rules,
 )
+from pdf4llm.llm_verify import _verify_chunk
 
 N_CHUNKS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 MAX_CHARS = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
@@ -61,7 +59,7 @@ for i, (chunk, sep) in enumerate(chunks[:N_CHUNKS], 1):
     print("-" * 78)
     cand, finish = _call_llm(
         # TECHNICAL prompt (doc classified technical in the user's run)
-        __import__("pdf4llm.llm", fromlist=["TECHNICAL_SYSTEM_PROMPT"]).TECHNICAL_SYSTEM_PROMPT,
+        __import__("pdf4llm.llm_prompts", fromlist=["TECHNICAL_SYSTEM_PROMPT"]).TECHNICAL_SYSTEM_PROMPT,
         chunk, model, endpoint, api_key, sampling=sampling,
     )
     cand = _strip_thinking(cand)

@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
-from pdf4llm import llm
+from pdf4llm import llm_chunk, llm_client, llm_prepass, llm_prompts, llm_run
 from pdf4llm.config import load_config
 
 NAME, MODEL, WORKERS = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -19,19 +19,19 @@ cfg = load_config()
 ENDPOINT, API_KEY = cfg["endpoint"], cfg["api_key"]
 
 orig = Path("out/CH32V208DS0 2.7 2026-06-01.md").read_text(encoding="utf-8")
-text = llm.dedupe_bullets(orig)
-text, _ = llm.strip_horizontal_rules(text)
-text, _ = llm.fix_subscripts(text)
-chunks = llm.chunk_markdown(text, 2000)
+text = llm_prepass.dedupe_bullets(orig)
+text, _ = llm_prepass.strip_horizontal_rules(text)
+text, _ = llm_prepass.fix_subscripts(text)
+chunks = llm_chunk.chunk_markdown(text, 2000)
 
-sys_prompt = llm.TECHNICAL_SYSTEM_PROMPT
+sys_prompt = llm_prompts.TECHNICAL_SYSTEM_PROMPT
 deltas: dict[int, dict] = {}
 t0 = time.monotonic()
 
 def run(i: int, chunk: str, sep: str) -> None:
     _res, delta = llm._run_chunk(
         i, len(chunks), chunk, sep, sys_prompt, MODEL, ENDPOINT,
-        API_KEY, llm.DEFAULT_SAMPLING, retries=2,
+        API_KEY, llm_client.DEFAULT_SAMPLING, retries=2,
     )
     deltas[i] = delta
 

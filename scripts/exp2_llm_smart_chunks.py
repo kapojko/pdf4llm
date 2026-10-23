@@ -23,19 +23,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pdf4llm import config as cfg
-from pdf4llm.llm import (
+from pdf4llm.llm_chunk import chunk_markdown
+from pdf4llm.llm_client import (
     DEFAULT_SAMPLING,
-    _num_check,
-    _strip_thinking,
-    _verify_chunk,
     _split_sampling,
-    chunk_markdown,
+    _strip_thinking,
+    output_token_cap,
+)
+from pdf4llm.llm_prepass import (
     collapse_dot_leaders,
     dedupe_bullets,
     fix_subscripts,
-    output_token_cap,
     strip_horizontal_rules,
 )
+from pdf4llm.llm_verify import _num_check, _verify_chunk
 
 MD = Path("examples/rm0410-stm32f76xxx-and-stm32f77xxx-advanced-armbased-32bit-mcus-stmicroelectronics.md")
 MAX_CHARS = 2000

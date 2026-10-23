@@ -4,7 +4,28 @@ CLI utility to convert PDF to properly formatted Markdown, for downstream LLM pr
 
 # Repo structure
 
-TBD
+* `src/pdf4llm/` — the package:
+  * `cli.py` — Typer CLI entry point (`pdf4llm` command);
+  * `convert.py` — PDF → Markdown conversion (pymupdf + ONNX layout models);
+  * `config.py` — config file loading (`endpoint`, `api_key`, `llm_sampling`, ...);
+  * `prune.py` — Markdown pruning (image/link/heading noise removal);
+  * `checks.py` — environment/dependency checks;
+  * LLM correction pass, one module per concern (all `llm_*.py`):
+    `llm_run.py` (orchestration, `correct_with_llm` entry point),
+    `llm_chunk.py` (structure-preserving chunking),
+    `llm_classify.py` (technical/general document classification),
+    `llm_prompts.py` (prompt templates),
+    `llm_client.py` (transport, sampling plumbing, output token cap),
+    `llm_protocol.py` (indexed `N|` echo protocol + hinted retry rounds),
+    `llm_verify.py` (algorithmic verifier — the safety gate),
+    `llm_table.py` (table/cell geometry, TOC detection),
+    `llm_salvage.py` (line-level salvage of rejected candidates),
+    `llm_prepass.py` (deterministic pre-passes),
+    `llm_server.py` (llama-swappy probing, worker pool, interrupt/context errors).
+* `tests/` — offline test suite (122 tests; `test_llm.py` covers the LLM pass, `test_convert.py`/`test_cli_options.py` the rest).
+* `scripts/` — one-off experiment & diagnostic scripts (`exp*.py`, `diag_rejections.py`, `probe_new_rules.py`); `scripts/bench/` — local model benchmarks (`bench_llm_local.py`, `probe_quality.py`).
+* `examples/` — sample documents (only the small 74HC_HCT74 fixture is committed).
+* `out/` — conversion/benchmark outputs, gitignored.
 
 # Precautions
 

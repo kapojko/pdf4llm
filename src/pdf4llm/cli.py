@@ -28,7 +28,9 @@ from datetime import datetime
 import pymupdf
 import typer
 
-from . import __version__, checks, config as cfg, convert, llm, prune
+from . import __version__, checks, config as cfg, convert, prune
+from .llm_run import correct_with_llm
+from .llm_server import LlmContextError, LlmInterrupted
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -412,12 +414,12 @@ def _process_one(
         chunk_chars = llm_chunk_chars or int(c.get("llm_chunk_chars", 2000))
         text = md_path.read_text(encoding="utf-8")
         try:
-            text, llm_stats = llm.correct_with_llm(
+            text, llm_stats = correct_with_llm(
                 text, model, endpoint, api_key, verbose=verbose,
                 sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
                 workers=llm_workers, max_chars=chunk_chars,
             )
-        except llm.LlmContextError as e:
+        except LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)
             return 4
         except KeyboardInterrupt:
@@ -425,7 +427,7 @@ def _process_one(
             # the plain .md is already on disk, nothing to clean up
             typer.echo("\n  llm: interrupted (Ctrl+C) — uncorrected .md kept", err=True)
             raise typer.Exit(130)
-        except llm.LlmInterrupted as e:
+        except LlmInterrupted as e:
             # half-corrected output is discarded; the original pre-LLM .md
             # (written by convert) stays untouched on disk
             done = e.stats["interrupted"]["chunks_completed"]

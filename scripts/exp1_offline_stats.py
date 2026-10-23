@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pdf4llm.llm import (
-    chunk_markdown,
+from pdf4llm.llm_chunk import chunk_markdown
+from pdf4llm.llm_prepass import (
     collapse_dot_leaders,
     dedupe_bullets,
     fix_subscripts,
