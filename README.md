@@ -107,7 +107,8 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
 2. **Constrained edits** — the model may only perform formatting/whitespace
    fixes: join split words (`D-t yp e` → `D-type`), subscript joins
    (`V CC` → `VCC`, `T amb` → `T_amb`), part-number hyphen joins
-   (`SOT108 - 1` → `SOT108-1`), false line-break removal. Nothing else.
+   (`SOT108 - 1` → `SOT108-1`), false line-break removal, and `<br>`
+   split-marker removal (see the verifier below). Nothing else.
 3. **Structure never passes through the model** — the pass is
    structure-aware, and the granularity matches where a small model is
    actually reliable:
@@ -203,15 +204,15 @@ elapsed time. With
 a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
 self-description endpoint and:
 
-- sets the number of workers automatically to `min(slots, 8)` (measured on
-  ling-3.0-tiny-np8: w4→w8 ≈ 1.75x aggregate throughput; w16 gave no further
-  gain — the GPU saturates at ~8 streams); an explicit `--llm-workers`
-  overrides this;
+- sets the number of workers automatically to `min(slots, 8)` (stream-scaling
+  measured on ling-3.0-tiny-np8 with the pre-batching pipeline: w4→w8 ≈ 1.75x
+  aggregate throughput; w16 gave no further gain — the GPU saturates at ~8
+  streams); an explicit `--llm-workers` overrides this;
 - reads the per-request `contextSize` (total `-c` divided by slots) and checks
-  a rough token estimate (input + same-size output + margin, ~3.5 chars/token)
-  for the **largest actual chunk** against it; if a chunk provably cannot fit,
-  the pass is **aborted before any LLM call** (exit code 4) — reduce the chunk
-  size or raise the server context.
+  a rough token estimate (input + up to 2x-size output + margin,
+  ~3.5 chars/token) for the **largest actual chunk** against it; if a chunk
+  provably cannot fit, the pass is **aborted before any LLM call** (exit code
+  4) — reduce the chunk size or raise the server context.
 
 Missing data degrades safely: no info endpoint → 1 worker, current behaviour;
 model key not listed / no `contextSize` → warning, check skipped. The detected
@@ -223,22 +224,27 @@ Safety is unaffected by parallelism: every unit still goes through the same
 verify-and-requeue pipeline, chunks are independent and the output is
 reassembled strictly in original chunk order.
 
-#### Model choice (measured, 49-page datasheet, 80 chunks; pre-batching pipeline —
-re-run with the current batched pass before drawing conclusions)
+#### Model choice
 
-| model | throughput | rejected | notes |
-|-------|-----------|----------|-------|
-| ornith-1.5-9b (dense, np4, w4) | 225 chars/s | 18/80 | baseline |
-| ling-3.0-tiny (MoE A1.3B, np8, w8) | 341 chars/s | 24–27/80 | **1.5x faster** |
+Current default (configured in the repo config): **ling-3.0-tiny-np8** (MoE,
+A1.3B active). Measured on the current batched pipeline, 19-page datasheet,
+19.4k alphanumeric chars, 8 slots:
 
-Both are equally safe (verifier-gated); the trade-off is repair recall: ling
-occasionally rewrites/drops whole lines, which the verifier rejects as a whole
-chunk (`candidate rewrite beyond salvage` in meta.json), so ~8% more of the
-document stays unrepaired. ling also scales to more slots (w4→w8 ≈ 1.75x;
-w16 adds nothing — GPU saturates ~8 streams), while the dense model does not.
-Rule of thumb: ling for long documents where wall-clock matters, ornith for
-quality-critical output. Rerun with `scripts/bench/` (`bench_llm_local.py`,
-`probe_quality.py`) when changing models or servers.
+- **750 chars/s** wall (142s → 43s vs the pre-batching pipeline on the same
+  document and server);
+- **0 rejected chunks, 0 truncated calls, 0 failed units** — 13 requeued
+  units, all recovered by the requeue machinery;
+- 6 of 7 known split-word defects fixed (the old pipeline fixed 2 of 7 on
+  the same document and left 5 in rejected chunks).
+
+Safety is model-independent (verifier-gated). There is **no current
+head-to-head comparison** of candidate models on the batched pipeline — the
+older ornith-1.5-9b vs ling-3.0-tiny table described the pre-batching
+whole-chunk pipeline, whose rejection profile no longer applies (whole-table
+chunk sends and their `candidate rewrite beyond salvage` rejections are
+gone). Such a comparison will be re-added once `scripts/bench/`
+(`bench_llm_local.py`, `probe_quality.py`) is re-run per candidate model on
+the current pipeline.
 
 `litellm` is the pluggable client — it works with Ollama, llama.cpp
 (llama-server), or any OpenAI-compatible endpoint.
