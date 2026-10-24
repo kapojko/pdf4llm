@@ -68,6 +68,7 @@ from .llm_prompts import (
 )
 from .llm_salvage import _salvage
 from .llm_server import LlmInterrupted, _DaemonPool, resolve_workers
+from .progress import _fmt_duration
 from .llm_table import (
     _is_separator_row,
     _is_table_row,
@@ -76,18 +77,6 @@ from .llm_table import (
     _suspicious_cell,
 )
 from .llm_verify import _verify_chunk
-
-
-def _fmt_duration(seconds: float) -> str:
-    """Human-readable duration: 42s, 6m05s, 1h02m."""
-    s = int(round(seconds))
-    if s < 60:
-        return f"{s}s"
-    m, sec = divmod(s, 60)
-    if m < 60:
-        return f"{m}m{sec:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h{m:02d}m"
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +107,7 @@ def _produce_chunk(sched: BatchScheduler, cfg: SimpleNamespace, idx: int) -> Non
         else:
             _produce_table(sched, cfg, cs, chunk, row_idx)
     finally:
+        cs.produced = True
         sched.producer_done()
 
 
@@ -337,6 +327,15 @@ def correct_with_llm(
     text, dots_collapsed = collapse_dot_leaders(text)
     text, br_joined = fix_br_word_splits(text)
 
+    # always shown (not verbose-gated): the first LLM call can stall for a
+    # long time if the server must load the model — silence here looks
+    # like a hang
+    print(
+        f"  llm: starting (model {model}) — the first call may take a while "
+        "if the server has to load the model",
+        flush=True,
+    )
+
     is_technical, source = (True, "heuristic")
     if classify:
         is_technical, source = classify_with_llm(
@@ -436,6 +435,7 @@ def correct_with_llm(
         states, {"cell": cell_prompt, "line": line_prompt}, vocab,
         model=model, endpoint=endpoint, api_key=api_key, sampling=sampling,
         retries=retries, stats=stats, lock=lock, pool=pool, note=note,
+        verbose=verbose,
     )
 
     try:
@@ -444,9 +444,11 @@ def correct_with_llm(
             # _DaemonPool): batches packed from scanned chunks must interleave
             pool.submit(_produce_chunk, sched, cfg, i, priority=1)
         sched.run()
+        sched.stop_progress()
         pool.drain_and_shutdown()
     except KeyboardInterrupt:
         pool.shutdown_now()
+        sched.stop_progress()
         _finish_interrupted(stats)
         raise  # unreachable, keeps type-checkers happy
 

@@ -29,6 +29,7 @@ from collections import Counter, deque
 
 from .llm_prepass import has_residual_br
 from .llm_protocol import _echo_units
+from .progress import LineProgress, _fmt_duration
 from .llm_table import _split_row_cells, _splice_cells
 from .llm_verify import (
     _verify_chunk,
@@ -168,7 +169,8 @@ class ChunkState:
     """Per-chunk buffers and counters (touched by producer + batch tasks)."""
 
     __slots__ = ("index", "chunk", "sep", "o_lines", "out_lines", "toc_skipped",
-                 "units_total", "units_fixed", "units_failed", "units_skipped",
+                 "produced", "units_total", "units_enqueued", "units_fixed",
+                 "units_failed", "units_unchanged", "enq_done", "units_skipped",
                  "cells_sent", "cells_fixed", "reasons", "truncated",
                  "retries_used", "salvage_note")
 
@@ -179,9 +181,13 @@ class ChunkState:
         self.o_lines = chunk.split("\n")
         self.out_lines = list(self.o_lines)
         self.toc_skipped = False
+        self.produced = False  # producer finished scanning this chunk
         self.units_total = 0
+        self.units_enqueued = 0  # unique units ever enqueued (requeues don't add)
         self.units_fixed = 0
         self.units_failed = 0
+        self.units_unchanged = 0  # model echoed the original: done, nothing applied
+        self.enq_done = 0  # enqueued units resolved (fixed/failed/unchanged)
         self.units_skipped = 0
         self.cells_sent = 0
         self.cells_fixed = 0
@@ -211,7 +217,8 @@ class BatchScheduler:
     def __init__(self, states: list[ChunkState], prompts: dict[str, str],
                  vocab: DocVocab, *, model: str, endpoint: str, api_key: str,
                  sampling: dict | None, retries: int, stats: dict,
-                 lock, pool, note=None, batch_chars: int = BATCH_CHARS) -> None:
+                 lock, pool, note=None, batch_chars: int = BATCH_CHARS,
+                 verbose: bool = False) -> None:
         self.states = states
         self.prompts = prompts          # kind -> system prompt
         self.vocab = vocab
@@ -230,6 +237,10 @@ class BatchScheduler:
         self.producers_total = len(states)
         self.producers_done = 0
         self.batches_sent = 0
+        self.fail_reasons: Counter[str] = Counter()  # finalized (retry-exhausted) fails
+        self.prog: LineProgress | None = None
+        self.t0: float | None = None
+        self.verbose = verbose  # gates TTY line-breaks before plain prints
         self._gid = 0
 
     # -- enqueue (producer side, lock held inside) ---------------------------
@@ -245,12 +256,14 @@ class BatchScheduler:
                         cell=cell, context="row: " + row)
             self.queues["cell"].append(unit)
             self.states[chunk].cells_sent += 1
+            self.states[chunk].units_enqueued += 1
             self.stats["units_sent"] += 1
 
     def enqueue_line(self, chunk: int, line: int, text: str) -> None:
         with self.lock:
             unit = Unit(self._next_gid(), chunk, line, "line", text)
             self.queues["line"].append(unit)
+            self.states[chunk].units_enqueued += 1
             self.stats["units_sent"] += 1
 
     def skip_unit(self, chunk: int) -> None:
@@ -288,8 +301,11 @@ class BatchScheduler:
     # -- main loop ------------------------------------------------------------
 
     def run(self) -> None:
+        self.t0 = time.monotonic()
+        self.prog = LineProgress()
         while True:
             batch = None
+            progress = ""
             with self.lock:
                 for kind in ("cell", "line"):
                     if self._packable(kind):
@@ -299,12 +315,73 @@ class BatchScheduler:
                 done = (self.producers_done >= self.producers_total
                         and not self.queues["cell"] and not self.queues["line"]
                         and self.active == 0)
+                if not done:
+                    progress = self._progress_text_locked()
+            if progress:
+                self.prog.update(progress)
             if batch is not None:
                 self.pool.submit(self._batch_task, batch)
                 continue
             if done:
                 return
             time.sleep(0.05)
+
+    # -- live progress (main thread; text built under lock) --------------------
+
+    def _progress_text_locked(self) -> str:
+        """One-line live state: settled chunks with outcomes, units, ETA.
+
+        A chunk is SETTLED when its producer finished and every unit it
+        enqueued is resolved (fixed / failed / unchanged-echo) — the same
+        condition under which finalize() would classify it, so the live
+        counts converge to the final summary.
+        """
+        elapsed = time.monotonic() - self.t0
+        total = self.producers_total
+        ok = salv = rej = toc = settled = 0
+        units_done = units_total = failed = 0
+        for cs in self.states:
+            # only enqueued (batch) units are counted here: salvage fixes
+            # resolve synchronously inside the producer, so a chunk settles
+            # when its producer finished and every enqueued unit is resolved
+            done_u = cs.enq_done
+            units_done += done_u
+            units_total += cs.units_enqueued
+            failed += cs.units_failed
+            if cs.produced and done_u >= cs.units_enqueued:
+                settled += 1
+                if cs.toc_skipped:
+                    toc += 1
+                elif cs.units_failed and not cs.units_fixed:
+                    rej += 1
+                elif cs.units_failed:
+                    salv += 1
+                else:
+                    ok += 1
+        text = (
+            f"  llm: chunks {settled}/{total} (ok {ok}, salv {salv}, rej {rej}"
+            + (f", toc {toc}" if toc else "")
+            + f"), units {units_done}/{units_total}"
+            + (f" ({failed} failed)" if failed else "")
+            + f", {self.batches_sent} batch(es), {_fmt_duration(elapsed)}"
+        )
+        if settled:
+            eta = elapsed / settled * (total - settled)
+            text += f", ~{_fmt_duration(eta)} left"
+        top = self.fail_reasons.most_common(1)
+        if top:
+            # 'llm error: ...' reasons can carry server/model text with
+            # non-ASCII (or wide) chars, which would break the padding
+            # arithmetic — keep printable ASCII only
+            reason = top[0][0][:40].encode("ascii", "replace").decode()
+            text += f" | top fail: {reason}"
+        return text
+
+    def stop_progress(self) -> None:
+        """Clear the progress line (idempotent; safe before run() too)."""
+        if self.prog is not None:
+            self.prog.finish()
+            self.prog = None
 
     # -- batch execution (worker thread) --------------------------------------
 
@@ -350,6 +427,10 @@ class BatchScheduler:
                     for c in {u.chunk for u in batch}:
                         self.states[c].truncated += 1
                 self._process_batch(batch, got, finish)
+                # verbose batch lines must not clobber the in-place progress
+                # line on a TTY (only when a line is actually printed)
+                if self.verbose and self.prog is not None:
+                    self.prog.line_break()
                 self.note(
                     f"  llm: batch {self.batches_sent}: {len(batch)} fragment(s), "
                     f"{frag_chars} chars"
@@ -376,6 +457,8 @@ class BatchScheduler:
             if u.kind == "cell":
                 new = new.strip()
             if not new.strip() or new.strip() == u.text.strip():
+                cs.units_unchanged += 1
+                cs.enq_done += 1
                 continue  # unchanged (or empty) echo: nothing to apply
             if u.kind == "cell":
                 reason = _verify_pair(u.text, new)
@@ -394,6 +477,7 @@ class BatchScheduler:
             else:
                 cs.out_lines[u.line] = new
             cs.units_fixed += 1
+            cs.enq_done += 1
             if u.attempts:
                 self.stats["units_fixed_after_requeue"] += 1
 
@@ -414,7 +498,9 @@ class BatchScheduler:
             return
         # retries exhausted: the original text stays — rejection is safe
         cs.units_failed += 1
+        cs.enq_done += 1
         self.stats["units_failed"] += 1
+        self.fail_reasons[reason.split(",")[0][:60]] += 1
         cs.note_reason(f"{u.where}: {reason}")
 
     # -- finalization (main thread, after run()) ------------------------------
