@@ -27,7 +27,7 @@ import pymupdf
 from pymupdf.layout.MultiProcessWrapper import MultiProcessWrapper
 
 from . import checks
-from .llm import _fmt_duration
+from .progress import LineProgress, _fmt_duration
 
 _WRAPPER: MultiProcessWrapper | None = None
 _DML_PATCHED = False
@@ -210,12 +210,26 @@ def convert(pdf: Path, out_dir: Path, pages: str | None = None) -> tuple[Path, d
     )
     t0 = time.perf_counter()
     wrapper = _get_wrapper()
+    prog = LineProgress()
+
+    def on_page(done: int, total: int) -> None:
+        elapsed = time.perf_counter() - t0
+        eta = elapsed / done * (total - done)
+        prog.update(
+            f"  layout: page {done}/{total} ({100 * done // total}%), "
+            f"{_fmt_duration(elapsed)}, ~{_fmt_duration(eta)} left"
+        )
+
     if idx is None:
-        md = wrapper.to_markdown(str(pdf))
+        md = wrapper.to_markdown(str(pdf), progress_callback=on_page)
     else:
-        parts = [wrapper.to_markdown(doc[i]) for i in idx]
+        parts = []
+        for i, page_no in enumerate(idx, 1):
+            parts.append(wrapper.to_markdown(doc[page_no]))
+            on_page(i, len(idx))
         md = "\n\n".join(p for p in parts if p.strip())
     doc.close()
+    prog.finish()
     print(
         f"  layout engine: done in {_fmt_duration(time.perf_counter() - t0)} "
         "(includes model load on first use)",

@@ -1,8 +1,12 @@
-"""Local benchmark: ornith-1.5-9b-np4 vs ling-3.0-tiny-np8 (and worker counts).
+"""Local benchmark: worker counts and batch sizes on the batched pipeline.
 
-Usage: python bench_llm_local.py <name> <model-key> <workers>
-Appends one result row to bench_results.json. Per-run stdout is captured to
-bench_logs/<name>.log (the pass prints unconditional progress lines).
+Usage: python bench_llm_local.py <name> <model-key> <workers> [batch_chars]
+
+batch_chars (optional, default: leave production value 5000) overrides the
+scheduler's BATCH_CHARS for this run via a BatchScheduler.__init__ wrap —
+no production-code change. Appends one result row to bench_results.json.
+Per-run stdout is captured to bench_logs/<name>.log (the pass prints
+unconditional progress lines).
 """
 from __future__ import annotations
 
@@ -14,12 +18,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
-from pdf4llm import llm
+from pdf4llm import llm_batch, llm_run
 from pdf4llm.config import load_config
 
 NAME, MODEL, WORKERS = sys.argv[1], sys.argv[2], int(sys.argv[3])
+BATCH_CHARS = int(sys.argv[4]) if len(sys.argv) > 4 else None
 cfg = load_config()
 ENDPOINT, API_KEY = cfg["endpoint"], cfg["api_key"]
+
+# batch-size override (bench-only): force every BatchScheduler instance of
+# this run to pack BATCH_CHARS-char batches
+if BATCH_CHARS is not None:
+    _orig_init = llm_batch.BatchScheduler.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs["batch_chars"] = BATCH_CHARS
+        _orig_init(self, *args, **kwargs)
+
+    llm_batch.BatchScheduler.__init__ = _patched_init
 
 TEXT = Path("out/CH32V208DS0 2.7 2026-06-01.md").read_text(encoding="utf-8")
 
@@ -43,33 +59,45 @@ def main() -> None:
     print(f"[{NAME}] warm-up reply={r.choices[0].message.content!r} "
           f"(incl. load/switch {load_secs:.1f}s)", flush=True)
 
-    # record per-chunk deltas by wrapping _run_chunk
+    # record per-chunk deltas by wrapping _apply_chunk_delta (called once per
+    # chunk at drain time in the batched pipeline)
     deltas: list[dict] = []
-    orig_run_chunk = llm._run_chunk
+    orig_apply = llm_run._apply_chunk_delta
 
-    def recording_run_chunk(*a, **kw):
-        result, delta = orig_run_chunk(*a, **kw)
+    def recording_apply(stats, delta):
         deltas.append(delta)
-        return result, delta
+        return orig_apply(stats, delta)
 
-    llm._run_chunk = recording_run_chunk
+    llm_run._apply_chunk_delta = recording_apply
     t0 = time.perf_counter()
     with contextlib.redirect_stdout(log_file):
-        corrected, stats = llm.correct_with_llm(
+        corrected, stats = llm_run.correct_with_llm(
             TEXT, MODEL, ENDPOINT, API_KEY,
             classify=False, workers=WORKERS,
         )
     wall = time.perf_counter() - t0
     log_file.close()
-    llm._run_chunk = orig_run_chunk
+    llm_run._apply_chunk_delta = orig_apply
 
     # fix-quantity metrics vs the input text
     in_lines = TEXT.split("\n")
     out_lines = corrected.split("\n")
     changed_lines = sum(1 for a, b in zip(in_lines, out_lines) if a != b)
 
+    # batch-size drift measurement (llm_batch._FAIL_LOG_CAP log): mean
+    # ordinal of failures within their batches + coarse histogram. Flat
+    # per-ordinal distribution -> batch can grow; tail-clustered -> ceiling.
+    fail_log = stats.get("unit_fail_log", [])
+    ordinals = [e["ordinal"] for e in fail_log if e.get("ordinal")]
+    hist = {"1-4": 0, "5-8": 0, "9-16": 0, "17+": 0}
+    for o in ordinals:
+        hist["1-4" if o <= 4 else "5-8" if o <= 8 else "9-16" if o <= 16 else "17+"] += 1
+
     result = {
         "name": NAME, "model": MODEL, "workers": WORKERS,
+        "batch_chars": BATCH_CHARS if BATCH_CHARS is not None else 5000,
+        "fail_ordinal_mean": round(sum(ordinals) / len(ordinals), 2) if ordinals else None,
+        "fail_ordinal_hist": hist if ordinals else None,
         "load_switch_secs": round(load_secs, 1),
         "wall_secs": round(wall, 1),
         "chars_per_sec": round(len(TEXT) / wall),
@@ -81,7 +109,10 @@ def main() -> None:
         "retries_used": stats["retries_used"],
         "truncated_calls": stats["truncated_calls"],
         "changed_lines_vs_input": changed_lines,
-        "chunk_duration_secs": sorted(round(d["duration"], 1) for d in deltas),
+        "units_sent": stats.get("units_sent", 0),
+        "units_failed": stats.get("units_failed", 0),
+        "units_skipped": stats.get("units_skipped", 0),
+        "batches": stats.get("batches", 0),
         "corrected_chars": len(corrected),
     }
     out = Path(__file__).resolve().parent / "outputs" / f"bench_{NAME}.md"

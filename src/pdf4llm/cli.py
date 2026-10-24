@@ -28,7 +28,9 @@ from datetime import datetime
 import pymupdf
 import typer
 
-from . import __version__, checks, config as cfg, convert, llm, prune
+from . import __version__, checks, config as cfg, convert, prune
+from .llm_run import correct_with_llm
+from .llm_server import LlmContextError, LlmInterrupted, probe_swappy
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -83,6 +85,23 @@ def _setup_llm() -> None:
         f"(model={c.get('model')}, endpoint={c.get('endpoint')}, "
         f"api_key={cfg.mask(c.get('api_key', ''))})"
     )
+    # server self-description (llama-swappy), same info the conversion stage
+    # prints before an --llm pass: slots / per-request context at hand when
+    # the user picks a model (missing endpoint/info silently prints nothing)
+    if c.get("model"):
+        info = probe_swappy(c.get("endpoint", ""), c.get("api_key", ""))
+        if info:
+            models = info.get("models") or []
+            entry = next(
+                (m for m in models if m.get("key") == c.get("model")), None)
+            if entry is None and len(models) == 1:
+                entry = models[0]
+            if entry is not None:
+                typer.echo(
+                    f"  llm: llama-swappy: model {entry.get('key')!r}, "
+                    f"slots={entry.get('slots')}, "
+                    f"context={entry.get('contextSize')} tok/request"
+                )
 
 
 _LOCATE_IDX_NAME = ".pdf4llm_locate.idx"
@@ -306,21 +325,18 @@ def convert_cmd(
     ),
     llm_workers: int = typer.Option(
         None, "--llm-workers", min=1,
-        help="Parallel LLM chunk requests. Default: auto from llama-swappy info "
-             "(min(slots, 8)), else 1. Explicit value overrides the server.",
+        help="Parallel LLM chunk requests (default: 1).",
+    ),
+    llm_batch_chars: int = typer.Option(
+        None, "--llm-batch-chars", min=100,
+        help="Fragment-char volume packed into one batched LLM echo request. "
+             "Default: 10000.",
     ),
     llm_chunk_chars: int = typer.Option(
         None, "--llm-chunk-chars", min=200,
         help="Max chunk size (chars) for the LLM pass. Default: 2000 (config "
              "key llm_chunk_chars). Smaller chunks are more stable on small "
              "models.",
-    ),
-    llm_content_only: bool = typer.Option(
-        False, "--llm-content-only",
-        help="Relaxed LLM verification: only letters, digits, underscores and "
-             "numeric values are protected; punctuation, ASCII decoration and "
-             "table geometry may change. Default off = strict (whitespace-only "
-             "edits). Config key: llm_content_only.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
@@ -342,7 +358,7 @@ def convert_cmd(
             pdf, out=out, force=force, copy_to=copy_to, dry_run=dry_run,
             pages=pages, llm_flag=llm_flag, model=model,
             llm_workers=llm_workers, llm_chunk_chars=llm_chunk_chars,
-            llm_content_only=llm_content_only, verbose=verbose,
+            llm_batch_chars=llm_batch_chars, verbose=verbose,
         )
         codes.append(code)
         if code == 130:  # user interrupt: do not start the remaining files
@@ -361,7 +377,7 @@ def _process_one(
     model: str | None,
     llm_workers: int | None,
     llm_chunk_chars: int | None,
-    llm_content_only: bool,
+    llm_batch_chars: int | None,
     verbose: bool,
 ) -> int:
     """Convert one PDF; returns the exit code for this file (0 = ok)."""
@@ -418,16 +434,15 @@ def _process_one(
             )
             return 3
         chunk_chars = llm_chunk_chars or int(c.get("llm_chunk_chars", 2000))
-        content_only = llm_content_only or bool(c.get("llm_content_only", False))
         text = md_path.read_text(encoding="utf-8")
         try:
-            text, llm_stats = llm.correct_with_llm(
+            text, llm_stats = correct_with_llm(
                 text, model, endpoint, api_key, verbose=verbose,
                 sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
                 workers=llm_workers, max_chars=chunk_chars,
-                content_only=content_only,
+                batch_chars=llm_batch_chars,
             )
-        except llm.LlmContextError as e:
+        except LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)
             return 4
         except KeyboardInterrupt:
@@ -435,7 +450,7 @@ def _process_one(
             # the plain .md is already on disk, nothing to clean up
             typer.echo("\n  llm: interrupted (Ctrl+C) — uncorrected .md kept", err=True)
             raise typer.Exit(130)
-        except llm.LlmInterrupted as e:
+        except LlmInterrupted as e:
             # half-corrected output is discarded; the original pre-LLM .md
             # (written by convert) stays untouched on disk
             done = e.stats["interrupted"]["chunks_completed"]

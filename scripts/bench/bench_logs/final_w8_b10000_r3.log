@@ -1,0 +1,21 @@
+  llm: starting (model ling-3.0-tiny-np8) — the first call may take a while if the server has to load the model
+  llm: document classified technical (heuristic); 367 subscripts normalised
+  llm: llama-swappy: slots=8, context=24576 tok/request -> workers=8 (explicit)
+  llm: chunks 0/80 (ok 0, salv 0, rej 0), units 0/0, 0 batch(es), 0s
+  llm: chunks 2/80 (ok 2, salv 0, rej 0), units 0/11, 0 batch(es), 10s, ~6m32s left
+  llm: chunks 3/80 (ok 3, salv 0, rej 0), units 0/17, 0 batch(es), 20s, ~8m35s left
+  llm: chunks 4/80 (ok 4, salv 0, rej 0), units 0/21, 0 batch(es), 30s, ~9m32s left
+  llm: chunks 5/80 (ok 5, salv 0, rej 0), units 0/34, 0 batch(es), 40s, ~10m02s left
+  llm: chunks 28/80 (ok 23, salv 0, rej 0, toc 5), units 0/135, 0 batch(es), 50s, ~1m33s left
+  llm: chunks 29/80 (ok 24, salv 0, rej 0, toc 5), units 0/138, 0 batch(es), 1m00s, ~1m46s left
+  llm: chunks 32/80 (ok 27, salv 0, rej 0, toc 5), units 0/138, 0 batch(es), 1m10s, ~1m45s left
+  llm: chunks 32/80 (ok 27, salv 0, rej 0, toc 5), units 0/138, 0 batch(es), 1m20s, ~2m00s left
+  llm: batch 1: 85 fragment(s), 10050 chars
+  llm: batch 2: 45 fragment(s), 2052 chars, truncated
+  llm: chunks 60/80 (ok 55, salv 0, rej 0, toc 5), units 101/138, 2 batch(es), 1m30s, ~30s left
+  llm: batch 3: 8 fragment(s), 1255 chars
+  llm: batch 4: 29 fragment(s), 1247 chars
+  llm: chunks 65/80 (ok 60, salv 0, rej 0, toc 5), units 109/138, 4 batch(es), 1m40s, ~23s left
+  llm: batch 5: 29 fragment(s), 1247 chars
+  llm: chunk 20/80 [REJECTED: row 12 cell 5: malformed reply (missing index), no-recovery after 2 requeue(s), truncated x1]
+  llm: done in 1m43s: 80 chunks (74 accepted, 0 salvaged, 1 rejected, 5 toc-skipped); 138 unit(s) sent in 5 batch(es), 15 fixed, 1 failed, 464 vocab-skipped

@@ -1,0 +1,25 @@
+  llm: starting (model ling-3.0-tiny-np8) — the first call may take a while if the server has to load the model
+  llm: document classified technical (heuristic); 367 subscripts normalised
+  llm: llama-swappy: slots=8, context=24576 tok/request -> workers=4 (explicit)
+  llm: chunks 0/80 (ok 0, salv 0, rej 0), units 0/0, 0 batch(es), 0s
+  llm: chunks 2/80 (ok 2, salv 0, rej 0), units 0/29, 0 batch(es), 10s, ~6m32s left
+  llm: chunks 3/80 (ok 3, salv 0, rej 0), units 0/32, 0 batch(es), 20s, ~8m36s left
+  llm: chunks 3/80 (ok 3, salv 0, rej 0), units 0/54, 0 batch(es), 30s, ~12m53s left
+  llm: chunks 5/80 (ok 5, salv 0, rej 0), units 0/66, 0 batch(es), 40s, ~10m02s left
+  llm: chunks 5/80 (ok 5, salv 0, rej 0), units 0/71, 0 batch(es), 50s, ~12m33s left
+  llm: chunks 19/80 (ok 14, salv 0, rej 0, toc 5), units 0/102, 0 batch(es), 1m00s, ~3m13s left
+  llm: chunks 30/80 (ok 25, salv 0, rej 0, toc 5), units 0/155, 0 batch(es), 1m10s, ~1m57s left
+  llm: batch 1: 4 fragment(s), 724 chars
+  llm: chunks 32/80 (ok 27, salv 0, rej 0, toc 5), units 4/155, 1 batch(es), 1m20s, ~2m00s left
+  llm: batch 2: 45 fragment(s), 2052 chars, truncated
+  llm: batch 3: 4 fragment(s), 202 chars
+  llm: chunks 38/80 (ok 33, salv 0, rej 0, toc 5), units 45/155, 3 batch(es), 1m30s, ~1m40s left
+  llm: batch 4: 4 fragment(s), 202 chars
+  llm: chunks 41/80 (ok 33, salv 0, rej 3, toc 5), units 49/155 (4 failed), 4 batch(es), 1m40s, ~1m35s left | top fail: malformed reply (missing index)
+  llm: batch 5: 106 fragment(s), 10007 chars
+  llm: batch 6: 1 fragment(s), 53 chars
+  llm: chunk 48/80 [REJECTED: row 18 cell 2: malformed reply (missing index), no-recovery after 2 requeue(s), truncated x1]
+  llm: chunk 70/80 [REJECTED: row 32 cell 2: malformed reply (missing index), no-recovery after 2 requeue(s), truncated x1]
+  llm: chunk 72/80 [REJECTED: row 8 cell 4: malformed reply (missing index), no-recovery after 2 requeue(s), truncated x1]
+  llm: chunk 77/80 [REJECTED: row 19 cell 1: malformed reply (missing index), no-recovery after 2 requeue(s), truncated x1]
+  llm: done in 1m44s: 80 chunks (71 accepted, 0 salvaged, 4 rejected, 5 toc-skipped); 155 unit(s) sent in 6 batch(es), 15 fixed, 4 failed, 464 vocab-skipped

@@ -1,0 +1,14 @@
+  llm: starting (model ling-3.0-tiny-np8) — the first call may take a while if the server has to load the model
+  llm: document classified technical (heuristic); 367 subscripts normalised
+  llm: llama-swappy: slots=8, context=24576 tok/request -> workers=8 (explicit)
+  llm: chunks 0/80 (ok 0, salv 0, rej 0), units 0/0, 0 batch(es), 0s
+  llm: chunks 2/80 (ok 2, salv 0, rej 0), units 0/3, 0 batch(es), 10s, ~6m30s left
+  llm: chunks 4/80 (ok 4, salv 0, rej 0), units 0/9, 0 batch(es), 20s, ~6m21s left
+  llm: chunks 5/80 (ok 5, salv 0, rej 0), units 0/19, 0 batch(es), 30s, ~7m31s left
+  llm: chunks 9/80 (ok 7, salv 0, rej 0, toc 2), units 0/36, 0 batch(es), 40s, ~5m17s left
+  llm: chunks 30/80 (ok 25, salv 0, rej 0, toc 5), units 0/110, 0 batch(es), 50s, ~1m24s left
+  llm: chunks 33/80 (ok 28, salv 0, rej 0, toc 5), units 0/113, 0 batch(es), 1m00s, ~1m26s left
+  llm: batch 1: 45 fragment(s), 2052 chars
+  llm: chunks 42/80 (ok 37, salv 0, rej 0, toc 5), units 45/113, 1 batch(es), 1m10s, ~1m04s left
+  llm: batch 2: 68 fragment(s), 7976 chars
+  llm: done in 1m17s: 80 chunks (75 accepted, 0 salvaged, 0 rejected, 5 toc-skipped); 113 unit(s) sent in 2 batch(es), 27 fixed, 0 failed, 464 vocab-skipped
