@@ -47,7 +47,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from .llm_batch import BatchScheduler, ChunkState, DocVocab
+from .llm_batch import BATCH_CHARS, BatchScheduler, ChunkState, DocVocab
 from .llm_chunk import chunk_markdown
 from .llm_classify import classify_with_llm
 from .llm_client import _call_llm, _strip_thinking
@@ -289,6 +289,7 @@ def correct_with_llm(
     sampling: dict | None = None,
     retries: int = 2,
     workers: int | None = None,
+    batch_chars: int | None = None,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass (single strict mode).
 
@@ -312,11 +313,15 @@ def correct_with_llm(
     pipeline, chunks are independent and the output is reassembled strictly
     in original order.
 
-    ``workers`` None (default) auto-selects from the llama-swappy info
-    endpoint: min(slots, 8), falling back to 1 when the server does not
-    self-describe. When the server reports its per-request context, a rough
-    input+output estimate for the largest chunk is checked against it and
-    the pass is aborted (LlmContextError) when a chunk provably cannot fit.
+    ``batch_chars`` overrides the fragment-char volume packed into one
+    batched echo request (default: llm_batch.BATCH_CHARS).
+
+    ``workers`` None (default) runs a single worker: one batched request
+    already saturates the server's decode (benchmarked; --llm-workers
+    overrides). The llama-swappy probe still provides the per-request
+    context check: a rough input+output estimate for the largest chunk is
+    compared against the reported contextSize and the pass is aborted
+    (LlmContextError) when a chunk provably cannot fit.
 
     Ctrl+C stops the pass instead of tearing it down: pending work is
     cancelled, nothing is written, and LlmInterrupted is raised carrying the
@@ -435,6 +440,7 @@ def correct_with_llm(
         states, {"cell": cell_prompt, "line": line_prompt}, vocab,
         model=model, endpoint=endpoint, api_key=api_key, sampling=sampling,
         retries=retries, stats=stats, lock=lock, pool=pool, note=note,
+        batch_chars=batch_chars if batch_chars else BATCH_CHARS,
         verbose=verbose,
     )
 

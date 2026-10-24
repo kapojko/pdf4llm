@@ -692,19 +692,17 @@ def test_probe_swappy_never_raises(monkeypatch):
     assert llm_server.probe_swappy("http://x/v1", "k") is None
 
 
-def test_resolve_workers_auto_from_slots(monkeypatch):
+def test_resolve_workers_default_is_one(monkeypatch):
+    # workers=None -> 1 regardless of the server's slot count: one batched
+    # request saturates the decode (slot scaling was a pre-batching effect)
     monkeypatch.setattr(llm_server, "probe_swappy", lambda ep, ak: SWAPPY_INFO)
     notes = []
-    w, entry = llm_server.resolve_workers("http://x", "k", "m-np4", 6000, None,
-                                   note=notes.append)
-    assert w == 4 and entry["key"] == "m-np4"        # min(slots, 8)
-    w8, _ = llm_server.resolve_workers("http://x", "k", "m-np8", 6000, None,
-                                note=notes.append)
-    assert w8 == 8                                    # capped at 8
-    w1, _ = llm_server.resolve_workers("http://x", "k", "m-np1", 6000, None,
-                                note=notes.append)
-    assert w1 == 1                                    # np=1 -> sequential
-    assert any("workers=4" in n for n in notes)
+    for key in ("m-np1", "m-np4", "m-np8"):
+        w, entry = llm_server.resolve_workers("http://x", "k", key, 6000, None,
+                                       note=notes.append)
+        assert w == 1 and entry["key"] == key
+    assert any("workers=1" in n for n in notes)
+    assert any("slots=4" in n for n in notes)   # slots still surfaced
 
 
 def test_resolve_workers_explicit_overrides_slots(monkeypatch):
@@ -762,10 +760,10 @@ def test_correct_with_llm_records_swappy_and_auto_workers(monkeypatch):
                         lambda system_prompt, chunk, *a, **kw: (_fixed(chunk), None))
     out, stats = llm_run.correct_with_llm(
         PAR_TEXT, "m", "http://x", "k", verbose=False, classify=False,
-        max_chars=MAXC)   # workers=None -> auto: min(4 slots, 4) = 4
+        max_chars=MAXC)   # workers=None -> default 1 (slots not translated)
     assert out == _fixed(_prep(PAR_TEXT))
     assert stats["swappy"] == {"key": "m", "slots": 4,
-                               "context_per_request": 36864, "workers": 4}
+                               "context_per_request": 36864, "workers": 1}
 
 
 def test_estimate_chunk_tokens_sanity():

@@ -24,11 +24,12 @@ from .llm_client import _CHARS_PER_TOKEN
 # Slack for the system prompt, retry hint, code-fence wrapping and estimator
 # error, added on top of the estimated input+output tokens.
 _CTX_MARGIN_TOKENS = 512
-# Cap on auto-selected workers. Measured on ling-3.0-tiny-np8 (2026-10):
-# w4→w8 ≈ 1.75x aggregate throughput (268s vs 470s on an 80-chunk fragment);
-# w16 gave no further gain (264s) — the GPU is saturated at ~8 streams.
-# The cap only limits auto-selection; --llm-workers overrides it.
-_MAX_AUTO_WORKERS = 8
+# Worker default is 1: on the batched pipeline a single large request already
+# saturates the server's decode (benchmarked on ling-3.0-tiny-np8 with dflash,
+# 2026-10: w1/w2/w4/w8 all within run-to-run noise at batch 10000, w1 slightly
+# ahead; the pre-batching w4→w8 ≈ 1.75x scaling no longer applies). The probe
+# still provides the per-request context check and the slots/context line;
+# --llm-workers overrides the default.
 
 
 class LlmInterrupted(RuntimeError):
@@ -174,10 +175,12 @@ def resolve_workers(
     workers: int | None,
     note=None,
 ) -> tuple[int, dict | None]:
-    """Probe llama-swappy; auto-set workers and check the context fit.
+    """Probe llama-swappy; check the context fit; resolve the worker count.
 
-    Worker priority: explicit ``workers`` argument > ``min(slots, 8)`` from
-    the info endpoint > 1 (unknown server). The context check compares a
+    Worker priority: explicit ``workers`` argument > 1 (default — one batched
+    request already saturates the server's decode, so slots are no longer
+    translated into workers; the probe still provides the slots/context line
+    and the per-request context check). The context check compares a
     rough input+output estimate for the largest chunk against the per-request
     contextSize reported by llama-swappy (v1.3 semantics: total -c divided
     by slots) and raises LlmContextError when it does not fit. Missing data
@@ -219,12 +222,9 @@ def resolve_workers(
     if workers is not None:
         n_workers = max(1, workers)
         how = "explicit"
-    elif slots:
-        n_workers = min(int(slots), _MAX_AUTO_WORKERS)
-        how = "from llama-swappy slots"
     else:
         n_workers = 1
-        how = "default (slots unknown)"
+        how = "default"
     note(f"  llm: llama-swappy: slots={slots}, context={ctx} tok/request "
          f"-> workers={n_workers} ({how})")
     return n_workers, entry

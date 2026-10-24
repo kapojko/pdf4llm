@@ -1,8 +1,12 @@
-"""Local benchmark: ornith-1.5-9b-np4 vs ling-3.0-tiny-np8 (and worker counts).
+"""Local benchmark: worker counts and batch sizes on the batched pipeline.
 
-Usage: python bench_llm_local.py <name> <model-key> <workers>
-Appends one result row to bench_results.json. Per-run stdout is captured to
-bench_logs/<name>.log (the pass prints unconditional progress lines).
+Usage: python bench_llm_local.py <name> <model-key> <workers> [batch_chars]
+
+batch_chars (optional, default: leave production value 5000) overrides the
+scheduler's BATCH_CHARS for this run via a BatchScheduler.__init__ wrap —
+no production-code change. Appends one result row to bench_results.json.
+Per-run stdout is captured to bench_logs/<name>.log (the pass prints
+unconditional progress lines).
 """
 from __future__ import annotations
 
@@ -14,12 +18,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
-from pdf4llm import llm_run
+from pdf4llm import llm_batch, llm_run
 from pdf4llm.config import load_config
 
 NAME, MODEL, WORKERS = sys.argv[1], sys.argv[2], int(sys.argv[3])
+BATCH_CHARS = int(sys.argv[4]) if len(sys.argv) > 4 else None
 cfg = load_config()
 ENDPOINT, API_KEY = cfg["endpoint"], cfg["api_key"]
+
+# batch-size override (bench-only): force every BatchScheduler instance of
+# this run to pack BATCH_CHARS-char batches
+if BATCH_CHARS is not None:
+    _orig_init = llm_batch.BatchScheduler.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        kwargs["batch_chars"] = BATCH_CHARS
+        _orig_init(self, *args, **kwargs)
+
+    llm_batch.BatchScheduler.__init__ = _patched_init
 
 TEXT = Path("out/CH32V208DS0 2.7 2026-06-01.md").read_text(encoding="utf-8")
 
@@ -68,8 +84,20 @@ def main() -> None:
     out_lines = corrected.split("\n")
     changed_lines = sum(1 for a, b in zip(in_lines, out_lines) if a != b)
 
+    # batch-size drift measurement (llm_batch._FAIL_LOG_CAP log): mean
+    # ordinal of failures within their batches + coarse histogram. Flat
+    # per-ordinal distribution -> batch can grow; tail-clustered -> ceiling.
+    fail_log = stats.get("unit_fail_log", [])
+    ordinals = [e["ordinal"] for e in fail_log if e.get("ordinal")]
+    hist = {"1-4": 0, "5-8": 0, "9-16": 0, "17+": 0}
+    for o in ordinals:
+        hist["1-4" if o <= 4 else "5-8" if o <= 8 else "9-16" if o <= 16 else "17+"] += 1
+
     result = {
         "name": NAME, "model": MODEL, "workers": WORKERS,
+        "batch_chars": BATCH_CHARS if BATCH_CHARS is not None else 5000,
+        "fail_ordinal_mean": round(sum(ordinals) / len(ordinals), 2) if ordinals else None,
+        "fail_ordinal_hist": hist if ordinals else None,
         "load_switch_secs": round(load_secs, 1),
         "wall_secs": round(wall, 1),
         "chars_per_sec": round(len(TEXT) / wall),

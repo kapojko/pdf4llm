@@ -38,11 +38,15 @@ from .llm_verify import (
 )
 
 
-# ~5k chars of *fragments* per batched call (context rows attached once per
-# row-group, not per cell; slot context is ~24k, so input is not the
-# constraint — generated output length is; the output cap scales with the
-# fragment total, see llm_client.output_cap_chars).
-BATCH_CHARS = 5000
+# ~10k chars of *fragments* per batched call (context rows attached once per
+# row-group, not per cell; slot context is 32k tok/request, so input is not
+# the constraint — generated output length is; the output cap scales with
+# the fragment total, see llm_client.output_cap_chars).
+# Benchmarked on ling-3.0-tiny-np8 (2026-10, batched pipeline, dflash
+# server): 10k beat 5k by ~16% wall time (77-102s vs 93-106s on the 80-chunk
+# CH32V208DS0 fixture); 20k added nothing and truncated once. Quality
+# (75/80 chunks accepted) was identical across 2.5k/5k/10k/20k.
+BATCH_CHARS = 10000
 
 # Failures per unit are logged for the batch-size drift measurement: flat
 # per-ordinal failure distribution -> batch size can grow; tail-clustered ->

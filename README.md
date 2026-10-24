@@ -53,8 +53,9 @@ exit results); the final exit code is the worst per-file code.
 | `--dry-run` | show the full plan (locate result, cleanup actions, output/meta/copy paths) without converting, writing, deleting or prompting |
 | `--version` | print the pdf4llm version and exit |
 | `--llm` | run local-LLM broken-text correction (default **off**) |
-| `--llm-workers N` | parallel LLM chunk requests. Default: **auto** from the llama-swappy info endpoint (`min(slots, 8)`), else 1; an explicit value overrides the server |
+| `--llm-workers N` | parallel LLM chunk requests; default **1** (rationale: see the llama-swappy section below) |
 | `--llm-chunk-chars N` | max chunk size (chars) for the LLM pass; default **2000** (config key `llm_chunk_chars`). Smaller chunks are more stable on small local models |
+| `--llm-batch-chars N` | fragment-char volume packed into one batched LLM echo request; default **10000**. Benchmarked on ling-3.0-tiny-np8: 10k ≈ 16% faster than 5k, 20k no further gain |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
@@ -204,10 +205,7 @@ elapsed time. With
 a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
 self-description endpoint and:
 
-- sets the number of workers automatically to `min(slots, 8)` (stream-scaling
-  measured on ling-3.0-tiny-np8 with the pre-batching pipeline: w4→w8 ≈ 1.75x
-  aggregate throughput; w16 gave no further gain — the GPU saturates at ~8
-  streams); an explicit `--llm-workers` overrides this;
+- runs with **1 worker by default**: on the batched pipeline a single large request already saturates the server's decode (benchmarked on ling-3.0-tiny-np8 with dflash, 2026-10: w1/w2/w4/w8 within run-to-run noise at batch 10000; the pre-batching w4→w8 ≈ 1.75x scaling no longer applies). Slots are still surfaced in the probe line, and an explicit `--llm-workers` overrides the default;
 - reads the per-request `contextSize` (total `-c` divided by slots) and checks
   a rough token estimate (input + up to 2x-size output + margin,
   ~3.5 chars/token) for the **largest actual chunk** against it; if a chunk
