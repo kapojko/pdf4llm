@@ -233,7 +233,8 @@ def test_cli_discovery_compact_list(fake_llm, tree: Path):
     # root printed once, relative paths, action column, per-line reason (mixed)
     assert f"--locate-mode update-all under {tree.resolve()}" in res.output
     assert "fresh.pdf  — already current" in res.output
-    assert res.output.count("fresh.pdf") == 1
+    # list line + per-file dry-run 'source:' line
+    assert res.output.count("fresh.pdf") == 2
 
 
 def test_cli_discovery_shared_reason_grouped(fake_llm, tree: Path):
@@ -271,10 +272,22 @@ def test_cli_discovery_without_index_errors(fake_llm, tmp_path: Path):
 
 def test_cli_discovery_dry_run_lists_without_prompt(fake_llm, tree: Path):
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run"])
+        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run",
+        "--no-llm"])
     assert res.exit_code == 0
     assert "2 file(s)" in res.output
-    assert "dry-run" in res.output
+    # unified with explicit-input dry-run: per-file would-write details
+    assert "would write:" in res.output
+    assert "dry-run: nothing written" in res.output
+
+
+def test_cli_discovery_dry_run_shows_copy_plan(fake_llm, tree: Path):
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run",
+        "--no-llm", "--copy", str(tree / "copies")])
+    assert res.exit_code == 0, res.output
+    assert "would copy to:" in res.output
+    assert "--copy with --locate-mode" in res.output  # collision warning
 
 
 def test_cli_discovery_declined_aborts(fake_llm, tree: Path, monkeypatch):

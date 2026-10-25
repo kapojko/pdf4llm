@@ -328,7 +328,7 @@ def convert_cmd(
         inputs = _run_discovery(
             locate, locate_mode, rebuild=locate_rebuild, force=force,
             dry_run=dry_run, llm_enabled=llm_flag, model_override=model,
-            pages=pages, out=out,
+            pages=pages, out=out, copy_to=copy_to,
         )
         discovered = True
     else:
@@ -415,6 +415,7 @@ def _run_discovery(
     model_override: str | None,
     pages: str | None,
     out: Path | None,
+    copy_to: Path | None,
 ) -> list[Path]:
     """Discover files via --locate-mode, show them for approval, return paths."""
     if locate_mode not in _LOCATE_MODES:
@@ -433,6 +434,13 @@ def _run_discovery(
         typer.echo(
             "warning: --out with --locate-mode gathers every output into one "
             "directory — same-basename files will overwrite each other",
+            err=True,
+        )
+    if copy_to is not None:
+        typer.echo(
+            "warning: --copy with --locate-mode gathers copies of every output "
+            "into one directory — same-basename files will overwrite each other "
+            "there too",
             err=True,
         )
 
@@ -471,14 +479,13 @@ def _run_discovery(
 
     _print_discovery_list(entries, locate.expanduser().resolve(), locate_mode)
 
-    if dry_run:
-        typer.echo("dry-run: nothing converted, written, deleted or prompted.")
-        raise typer.Exit(0)
-    if not force and not prune.confirm(
+    if not dry_run and not force and not prune.confirm(
         f"Proceed with {len(entries)} file(s)? [y/N] "
     ):
         typer.echo("aborted: file list declined — nothing processed.", err=True)
         raise typer.Exit(1)
+    # no early dry-run exit: the caller's per-file _process_one(dry_run=True)
+    # pass prints the would-write / would-copy details, same as explicit inputs
     return [e.pdf for e in entries]
 
 
