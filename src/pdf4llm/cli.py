@@ -590,14 +590,18 @@ def _process_one(
         meta["checks"] = checks.run_checks(text, meta["page_chars"])
         convert.write_meta(meta)
 
-        if llm_stats.get("chunks_rejected") or llm_stats.get("chunks_salvaged"):
-            typer.echo(
-                f"  llm: {llm_stats['chunks_accepted']}/{llm_stats['chunks_total']} "
-                f"chunks accepted, {llm_stats.get('chunks_salvaged', 0)} salvaged "
-                f"({llm_stats.get('blocks_fixed', 0)} blocks fixed), "
-                f"{llm_stats['chunks_rejected']} rejected "
-                "(originals kept — see meta.json)"
-            )
+        # always shown (like the layout-engine 'done' line): one line per
+        # file summarizing the pass, even when nothing was salvaged/rejected
+        note = (
+            " (originals kept — see meta.json)"
+            if llm_stats.get("chunks_rejected") else ""
+        )
+        typer.echo(
+            f"  llm: {llm_stats['chunks_accepted']}/{llm_stats['chunks_total']} "
+            f"chunks accepted, {llm_stats.get('chunks_salvaged', 0)} salvaged "
+            f"({llm_stats.get('blocks_fixed', 0)} blocks fixed), "
+            f"{llm_stats['chunks_rejected']} rejected{note}"
+        )
 
     # --copy comes LAST: the copy must be of the final (post-LLM) .md
     if copy_to is not None:
