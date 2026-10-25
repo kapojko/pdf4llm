@@ -24,6 +24,7 @@ import getpass
 import os
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pymupdf
 import typer
@@ -31,6 +32,7 @@ import typer
 from . import __version__, checks, config as cfg, convert, prune
 from .llm_run import correct_with_llm
 from .llm_server import LlmContextError, LlmInterrupted, probe_swappy
+from .progress import LineProgress
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -264,7 +266,8 @@ def convert_cmd(
              "previously converted files; convert: update-all plus PDFs with "
              "same-basename .docx/.txt/.md siblings; convert-all: every PDF. "
              "Modes nest: update < update-all < convert < convert-all. "
-             "The discovered list is shown for approval (--force skips).",
+             "Default: update. The discovered list is shown for approval "
+             "(--force skips).",
     ),
     copy_to: Path = typer.Option(
         None, "--copy", metavar="FOLDER",
@@ -312,12 +315,16 @@ def convert_cmd(
         if not inputs:
             raise typer.Exit(0)
     if not inputs:
-        if locate is None or locate_mode is None:
+        if locate is None:
             typer.echo(
                 "error: no input file(s) given "
-                "(or use --locate FOLDER together with --locate-mode)", err=True,
+                "(or use --locate FOLDER, optionally with --locate-mode)",
+                err=True,
             )
             raise typer.Exit(2)
+        if locate_mode is None:
+            locate_mode = "update"
+            typer.echo("locate: no --locate-mode given — defaulting to 'update'")
         inputs = _run_discovery(
             locate, locate_mode, rebuild=locate_rebuild, force=force,
             dry_run=dry_run, llm_enabled=llm_flag, model_override=model,
@@ -348,6 +355,54 @@ def convert_cmd(
         if code == 130:  # user interrupt: do not start the remaining files
             break
     raise typer.Exit(max(codes))
+
+
+def _filter_existing(entries: list) -> list:
+    """Drop entries whose PDF no longer exists (stale index); warn about them.
+
+    Discovery trusts the index and does not stat every candidate, so vanished
+    files surface only here — checked in parallel over the (small) selected
+    set.
+    """
+    from .locate_index import DiscoveryEntry
+
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        exists = list(ex.map(lambda e: e.pdf.is_file(), entries))
+    kept, missing = [], []
+    for e, ok in zip(entries, exists):
+        (kept if ok else missing).append(e)
+    if missing:
+        typer.echo(
+            f"locate: warning: {len(missing)} selected file(s) no longer exist "
+            "(stale index? --locate-rebuild refreshes it):", err=True,
+        )
+        for e in missing:
+            typer.echo(f"  {e.pdf}", err=True)
+    return kept
+
+
+def _print_discovery_list(entries: list, folder: Path, mode: str) -> None:
+    """Print the discovered files compactly: root once, relative paths,
+    action column, shared reason summarized once (per-line when mixed)."""
+    def rel(p: Path) -> str:
+        try:
+            return p.resolve().relative_to(folder).as_posix()
+        except ValueError:
+            return str(p)
+
+    typer.echo(
+        f"locate: {len(entries)} file(s) selected by --locate-mode {mode} "
+        f"under {folder}"
+    )
+    reasons = {e.reason for e in entries}
+    common = None if len(reasons) > 1 else next(iter(reasons))
+    for n, e in enumerate(entries, 1):
+        line = f"{n:4}. {e.action:<9} {rel(e.pdf)}"
+        if common is None:
+            line += f"  — {e.reason}"
+        typer.echo(line)
+    if common is not None:
+        typer.echo(f"  reason (all {len(entries)}): {common}")
 
 
 def _run_discovery(
@@ -393,24 +448,28 @@ def _run_discovery(
             raise typer.Exit(3)
 
     try:
+        prog = LineProgress()
+
+        def on_progress(done: int, total: int) -> None:
+            prog.update(
+                f"locate: checking {total} PDF(s) from index... {done}/{total}")
+
         entries = _discover_files(
             locate, locate_mode, rebuild=rebuild,
             current_version=__version__, current_model=current_model,
-            llm_enabled=llm_enabled,
+            llm_enabled=llm_enabled, progress=on_progress,
         )
+        prog.finish()
     except DiscoveryError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2)
 
+    entries = _filter_existing(entries)
     if not entries:
         typer.echo(f"locate: nothing to do — no files match --locate-mode {locate_mode}")
         raise typer.Exit(0)
 
-    typer.echo(
-        f"locate: {len(entries)} file(s) selected by --locate-mode {locate_mode}:"
-    )
-    for n, e in enumerate(entries, 1):
-        typer.echo(f" {n:3}. {e.pdf}  {e.action}  ({e.reason})")
+    _print_discovery_list(entries, locate.expanduser().resolve(), locate_mode)
 
     if dry_run:
         typer.echo("dry-run: nothing converted, written, deleted or prompted.")

@@ -129,7 +129,7 @@ def test_discover_actions(tree: Path):
     assert by_stem["plain"].action == "convert"
     assert "plain.docx" in by_stem["plain"].reason
     assert by_stem["mdonly"].action == "convert"
-    assert "mdonly.md" in by_stem["mdonly"].reason
+    assert "overwrite .md" in by_stem["mdonly"].reason
     assert by_stem["bare"].action == "convert"
 
 
@@ -149,6 +149,22 @@ def test_discover_rebuild_builds_index(tmp_path: Path):
 def test_discover_unknown_mode(tree: Path):
     with pytest.raises(DiscoveryError):
         discover(tree, "nope", current_version=__version__)
+
+
+def test_discover_trusts_index_for_existence(tree: Path):
+    # vanished PDF is still evaluated from the index (no stat walk);
+    # dropping it is the caller's (CLI) job via _filter_existing
+    (tree / "stale.pdf").unlink()
+    got = [e.pdf.stem for e in discover(
+        tree, "update", current_version=__version__, current_model="m1")]
+    assert got == ["stale"]
+
+
+def test_discover_progress_callback(tree: Path):
+    seen: list[tuple[int, int]] = []
+    discover(tree, "update-all", current_version=__version__,
+             current_model="m1", progress=lambda d, t: seen.append((d, t)))
+    assert seen and seen[-1] == (len(seen), len(seen))
 
 
 def test_discover_llm_enabled_missing_model_is_stale(tree: Path):
@@ -188,6 +204,54 @@ def test_cli_locate_mode_with_inputs_errors(fake_llm, tree: Path):
     res = runner.invoke(cli_mod.app, [
         "stale.pdf", "--locate", str(tree), "--locate-mode", "update-all"])
     assert res.exit_code == 2
+
+
+def test_cli_locate_without_mode_defaults_to_update(fake_llm, tree: Path,
+                                                    fake_process):
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--force", "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert "defaulting to 'update'" in res.output
+    assert [p.stem for p in fake_process] == ["stale"]
+
+
+def test_cli_discovery_missing_selected_files_warned(fake_llm, tree: Path,
+                                                     fake_process):
+    (tree / "stale.pdf").unlink()  # index still lists it
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--locate-mode", "update", "--force",
+        "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert "no longer exist" in res.output
+    assert fake_process == []  # vanished file dropped, not passed on
+
+
+def test_cli_discovery_compact_list(fake_llm, tree: Path):
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    # root printed once, relative paths, action column, per-line reason (mixed)
+    assert f"--locate-mode update-all under {tree.resolve()}" in res.output
+    assert "fresh.pdf  — already current" in res.output
+    assert res.output.count("fresh.pdf") == 1
+
+
+def test_cli_discovery_shared_reason_grouped(fake_llm, tree: Path):
+    # update mode on a version-homogeneous tree: one shared reason, one line
+    for p in tree.glob("*.meta.json"):
+        p.unlink()
+    (tree / "fresh.meta.json").write_text(
+        json.dumps({"pdf4llm_version": "0.5.0", "llm_model": "m1"}),
+        encoding="utf-8")
+    (tree / "stale.meta.json").write_text(
+        json.dumps({"pdf4llm_version": "0.5.0", "llm_model": "m1"}),
+        encoding="utf-8")
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run",
+        "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert "reason (all 2):" in res.output
+    assert res.output.count("converted with pdf4llm 0.5.0") == 1
 
 
 def test_cli_locate_mode_unknown_errors(fake_llm, tree: Path):

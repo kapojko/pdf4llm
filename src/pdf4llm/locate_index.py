@@ -4,6 +4,11 @@ Index: `.pdf4llm_locate.idx` inside the locate folder maps lowercase file
 name -> absolute path, so repeated --locate runs (especially over slow
 network shares) skip the expensive recursive directory walk entirely.
 
+Discovery trusts the index: it does NOT stat every indexed PDF to check it
+still exists (thousands of slow network round-trips). Existence of the
+files actually selected for processing is verified separately (small set,
+parallel); vanished files are reported as stale index entries.
+
 Discovery (--locate-mode without explicit input names): selects the files
 to process from the folder using the SAME index (no second walk). The
 modes nest, each including the previous one:
@@ -26,9 +31,11 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 _LOCATE_IDX_NAME = ".pdf4llm_locate.idx"
 _LOCATE_IDX_HEADER = "pdf4llm-locate-index 1"
@@ -152,7 +159,7 @@ def _reason_for(pdf: Path, stale: str | None, has_meta: bool) -> tuple[str, str]
     elif has_meta:
         parts.append("already current")
     if md is not None:
-        parts.append(f"overwrite {md.name}")
+        parts.append("overwrite .md")  # same stem, name adds no information
     if delete:
         parts.append("delete " + ", ".join(d.name for d in delete))
     if stale:
@@ -162,6 +169,9 @@ def _reason_for(pdf: Path, stale: str | None, has_meta: bool) -> tuple[str, str]
     return "convert", "; ".join(parts) or "new file"
 
 
+_DISCOVERY_WORKERS = 32  # parallel meta.json/side-file network ops
+
+
 def discover(
     folder: Path,
     mode: str,
@@ -169,11 +179,17 @@ def discover(
     current_version: str = "",
     current_model: str | None = None,
     llm_enabled: bool = True,
+    progress: Callable[[int, int], None] | None = None,
 ) -> list[DiscoveryEntry]:
     """Collect the files to process for `mode` (see module docstring).
 
     Uses the locate index; never rebuilds it implicitly. Raises
     DiscoveryError on a bad folder/mode or a missing/unusable index.
+
+    Per-candidate work (meta.json staleness read, side-file stats) runs in a
+    thread pool — on network shares it is latency-bound, so parallelism cuts
+    wall time drastically. `progress(done, total)` is called from the caller's
+    thread as candidates complete (for a progress line).
     """
     if mode not in MODES:
         raise DiscoveryError(
@@ -191,17 +207,16 @@ def discover(
                 f"no usable locate index in {folder} — "
                 "run once with --locate-rebuild to build it")
 
-    # candidate PDFs from the index, existing on disk right now
+    # candidate PDFs straight from the index; existence is NOT checked here
+    # (trusting the index avoids a stat per PDF over the network)
     pdfs: set[Path] = set()
     for name, paths in index.items():
         if name.endswith(".pdf"):
-            for p in paths:
-                pdf_path = Path(p)
-                if pdf_path.is_file():
-                    pdfs.add(pdf_path)
+            pdfs.update(Path(p) for p in paths)
+    ordered = sorted(pdfs, key=lambda p: p.as_posix().lower())
+    total = len(ordered)
 
-    selected: list[DiscoveryEntry] = []
-    for pdf in sorted(pdfs, key=lambda p: p.as_posix().lower()):
+    def evaluate(pdf: Path) -> DiscoveryEntry | None:
         meta_path = pdf.with_suffix(".meta.json")
         has_meta = meta_path.is_file()
         stale = (
@@ -210,14 +225,27 @@ def discover(
             if has_meta else None
         )
         if mode == "update" and not stale:
-            continue
+            return None
         if mode == "update-all" and not has_meta:
-            continue
+            return None
         if mode == "convert" and not has_meta:
             delete, md = _side_files(pdf)
             if not delete and md is None:
-                continue
+                return None
         # convert-all: everything
         action, reason = _reason_for(pdf, stale, has_meta)
-        selected.append(DiscoveryEntry(pdf, action, reason))
+        return DiscoveryEntry(pdf, action, reason)
+
+    selected: list[DiscoveryEntry] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=_DISCOVERY_WORKERS) as ex:
+        futures = [ex.submit(evaluate, pdf) for pdf in ordered]
+        for fut in as_completed(futures):
+            done += 1
+            if progress is not None:
+                progress(done, total)
+            entry = fut.result()
+            if entry is not None:
+                selected.append(entry)
+    selected.sort(key=lambda e: e.pdf.as_posix().lower())
     return selected
