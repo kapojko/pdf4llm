@@ -38,6 +38,25 @@ def test_staleness_old_version(tmp_path: Path):
     assert "0.9.0" in staleness_reason(mp, __version__, "m1", llm_enabled=True)
 
 
+def test_staleness_patch_version_difference_not_stale(tmp_path: Path):
+    # patch-only differences (either direction) do not require an update
+    mp = _write_meta(tmp_path / "a.meta.json", pdf4llm_version="1.4.0")
+    assert staleness_reason(mp, "1.4.3", "m1", llm_enabled=True) is None
+    mp2 = _write_meta(tmp_path / "b.meta.json", pdf4llm_version="1.4.9")
+    assert staleness_reason(mp2, "1.4.0", "m1", llm_enabled=True) is None
+
+
+def test_staleness_minor_version_difference_stale(tmp_path: Path):
+    mp = _write_meta(tmp_path / "a.meta.json", pdf4llm_version="1.4.0")
+    r = staleness_reason(mp, "1.5.0", "m1", llm_enabled=True)
+    assert r is not None and "1.4.0" in r
+
+
+def test_staleness_unparseable_version_stale(tmp_path: Path):
+    mp = _write_meta(tmp_path / "a.meta.json", pdf4llm_version="dev")
+    assert staleness_reason(mp, __version__, "m1", llm_enabled=True) is not None
+
+
 def test_staleness_no_version_field(tmp_path: Path):
     mp = tmp_path / "a.meta.json"
     mp.write_text(json.dumps({"llm": False}), encoding="utf-8")

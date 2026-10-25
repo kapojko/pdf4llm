@@ -241,7 +241,6 @@ class BatchScheduler:
         self.producers_total = len(states)
         self.producers_done = 0
         self.batches_sent = 0
-        self.fail_reasons: Counter[str] = Counter()  # finalized (retry-exhausted) fails
         self.prog: LineProgress | None = None
         self.t0: float | None = None
         self.verbose = verbose  # gates TTY line-breaks before plain prints
@@ -333,25 +332,23 @@ class BatchScheduler:
     # -- live progress (main thread; text built under lock) --------------------
 
     def _progress_text_locked(self) -> str:
-        """One-line live state: settled chunks with outcomes, units, ETA.
+        """One-line live state: settled chunks with outcomes, ETA.
 
         A chunk is SETTLED when its producer finished and every unit it
         enqueued is resolved (fixed / failed / unchanged-echo) — the same
         condition under which finalize() would classify it, so the live
-        counts converge to the final summary.
+        counts converge to the final summary. Deliberately chunk-level
+        only: unit counts and failure reasons belong to the final summary
+        and meta.json, not to a (terminal-width-capped) progress line.
         """
         elapsed = time.monotonic() - self.t0
         total = self.producers_total
         ok = salv = rej = toc = settled = 0
-        units_done = units_total = failed = 0
         for cs in self.states:
             # only enqueued (batch) units are counted here: salvage fixes
             # resolve synchronously inside the producer, so a chunk settles
             # when its producer finished and every enqueued unit is resolved
             done_u = cs.enq_done
-            units_done += done_u
-            units_total += cs.units_enqueued
-            failed += cs.units_failed
             if cs.produced and done_u >= cs.units_enqueued:
                 settled += 1
                 if cs.toc_skipped:
@@ -365,20 +362,11 @@ class BatchScheduler:
         text = (
             f"  llm: chunks {settled}/{total} (ok {ok}, salv {salv}, rej {rej}"
             + (f", toc {toc}" if toc else "")
-            + f"), units {units_done}/{units_total}"
-            + (f" ({failed} failed)" if failed else "")
-            + f", {self.batches_sent} batch(es), {_fmt_duration(elapsed)}"
+            + f"), {self.batches_sent} batch(es), {_fmt_duration(elapsed)}"
         )
         if settled:
             eta = elapsed / settled * (total - settled)
             text += f", ~{_fmt_duration(eta)} left"
-        top = self.fail_reasons.most_common(1)
-        if top:
-            # 'llm error: ...' reasons can carry server/model text with
-            # non-ASCII (or wide) chars, which would break the padding
-            # arithmetic — keep printable ASCII only
-            reason = top[0][0][:40].encode("ascii", "replace").decode()
-            text += f" | top fail: {reason}"
         return text
 
     def stop_progress(self) -> None:
@@ -504,7 +492,6 @@ class BatchScheduler:
         cs.units_failed += 1
         cs.enq_done += 1
         self.stats["units_failed"] += 1
-        self.fail_reasons[reason.split(",")[0][:60]] += 1
         cs.note_reason(f"{u.where}: {reason}")
 
     # -- finalization (main thread, after run()) ------------------------------

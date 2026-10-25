@@ -16,8 +16,9 @@ modes nest, each including the previous one:
     update < update-all < convert < convert-all
 
   update      previously converted (meta.json present) files that are
-              stale: missing/invalid pdf4llm_version or llm_model, an
-              older pdf4llm version, or — when the LLM pass is enabled —
+              stale: missing/invalid pdf4llm_version or llm_model, a
+              pdf4llm version that differs in major.minor (patch-only
+              differences are accepted), or — when the LLM pass is enabled —
               a different LLM model than the one this run would use;
   update-all  all previously converted files (with meta.json);
   convert     update-all plus PDFs that have same-basename .docx/.txt/.md
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -121,8 +123,9 @@ def staleness_reason(
 ) -> str | None:
     """Return why the conversion recorded in meta_path is stale, else None.
 
-    Stale = meta.json missing/unreadable, no/other pdf4llm_version, or —
-    when the LLM pass is enabled — no/other llm_model.
+    Stale = meta.json missing/unreadable, a pdf4llm_version that differs in
+    major.minor (a patch-only difference is NOT stale), or — when the LLM
+    pass is enabled — no/other llm_model.
     """
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -132,7 +135,11 @@ def staleness_reason(
     if not ver:
         return "meta.json has no pdf4llm_version (pre-1.7 conversion)"
     if ver != current_version:
-        return f"converted with pdf4llm {ver}"
+        # patch-only differences (1.4.0 vs 1.4.3) do not make the file stale:
+        # only major.minor carries conversion-behaviour changes
+        mm_meta, mm_cur = _major_minor(str(ver)), _major_minor(current_version)
+        if mm_meta is None or mm_cur is None or mm_meta != mm_cur:
+            return f"converted with pdf4llm {ver}"
     if llm_enabled:
         m = meta.get("llm_model")
         if not m:
@@ -140,6 +147,12 @@ def staleness_reason(
         if m != current_model:
             return f"converted with model {m}"
     return None
+
+
+def _major_minor(version: str) -> tuple[int, int] | None:
+    """(major, minor) of an 'X.Y[.Z...]' version string, else None."""
+    m = re.match(r"(\d+)\.(\d+)", version.strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _side_files(pdf: Path) -> tuple[list[Path], Path | None]:

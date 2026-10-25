@@ -6,6 +6,7 @@ of --verbose.
 """
 from __future__ import annotations
 
+import shutil
 import sys
 import time
 
@@ -46,6 +47,13 @@ class LineProgress:
             return
         self._last = now
         if self.is_tty:
+            # a line wider than the terminal wraps, and the next '\r' would
+            # only return to the start of the LAST wrapped segment — in-place
+            # rewriting silently degrades into one printed line per update.
+            # Truncate to the (current) terminal width; -1 avoids the
+            # deferred-wrap quirk at the last column.
+            width = shutil.get_terminal_size().columns
+            text = text[:max(1, width - 1)]
             # leftover erasure goes AFTER the text: writing it before would
             # shift the new line right by len(pad) (visible as a jitter)
             pad = " " * max(0, self._last_len - len(text))
