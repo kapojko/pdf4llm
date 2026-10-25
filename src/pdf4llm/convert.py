@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import pymupdf
 from pymupdf.layout.MultiProcessWrapper import MultiProcessWrapper
 
-from . import checks
+from . import __version__, checks
 from .progress import LineProgress, _fmt_duration
 
 _WRAPPER: MultiProcessWrapper | None = None
@@ -252,6 +252,8 @@ def convert(pdf: Path, out_dir: Path, pages: str | None = None) -> tuple[Path, d
         "output": str(md_path),
         "page_chars": page_chars,
         "checks": result,
+        "pdf4llm_version": __version__,
+        "llm_model": None,  # filled in after the LLM pass (cli)
         "llm": False,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

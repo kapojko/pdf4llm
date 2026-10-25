@@ -4,11 +4,12 @@ No subcommands. One command:
     pdf4llm <input.pdf> [more.pdf ...] [options]
 
 Flow (per input PDF):
-  1. validate the input PDF (--locate can find it by name in a folder)
+  1. validate the input PDF (--locate can find it by name in a folder;
+     --locate + --locate-mode can discover whole file sets instead)
   2. prompt-delete same-basename .docx/.txt and prompt-overwrite .md
      (skip all prompts with --force; --dry-run only reports them)
   3. convert to Markdown (+ .meta.json), UTF-8 no BOM
-  4. optional --llm broken-text correction
+  4. LLM broken-text correction (default on; --no-llm skips)
   5. optional --copy of the .md into an additional folder
   6. print a one-line sanity score; exit non-zero if it scored badly
 
@@ -23,7 +24,6 @@ import getpass
 import os
 import shutil
 import time
-from datetime import datetime
 
 import pymupdf
 import typer
@@ -104,62 +104,15 @@ def _setup_llm() -> None:
                 )
 
 
-_LOCATE_IDX_NAME = ".pdf4llm_locate.idx"
-_LOCATE_IDX_HEADER = "pdf4llm-locate-index 1"
-
-
-def _locate_index_path(folder: Path) -> Path:
-    return folder / _LOCATE_IDX_NAME
-
-
-def _locate_build_index(folder: Path) -> dict[str, list[str]]:
-    """Walk `folder` once, write the on-disk index, return the name mapping.
-
-    The index maps lowercase file name -> list of absolute path strings, so
-    repeated --locate runs (especially over slow network shares) skip the
-    expensive recursive directory walk entirely.
-    """
-    idx_path = _locate_index_path(folder)
-    mapping: dict[str, list[str]] = {}
-    lines: list[str] = [
-        _LOCATE_IDX_HEADER,
-        f"folder={folder.as_posix()}",
-        f"built={datetime.now().isoformat(timespec='seconds')}",
-    ]
-    for root, _dirs, files in os.walk(folder):
-        for name in files:
-            if name == _LOCATE_IDX_NAME:
-                continue
-            full = os.path.join(root, name)
-            mapping.setdefault(name.lower(), []).append(full)
-            lines.append(f"{name.lower()}\t{full}")
-    tmp_path = idx_path.with_name(idx_path.name + ".tmp")
-    try:
-        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(tmp_path, idx_path)
-    except OSError:
-        pass  # unwritable share: locate still works, just without caching
-    return mapping
-
-
-def _locate_load_index(folder: Path) -> dict[str, list[str]] | None:
-    """Load the index for `folder`; None if missing, corrupt or for another folder."""
-    try:
-        lines = _locate_index_path(folder).read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-    if (
-        len(lines) < 4
-        or lines[0] != _LOCATE_IDX_HEADER
-        or lines[1] != f"folder={folder.as_posix()}"
-    ):
-        return None
-    mapping: dict[str, list[str]] = {}
-    for line in lines[3:]:
-        name, sep, full = line.partition("\t")
-        if sep:
-            mapping.setdefault(name, []).append(full)
-    return mapping
+_LOCATE_IDX_NAME = ".pdf4llm_locate.idx"  # re-exported for tests/back-compat
+from .locate_index import (  # noqa: E402
+    DiscoveryError,
+    MODES as _LOCATE_MODES,
+    build_index as _locate_build_index,
+    load_index as _locate_load_index,
+    locate_index_path as _locate_index_path,
+    discover as _discover_files,
+)
 
 
 def _locate_files(inputs: list[Path], folder: Path, rebuild: bool = False) -> list[Path]:
@@ -279,7 +232,7 @@ def _version_callback(value: bool) -> None:
 @app.command()
 def convert_cmd(
     inputs: list[Path] = typer.Argument(
-        None, help="Path(s) to PDF file(s) (optional with --llm-auth)"
+        None, help="Path(s) to PDF file(s); omit with --locate + --locate-mode"
     ),
     version: bool = typer.Option(
         None, "--version", callback=_version_callback, is_eager=True,
@@ -299,7 +252,19 @@ def convert_cmd(
     ),
     locate_rebuild: bool = typer.Option(
         False, "--locate-rebuild",
-        help="Force a fresh --locate scan, rewriting the index file in FOLDER",
+        help="Force a fresh --locate scan, rewriting the index file in FOLDER "
+             "(the only way discovery refreshes the index — it is never "
+             "rebuilt implicitly)",
+    ),
+    locate_mode: str = typer.Option(
+        None, "--locate-mode", metavar="MODE",
+        help="With --locate and NO input names: pick files from FOLDER. "
+             "update: previously converted (meta.json) files that are stale "
+             "(older pdf4llm version or different LLM model); update-all: all "
+             "previously converted files; convert: update-all plus PDFs with "
+             "same-basename .docx/.txt/.md siblings; convert-all: every PDF. "
+             "Modes nest: update < update-all < convert < convert-all. "
+             "The discovered list is shown for approval (--force skips).",
     ),
     copy_to: Path = typer.Option(
         None, "--copy", metavar="FOLDER",
@@ -312,7 +277,8 @@ def convert_cmd(
              "paths) without converting, writing, deleting or prompting",
     ),
     llm_flag: bool = typer.Option(
-        False, "--llm", help="Run local-LLM broken-text correction (default off)"
+        True, "--llm/--no-llm",
+        help="Run local-LLM broken-text correction (default on; --no-llm skips it)",
     ),
     llm_auth: bool = typer.Option(
         False, "--llm-auth", help="Interactively set & save LLM credentials"
@@ -346,10 +312,28 @@ def convert_cmd(
         if not inputs:
             raise typer.Exit(0)
     if not inputs:
-        typer.echo("error: no input file(s) given", err=True)
-        raise typer.Exit(2)
+        if locate is None or locate_mode is None:
+            typer.echo(
+                "error: no input file(s) given "
+                "(or use --locate FOLDER together with --locate-mode)", err=True,
+            )
+            raise typer.Exit(2)
+        inputs = _run_discovery(
+            locate, locate_mode, rebuild=locate_rebuild, force=force,
+            dry_run=dry_run, llm_enabled=llm_flag, model_override=model,
+            pages=pages, out=out,
+        )
+        discovered = True
+    else:
+        discovered = False
+        if locate_mode is not None:
+            typer.echo(
+                "error: --locate-mode applies only when --locate is used "
+                "without input file names", err=True,
+            )
+            raise typer.Exit(2)
 
-    if locate is not None:
+    if locate is not None and not discovered:
         inputs = _locate_files(inputs, locate, rebuild=locate_rebuild)
 
     codes: list[int] = []
@@ -364,6 +348,79 @@ def convert_cmd(
         if code == 130:  # user interrupt: do not start the remaining files
             break
     raise typer.Exit(max(codes))
+
+
+def _run_discovery(
+    locate: Path,
+    locate_mode: str,
+    rebuild: bool,
+    force: bool,
+    dry_run: bool,
+    llm_enabled: bool,
+    model_override: str | None,
+    pages: str | None,
+    out: Path | None,
+) -> list[Path]:
+    """Discover files via --locate-mode, show them for approval, return paths."""
+    if locate_mode not in _LOCATE_MODES:
+        typer.echo(
+            f"error: unknown --locate-mode '{locate_mode}' "
+            f"(valid: {', '.join(_LOCATE_MODES)})", err=True,
+        )
+        raise typer.Exit(2)
+    if pages:
+        typer.echo(
+            "error: --pages cannot be combined with --locate-mode discovery "
+            "(it would produce partial conversions of a whole folder)", err=True,
+        )
+        raise typer.Exit(2)
+    if out is not None:
+        typer.echo(
+            "warning: --out with --locate-mode gathers every output into one "
+            "directory — same-basename files will overwrite each other",
+            err=True,
+        )
+
+    current_model: str | None = None
+    if llm_enabled:
+        c = cfg.load_config()
+        current_model = model_override or c.get("model")
+        if not current_model:
+            typer.echo(
+                "error: --locate-mode with the LLM pass enabled requires LLM "
+                "config. Run once with --llm-auth, or pass --no-llm.", err=True,
+            )
+            raise typer.Exit(3)
+
+    try:
+        entries = _discover_files(
+            locate, locate_mode, rebuild=rebuild,
+            current_version=__version__, current_model=current_model,
+            llm_enabled=llm_enabled,
+        )
+    except DiscoveryError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2)
+
+    if not entries:
+        typer.echo(f"locate: nothing to do — no files match --locate-mode {locate_mode}")
+        raise typer.Exit(0)
+
+    typer.echo(
+        f"locate: {len(entries)} file(s) selected by --locate-mode {locate_mode}:"
+    )
+    for n, e in enumerate(entries, 1):
+        typer.echo(f" {n:3}. {e.pdf}  {e.action}  ({e.reason})")
+
+    if dry_run:
+        typer.echo("dry-run: nothing converted, written, deleted or prompted.")
+        raise typer.Exit(0)
+    if not force and not prune.confirm(
+        f"Proceed with {len(entries)} file(s)? [y/N] "
+    ):
+        typer.echo("aborted: file list declined — nothing processed.", err=True)
+        raise typer.Exit(1)
+    return [e.pdf for e in entries]
 
 
 def _process_one(
@@ -463,6 +520,7 @@ def _process_one(
             return 130
         md_path.write_text(text, encoding="utf-8")
         meta["llm"] = llm_stats
+        meta["llm_model"] = model
         meta["checks"] = checks.run_checks(text, meta["page_chars"])
         convert.write_meta(meta)
 

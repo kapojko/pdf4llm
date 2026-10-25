@@ -47,12 +47,13 @@ exit results); the final exit code is the worst per-file code.
 | `-o/--out DIR` | output dir, **default = same folder as the PDF** |
 | `--pages A-B,12,15` | page subset (useful for short LLM tests) |
 | `--locate FOLDER` | treat `input` as a file **name** and search for it recursively in FOLDER; must match exactly one file (case-insensitive) or the run aborts with the match list. Uses an index file (`.pdf4llm_locate.idx`) inside FOLDER so repeat runs skip the slow recursive scan (big win on network shares); a missing or vanished match triggers one automatic rebuild, and all inputs are matched from a single scan |
-| `--locate-rebuild` | force a fresh `--locate` scan and rewrite the index file in FOLDER |
+| `--locate-rebuild` | force a fresh `--locate` scan and rewrite the index file in FOLDER (also the only way `--locate-mode` discovery refreshes the index — it is never rebuilt implicitly) |
+| `--locate-mode MODE` | with `--locate FOLDER` and **no input names**: discover the files to process from the index. `update` = previously converted (meta.json present) files that are stale — older pdf4llm version or different LLM model; `update-all` = all previously converted files; `convert` = update-all plus PDFs that have same-basename `.docx`/`.txt`/`.md` siblings; `convert-all` = every PDF. Modes nest: `update < update-all < convert < convert-all`. The numbered result list is shown for approval (one y/N; `--force` approves, `--dry-run` lists without prompting) |
 | `--copy FOLDER` | after the (optional) LLM pass, additionally copy the **final** `.md` into FOLDER (created if missing); if the file exists there, ask y/N — or overwrite silently with `--force` |
 | `--force` | skip all y/N confirmations (delete / overwrite / copy-overwrite); actions are still logged to `.pdf4llm_prune.log` |
 | `--dry-run` | show the full plan (locate result, cleanup actions, output/meta/copy paths) without converting, writing, deleting or prompting |
 | `--version` | print the pdf4llm version and exit |
-| `--llm` | run local-LLM broken-text correction (default **off**) |
+| `--llm / --no-llm` | run local-LLM broken-text correction (default **on**; `--no-llm` skips it) |
 | `--llm-workers N` | parallel LLM chunk requests; default **1** (rationale: see the llama-swappy section below) |
 | `--llm-chunk-chars N` | max chunk size (chars) for the LLM pass; default **2000** (config key `llm_chunk_chars`). Smaller chunks are more stable on small local models |
 | `--llm-batch-chars N` | fragment-char volume packed into one batched LLM echo request; default **10000**. Benchmarked on ling-3.0-tiny-np8: 10k ≈ 16% faster than 5k, 20k no further gain |
@@ -66,7 +67,7 @@ No subcommands. For each PDF the tool:
    bypass only with `--force`). An undo record (path + sha256 + size) is
    written to `.pdf4llm_prune.log`.
 2. converts to `<basename>.md` (**UTF-8, no BOM**) + `<basename>.meta.json`.
-3. optionally runs the `--llm` correction pass.
+3. runs the LLM correction pass (`--no-llm` skips it).
 4. optionally copies the final `.md` with `--copy`.
 5. prints a one-line sanity score and exits non-zero if it scored badly.
 
@@ -194,6 +195,11 @@ Then:
 ```powershell
 pdf4llm <file.pdf> --llm --pages 1-10
 ```
+
+`meta.json` records the conversion provenance: `pdf4llm_version` (pdf4llm
+version that produced the file) and `llm_model` (model used by the LLM
+pass, `null` when skipped) — these are what `--locate-mode update` compares
+against to detect stale conversions.
 
 Chunk producers (deterministic scan + one whole-chunk prose attempt per
 prose chunk) run concurrently with the batch requests in the worker pool.
