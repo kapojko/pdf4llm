@@ -1,95 +1,75 @@
-# TODO — llm_smart_chunks branch
+# TODO — structure-aware `--llm` pipeline
 
-Status of the structure-aware `--llm` pipeline. Everything below assumes the
-verifier-first design: sampling is never overridden (server-side defaults
-unless `llm_sampling` is configured), every unit is verified before it is
-applied, failed units keep the original text after `llm_retries` extra
-attempts (default 2), and rejection is always safe (the original text is
-kept).
+Status of the verifier-first `--llm` pipeline. Design contract: sampling is
+never overridden (server-side defaults unless `llm_sampling` is configured),
+every unit is verified before it is applied, failed units keep the original
+text after `llm_retries` extra attempts (default 2), and rejection is always
+safe (the original text is kept).
 
-## Module layout (post-refactor baseline)
+## Module layout
 
-`llm.py` has been split into focused modules: `llm_prepass`, `llm_classify`,
+`llm.py` is split into focused modules: `llm_prepass`, `llm_classify`,
 `llm_chunk`, `llm_prompts`, `llm_verify`, `llm_table`, `llm_salvage`,
 `llm_protocol`, `llm_client`, `llm_server`, `llm_run` (plus `llm_batch`,
 the cross-chunk batch scheduler).
 
-## Open investigation (highest priority, before tuning anything)
+## Resolved: WCH cell-failure investigation
 
-**WCH datasheet cell failures do not reproduce in isolation.**
-On `CH32V208DS0` the in-run pass rejects ~14/80 chunks with `invariant A
-violated` on individual cells, while isolated probes of the same rows/cells
-(same payload, same sampling) show zero failures. Run-to-run variance is
-real, but the probe/production gap is unexplained — and it poisons the
-measurements every tuning decision below depends on.
+The old open question (CH32V208DS0 in-run cell rejections not reproducing in
+isolation) is closed. Full re-run with the current server config
+(`ling-3.0-tiny-np8`, dflash, **1 worker**, server-default sampling):
+**0 rejections, 0 truncated calls** vs 13/20 in the old 4/8-worker runs with
+client-side sampling. The probe/production gap was server state under
+multiple streams and/or sampling override, as suspected. Note: with the new
+server config, 1 worker with dflash is faster than any multi-worker setup —
+worker count is not a tuning knob to revisit.
 
-Next steps:
-- cross-reference failing cells against `out/e2e_wch_exchange_log.jsonl`
-  (payload identical to probe? extra echo/thinking/fences in response?);
-- run the same file with `--llm-workers 1` vs 8 — if failures cluster in the
-  parallel path, suspect server-side state under 8 streams first.
+## Measured cross-document baseline (current pipeline, 1 worker)
 
-## Decided improvements
+| doc | pages/chunks | rejected | cells sent/fixed | wholechunk acc | truncated | duration |
+|---|---|---|---|---|---|---|
+| CH32V208DS0 | 49 / 80 | 0% | 45/1 | 7/23 | 0 | 78 s |
+| CH32FV2x_V3xRM | 627 / 1528 | 1.9% | 799/103 (13%) | 125/259 (48%) | 242 | 30 min |
+| rm0410 (STM32F7) | 1942 / 2937 | 2.4% | 346/0 (0%) | 808/1848 (44%) | 230 | 2 h |
+| SAM9X60 (Microchip) | 2288 / 3947 | **17.6%** | 3201/839 (26%) | 431/957 (45%) | **1556** | 96 min |
 
-### 1. Cross-chunk batch aggregation — DONE
+Conclusions drawn from this data:
 
-Implemented in `llm_batch.py` (`Unit` registry, kind-separated global
-queues, batch packer ~5k fragment chars, CONTEXT row once per row-group,
-pure global requeue failure semantics, per-unit NOTE hints, drain phase,
-per-ordinal failure log for drift measurement). Producers (scan + whole-chunk
-prose attempts) and batch requests share the worker pool via a priority heap
-(batches interleave with producers). Chunk final states are computed at
-drain time; safety gates unchanged.
+- **Cell pass yield is document-class dependent, not zero.** 0–1% on
+  WCH/STMCU-style docs (few suspect cells; the vocab filter now skips most),
+  13–26% on dense Microchip register docs. Global demotion rejected.
+- **Whole-chunk prose attempt earns its keep everywhere** (44–48% accepted,
+  3–342 line-join fixes). The conditional-skip idea (old item 7) is
+  rejected by measurement.
+- **Two distinct failure regimes**: invariant-A drift dominates on
+  prose-heavy RMs (rm0410: 1353/2000 fail entries); **missing-index
+  malformed replies** dominate on dense register tables (SAM9X60: 1172/2000,
+  concentrated in chunks 1190–1480, chunk 1205 = 64 alone).
+- **Truncation is a shared tax**: 230–1556 calls, requeue salvages only
+  6–9% of requeued units.
+- The 2000-entry `unit_fail_log` cap truncates the evidence itself
+  (SAM9X60: 1604 failed units vs 2000 log entries).
 
-### 2. Output token cap relative to fragments — DONE
+## Open work (priority order)
 
-Batched echo requests cap `max_tokens` at 2x the FRAGMENT volume + margin
-(`output_cap_chars` through `_call_llm`), not the whole prompt; truncation
-handling unchanged (missing tail units are requeued).
-
-### 3. One-shot example in every unit prompt — DONE
-
-Both line and cell prompts carry one worked example (one fixed fragment +
-one clean-echoed fragment) plus the NOTE-line convention, in the system
-message.
-
-### 4. `<br>` split-cell repair — DONE
-
-Deterministic pre-pass joins `letter<br>lowercase` mechanically; the
-invariant-A projection strips `<br>` variants from both sides (numeric-token
-check does NOT see the projection, so `2<br>0` -> `20` stays rejected);
-lines with residual `<br>` are always admitted as batched units.
-
-### 5. Heading-aligned chunk boundaries — DONE
-
-`llm_chunk.py` aligns overflow breaks to the last ATX heading in-window
-(the heading opens the next chunk) whenever that leaves a non-degenerate
-chunk; table-swallow and paragraph-fold behaviour unchanged.
-
-### 6. In-document vocabulary as a SEND/SKIP filter — DONE
-
-`DocVocab` in `llm_batch.py`: per-document word map built after pre-passes;
-a fragment is admitted when some contiguous sub-join of its suspicious-gap
-groups occurs in the document (or when it carries residual `<br>`, double
-spaces/tabs, or is very long). Skipped units are counted (`units_skipped`),
-never edited. Not applied to targeted disputed-line re-asks of the prose
-path.
-
-### 7. Whole-chunk prose attempt: measure, then condition — HALF DONE
-
-Measurement is in place: meta.json carries `wholechunk_attempts`,
-`wholechunk_accepted`, `wholechunk_linejoin_fixes` (the unique yield).
-Still open: the conditional skip for chunks without suspicious cross-line
-patterns, gated on measured yield being near zero on real documents. (The
-paired-line unit idea remains REJECTED — see below.)
-
-### 8. Rule yield accounting and pruning — instrumentation DONE
-
-meta.json now reports `units_sent/fixed/failed/skipped` per pass plus
-`cells_sent/cells_fixed` and the per-unit fail log. Still open: the actual
-prune/demote decision for zero-yield heuristics (prime suspect: the cell
-pass on WCH datasheets, `cells_fixed` 0/365, 0/274 sent) once the open
-investigation is resolved.
+1. **Deterministic missing-index inference** — highest value.
+   `malformed reply (missing index)` is the #1 SAM9X60 failure (1001 cell +
+   171 line). When a batch reply contains all ordinals present and unique
+   *except one*, the missing unit is unambiguously identifiable: infer it,
+   then verify content as usual (invariant A still gates it). Safe, no prompt
+   changes, attacks ~57% of that document's failures.
+2. **Adaptive batch packing by fragment length** — the packer currently
+   targets ~5k fragment chars regardless of fragment size; dense register
+   cells blow the 2x-fragment output cap (1556 truncations on SAM9X60) and
+   requeue only salvages 9%. Pack so estimated echo output stays under the
+   cap with margin (shrink the batch when average fragment length is large)
+   instead of paying a full requeue round. Measure on a SAM9X60 re-run
+   before committing.
+3. **Fail-log cap** — raise from 2000 to ~10k entries (or store per-reason
+   counts + N samples) so full-document runs are diagnosable.
+4. (Optional, low priority) NOTE hint variant for missing-index failures
+   ("your previous reply dropped the index") — cheap, but item 1 makes most
+   of these moot.
 
 ## Rejected ideas (recorded so they are not re-proposed)
 
@@ -99,7 +79,8 @@ investigation is resolved.
   whose string content is where errors live anyway. The indexed line
   protocol has exactly one metacharacter and is measured at zero content
   violations. (`response_format`/grammar was ruled out earlier — grammar
-  masking can hurt speculative decoding.)
+  masking can hurt speculative decoding.) Missing-index failures argue for
+  *repairing* the indexed protocol (open item 1), not replacing it.
 - **Targeted-edits-only responses** (return only changed units): a missing
   index is ambiguous between "unchanged" and "forgot" — silent recall loss,
   no recall measurability; small models are bad at "return nothing for
@@ -111,51 +92,56 @@ investigation is resolved.
   section" devolves back to chunking. Geometry is code's job, cell text is
   the model's job.
 - **Paired-line unit for cross-line joins**: detection unreliable on real
-  extraction garbage; whole-chunk attempt covers the case (see item 7).
+  extraction garbage; whole-chunk attempt covers the case.
 - **Pre-built / cross-document vocabularies**: overfit risk to 1–2
-  documents; per-document maps only (item 6).
+  documents; per-document maps only.
 - **In-place retry rounds** (re-asking the failed subset inside the same
   batch handler): replaced by pure global requeue — each retry gets a fresh
   position in the echo (drift-isolated), hints stay per-unit coherent in
   mixed-reason batches.
+- **Conditional skip of whole-chunk prose attempts** for chunks without
+  suspicious cross-line patterns: rejected by measurement — wholechunk yield
+  is 44–48% of attempts accepted with real line-join fixes on all four
+  baseline documents, nowhere near zero.
+- **Global demotion of the cell pass**: rejected by measurement — yield is
+  0–1% on WCH/STMCU docs but 13–26% on Microchip register docs; it is a
+  document-class property, not a dead heuristic.
+- **Atomic-token masking** (`[Figure-n](x,y,w,h)`, `(cid:...)`): no evidence
+  — `cid_tokens` is 0 in all baseline metas and no rejection reason
+  implicates atomic tokens. Keep the per-unit fallback; revisit only if
+  meta stats show rejections.
 
-## Minor items (keep, low priority)
+## Validation status
 
-- Atomic tokens (`[Figure-n](x,y,w,h)`, `(cid:...)`) are handled by
-  per-unit fallback only. Add masking (placeholder substitution) if meta
-  stats show them causing rejections.
+- Full-document runs: **all done** (CH32V208DS0, CH32FV2x_V3xRM, rm0410,
+  SAM9X60 — table above). Old-vs-new meta comparison done; previous
+  baselines preserved in `*.meta.json.bak` / `meta_main` / `meta_smart`
+  files at the document locations.
+- Local model bench (`scripts/bench/`): **dropped** — model choice is
+  settled on the remote dflash server, where 1 worker is fastest.
+- Remaining: re-run SAM9X60 after open items 1–3 land; expect the
+  missing-index share of the fail log to collapse and `truncated_calls`
+  to drop.
 
-## Validation still to do (requires owner approval for long runs)
-
-- Full-document runs to replace page/chunk-slice evidence:
-  - `rm0410` (1942 pages) — expect TOC region to skip ~140 chunks
-    deterministically, register region to hold the measured 7.5% rejection /
-    2x fix yield;
-  - `CH32FV2x_V3xRM` (translated prose the old pipeline reworded beyond
-    salvage);
-  - `CH32V208DS0` re-run after the open investigation is resolved; previous
-    baseline preserved in `*.meta.json.bak`.
-- Compare meta.json old vs new per document; watch `chunks_toc_skipped`,
-  `cells_sent`/`cells_fixed`, `truncated_calls` (should stay near zero).
-- Re-run the local bench (`scripts/bench/`, `bench_llm_local.py`,
-  `probe_quality.py`) — batch aggregation changes the throughput/rejection
-  trade-off the model-choice table is based on.
-
-## Done on this branch (for context)
+## Done (for context)
 
 - Canonical verifier (bidirectional dash/quote/bullet/ellipsis map,
   `\|` tolerance, numeric-token check on canonicalized text, `<br>`
   split-marker projection).
-- 2x output token cap (was 1x; truncated 419/2936 calls on rm0410).
-- TOC-like chunk detection with deterministic skip.
+- 2x output token cap relative to fragments (was 1x; truncated 419/2936
+  calls on rm0410 under the old pipeline).
+- TOC-like chunk detection with deterministic skip (measured 140 on
+  rm0410, matching prediction).
 - Cell-level table processing: suspect cells only (dup/contained cells and
   escaped-pipe rows never sent), row as context, skeleton spliced back.
 - Prose: whole-chunk attempt -> line salvage -> batched disputed-line units.
 - Echo protocol (`N| text`) with per-unit verification and requeue retries.
-- Cross-chunk batch aggregation (item 1), fragment-based output cap (2),
-  worked examples (3), `<br>` repair (4), heading-aligned boundaries (5),
-  vocabulary SEND/SKIP filter (6), yield accounting (8).
-- Per-unit rejection-reason hints as NOTE lines; `retries_used` now counts
+- Cross-chunk batch aggregation, fragment-based output cap, worked examples
+  in every unit prompt, `<br>` split-cell repair, heading-aligned chunk
+  boundaries, in-document vocabulary SEND/SKIP filter, per-unit yield
+  accounting in meta.json (`units_*`, `cells_*`, `wholechunk_*`,
+  `unit_fail_log`).
+- Per-unit rejection-reason hints as NOTE lines; `retries_used` counts
   extra attempts across batches.
 - Sampling never overridden: no `llm_sampling` configured -> no sampling
   parameters sent at all; configured -> forwarded verbatim.
