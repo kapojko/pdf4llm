@@ -94,13 +94,47 @@ re-run deferred until items 1-2 land — one run then validates all three.
    *except one*, the missing unit is unambiguously identifiable: infer it,
    then verify content as usual (invariant A still gates it). Safe, no prompt
    changes, attacks ~57% of that document's failures.
-2. **Adaptive batch packing by fragment length** — the packer currently
-   targets ~5k fragment chars regardless of fragment size; dense register
-   cells blow the 2x-fragment output cap (1556 truncations on SAM9X60) and
-   requeue only salvages 9%. Pack so estimated echo output stays under the
-   cap with margin (shrink the batch when average fragment length is large)
-   instead of paying a full requeue round. Measure on a SAM9X60 re-run
-   before committing.
+2. **Token-aware output cap and batch packing** — the cap and the packer
+   currently assume 3.5 chars/token (`llm_client._CHARS_PER_TOKEN`), but
+   server-measured reality is text-class dependent: prose ≈ 3.3,
+   register cells/hex ≈ 1.12-1.15 (3x error). For dense-cell batches the
+   nominal 2x cap is therefore ~0.67x of the tokens actually needed —
+   truncation is baked in (1556 truncated calls on SAM9X60; requeue
+   salvages only 6-9% because retried tails re-enter the same char-based
+   packing and truncate again).
+
+   Two distinct unknowns, each estimated at its own source:
+   - **tokenization ratio** — solved deterministically by the server's own
+     tokenizer: llama-server exposes `POST /tokenize`; CHECK FIRST whether
+     llama-swappy can route it (user-owned loader; nginx fronts /v1 +
+     private endpoints). If available: exact pre-send token counts for
+     fragments (echo size) and prompts (context-fit check in llm_server
+     has the same 3x bias), no priors, no drift, per-model automatically.
+   - **output expansion factor** (echo + rewrites, ~1-2x fragment volume;
+     depends on model behavior, not tokenization) — measured from
+     `usage.completion_tokens` in every response (returned by the server,
+     currently discarded by the client). Per-model calibration, mandatory
+     for the escalation ladder (item 5: different vocab AND different
+     verbosity per model).
+
+   Fallback layers when `/tokenize` is not available (keep — any future
+   server may lack it):
+   - per-class rolling ratios, not one scalar: the scheduler already knows
+     batch kind (line vs cell); cell batches start from a pessimistic prior
+     (~1.5 chars/token). Asymmetric error cost justifies pessimism:
+     underestimate -> truncation -> requeue; overestimate -> slightly
+     larger cap / smaller batch -> negligible. This kills the
+     prose-then-tables drift failure (one scalar adapts to prose, then a
+     dense batch truncates).
+   - graceful degradation: truncated batches already apply the ordinals
+     that arrived; requeued tails must be packed by token estimate (they
+     are few), turning truncation into one extra round-trip instead of
+     lost work.
+
+   Pack by estimated OUTPUT TOKENS against a token budget (not fragment
+   chars); cap = expansion_factor x expected_echo_tokens + margin (keeps
+   the loop leash relative to real expected size). Validate on the deferred
+   full SAM9X60 re-run.
 3. **Fail-log cap** — raise from 2000 to ~10k entries (or store per-reason
    counts + N samples) so full-document runs are diagnosable.
 4. (Optional, low priority) NOTE hint variant for missing-index failures
