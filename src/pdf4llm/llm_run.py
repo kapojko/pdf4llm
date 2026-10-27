@@ -47,7 +47,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from .llm_batch import BATCH_CHARS, BatchScheduler, ChunkState, DocVocab
+from .llm_batch import BATCH_TOKENS, BatchScheduler, ChunkState, DocVocab
 from .llm_chunk import chunk_markdown
 from .llm_classify import classify_with_llm
 from .llm_client import _call_llm, _strip_thinking
@@ -78,6 +78,7 @@ from .llm_table import (
     _suspicious_cell,
     dup_cell_indices as _dup_cell_indices,
 )
+from .llm_tokens import TokenMeter
 from .llm_verify import _verify_chunk
 
 
@@ -100,6 +101,11 @@ def _produce_chunk(sched: BatchScheduler, cfg: SimpleNamespace, idx: int) -> Non
     chunk = cs.chunk
     o_lines = cs.o_lines
     try:
+        if not chunk.strip():
+            # whitespace-only chunk (e.g. leading blank lines): nothing to
+            # correct, never send it to the model (a whole-chunk attempt on
+            # empty input is a wasted request the verifier rejects anyway)
+            return
         row_idx = [i for i, l in enumerate(o_lines) if _is_table_row(l)]
         if row_idx and _is_toc_like(o_lines):
             cs.toc_skipped = True
@@ -117,11 +123,15 @@ def _produce_prose(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
                    chunk: str) -> None:
     """Whole-chunk attempt -> deterministic line salvage -> disputed units."""
     o_lines = cs.o_lines
+    echo_tokens = cfg.meter.count(chunk)
+    cap = cfg.meter.cap_for("chunk", echo_tokens)
+    sink: dict = {}
     candidate, finish = _call_llm(
         cfg.system_prompt, chunk, cfg.model, cfg.endpoint, cfg.api_key,
-        sampling=cfg.sampling)
+        sampling=cfg.sampling, output_cap_tokens=cap, usage_sink=sink)
     with sched.lock:
         cfg.stats["wholechunk_attempts"] += 1
+        cfg.meter.record("chunk", echo_tokens, sink)
     candidate = _strip_thinking(candidate)
     if finish == "length":
         cs.truncated += 1  # merged into truncated_calls at finalize
@@ -280,7 +290,7 @@ def correct_with_llm(
     sampling: dict | None = None,
     retries: int = 2,
     workers: int | None = None,
-    batch_chars: int | None = None,
+    batch_tokens: int | None = None,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass (single strict mode).
 
@@ -304,8 +314,10 @@ def correct_with_llm(
     pipeline, chunks are independent and the output is reassembled strictly
     in original order.
 
-    ``batch_chars`` overrides the fragment-char volume packed into one
-    batched echo request (default: llm_batch.BATCH_CHARS).
+    ``batch_tokens`` overrides the fragment-token volume packed into one
+    batched echo request (default: llm_batch.BATCH_TOKENS). Fragment tokens
+    are counted by the server's own tokenizer (llama-swappy /llama/tokenize)
+    when reachable, else the naive 1 char = 1 token estimate.
 
     ``workers`` None (default) runs a single worker: one batched request
     already saturates the server's decode (benchmarked; --llm-workers
@@ -359,15 +371,29 @@ def correct_with_llm(
     vocab = DocVocab(text)
     chunks = chunk_markdown(text, max_chars)
 
-    # llama-swappy probe: auto workers + rough context-sufficiency check.
-    # Runs on the ACTUAL largest chunk (an oversized single line can exceed
-    # max_chars), before any LLM call so an abort costs nothing.
+    # byte offsets of every chunk in the EXACT text chunked above (after the
+    # deterministic pre-passes, before the LLM pass): fail-log chunk indices
+    # resolve back into the document via [start, end) character ranges
+    offsets: list[list[int]] = []
+    pos = 0
+    for chunk, sep in chunks:
+        offsets.append([pos, pos + len(chunk)])
+        pos += len(chunk) + len(sep)
+
+    # llama-swappy probe: auto workers + context-sufficiency check. Runs on
+    # the ACTUAL largest chunk (an oversized single line can exceed
+    # max_chars), before any LLM call so an abort costs nothing. The token
+    # meter counts the largest chunk exactly when /llama/tokenize answers;
+    # its availability is probed here, before the pass, either way.
+    meter = TokenMeter(model, endpoint, api_key)
     swappy_entry: dict | None = None
     if chunks:
-        biggest = max(len(chunk) for chunk, _sep in chunks)
+        biggest_idx = max(range(len(chunks)), key=lambda i: len(chunks[i][0]))
+        biggest = len(chunks[biggest_idx][0])
         workers, swappy_entry = resolve_workers(
             endpoint, api_key, model, biggest, workers,
             note=lambda msg: print(msg, flush=True),
+            meter=meter, largest_chunk_text=chunks[biggest_idx][0],
         )
     elif workers is None:
         workers = 1
@@ -396,6 +422,7 @@ def correct_with_llm(
         "units_skipped": 0,
         "units_requeued": 0,
         "units_fixed_after_requeue": 0,
+        "units_inferred_missing": 0,
         "batches": 0,
         "cells_sent": 0,
         "cells_fixed": 0,
@@ -406,6 +433,8 @@ def correct_with_llm(
         "truncated_calls": 0,
         "rejections": [],
         "unit_fail_log": [],
+        "truncation_log": [],
+        "chunk_offsets": offsets,
     }
     if swappy_entry is not None:
         stats["swappy"] = {
@@ -429,12 +458,14 @@ def correct_with_llm(
     cfg = SimpleNamespace(
         system_prompt=system_prompt, model=model, endpoint=endpoint,
         api_key=api_key, sampling=sampling, stats=stats, vocab=vocab,
+        meter=meter,
     )
     sched = BatchScheduler(
         states, {"cell": cell_prompt, "line": line_prompt}, vocab,
         model=model, endpoint=endpoint, api_key=api_key, sampling=sampling,
         retries=retries, stats=stats, lock=lock, pool=pool, note=note,
-        batch_chars=batch_chars if batch_chars else BATCH_CHARS,
+        batch_tokens=batch_tokens if batch_tokens else BATCH_TOKENS,
+        meter=meter,
         verbose=verbose,
     )
 
@@ -462,6 +493,7 @@ def correct_with_llm(
                 flush=True,
             )
     stats["units_fixed"] = stats["blocks_fixed"]
+    stats["tokens"] = meter.meta()
     stats["duration"] = time.monotonic() - t0
     if verbose:
         print(

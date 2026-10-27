@@ -437,8 +437,7 @@ def test_split_and_splice_row_cells():
 def test_parse_indexed_lines():
     resp = "junk header\n0| Boundary address\n3| Register map\n9| ignored index"
     got = llm_protocol._parse_indexed_lines(resp, {0, 3})
-    assert got == {0: "Boundary address", 3: "Register map"}
-    # continuation lines append to the previous index (wrapped long line)
+    assert got == {0: "Boundary address", 3: "Register map"}    # continuation lines append to the previous index (wrapped long line)
     got2 = llm_protocol._parse_indexed_lines("1| first part\ncontinued here", {1})
     assert got2 == {1: "first part\ncontinued here"}
     # the CONTEXT block is never captured, even when the model echoes it
@@ -623,7 +622,7 @@ def test_parallel_reassembles_in_order_and_merges_stats(monkeypatch):
 
 def test_parallel_output_identical_to_sequential(monkeypatch):
     def fake_call(system_prompt, chunk, model, endpoint, api_key,
-                  sampling=None, retry_hint=None, output_cap_chars=None):
+                  sampling=None, retry_hint=None, **kw):
         # first whole-chunk attempt on the 'Ordering' chunk returns the text
         # plus a hallucinated tail -> exercises salvage; the line-level echo
         # request (numbered lines) gets a clean fixed answer
@@ -657,7 +656,7 @@ def test_parallel_completions_out_of_order_still_ordered(monkeypatch):
                  enumerate(llm_chunk.chunk_markdown(_prep(PAR_TEXT), MAXC), 1)}
 
     def fake_call(system_prompt, chunk, model, endpoint, api_key,
-                  sampling=None, retry_hint=None):
+                  sampling=None, retry_hint=None, **kw):
         # make LATER chunks finish FIRST so completion order != chunk order
         delay = max(1.0 - 0.15 * chunk_idx[chunk], 0.05)
         _time.sleep(delay)
@@ -1086,6 +1085,184 @@ def test_run_rejects_unfixable_cell_and_keeps_original(monkeypatch):
     assert stats["cells_fixed"] == 0 and stats["units_failed"] == 1
 
 
+def test_parse_reply_struct_keeps_got_semantics():
+    resp = "junk header\n0| Boundary address\n3| Register map\n9| ignored index"
+    info = llm_protocol._parse_reply(resp, {0, 3})
+    assert info.got == {0: "Boundary address", 3: "Register map"}
+    assert info.order == [0, 3]
+    assert info.dup_want == set()
+    # 'junk header' is an orphan (no index active yet)
+    assert info.orphans == ["junk header"]
+    # continuation lines still append to the previous index
+    info2 = llm_protocol._parse_reply("1| first part\ncontinued here", {1})
+    assert info2.got == {1: "first part\ncontinued here"}
+
+
+def test_parse_reply_detects_duplicate_ordinals():
+    resp = "0| first\n1| second\n0| first again"
+    info = llm_protocol._parse_reply(resp, {0, 1})
+    assert info.dup_want == {0}
+    assert info.got[0] == "first again"      # last occurrence wins (as before)
+    assert info.order == [0, 1]
+
+
+def test_parse_reply_orphan_after_context_reset():
+    # the shape real missing-index replies produce on cell batches: the
+    # model drops the 'N| ' prefix of the first unit of the next row-group,
+    # so its text lands right after the CONTEXT block (last == None)
+    resp = ("0| D-type\n"
+            "CONTEXT:\n"
+            "row: | R0 | D-t yp e | 0x08 |\n"
+            "D-typ f\n"
+            "CONTEXT:\n"
+            "row: | R1 | D-t yp f | 0x09 |")
+    info = llm_protocol._parse_reply(resp, {0, 1})
+    assert info.got == {0: "D-type"}
+    assert info.orphans == ["D-typ f"]
+
+
+def test_parse_reply_orphan_blocks_split_on_context_and_note():
+    # NOTE lines and CONTEXT blocks both reset the active index, so each
+    # orphan segment becomes its own block
+    resp = "pre\nNOTE 7: rejected\nblock a\nCONTEXT:\nrow: | x |\nblock b"
+    info = llm_protocol._parse_reply(resp, set())
+    assert info.orphans == ["pre", "block a", "block b"]
+
+
+def test_run_missing_index_merged_continuation_is_inferred(monkeypatch):
+    # the reply drops the '1| ' prefix of the second cell; its text is
+    # parsed as a continuation of the first cell's echo. The split is
+    # unambiguous (one missing ordinal), both halves verify, so BOTH cells
+    # are recovered instead of requeued.
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        assert "0| D-t yp e" in chunk and "1| D-t yp f" in chunk
+        return "0| D-type\nD-typ f", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert "| R0 | D-type | D-typ f |" in out
+    assert stats["units_inferred_missing"] == 1
+    assert stats["cells_fixed"] == 2
+    assert stats["units_requeued"] == 0 and stats["units_failed"] == 0
+    assert stats["chunks_accepted"] == 1
+
+
+def test_run_missing_index_orphan_is_inferred(monkeypatch):
+    # different row-groups: the dropped unit's text lands after the CONTEXT
+    # block and is recovered from the orphan blocks
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | 0x08 |\n"
+           "| R1 | D-t yp f | 0x09 |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return ("0| D-type\n"
+                "CONTEXT:\n"
+                "row: | R0 | D-t yp e | 0x08 |\n"
+                "D-typ f"), None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert "| R0 | D-type | 0x08 |" in out
+    assert "| R1 | D-typ f | 0x09 |" in out
+    assert stats["units_inferred_missing"] == 1
+    assert stats["cells_fixed"] == 2
+    assert stats["units_failed"] == 0
+
+
+def test_run_missing_index_not_inferred_on_duplicate_ordinal(monkeypatch):
+    # a repeated ordinal makes the reply ambiguous -> no inference, the
+    # missing unit takes the normal failure path
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-type\n0| D-type", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
+    assert stats["units_inferred_missing"] == 0
+    assert stats["cells_fixed"] == 1            # only the echoed cell applied
+    assert stats["units_failed"] == 1           # missing one keeps original
+    assert "| R0 | D-type | D-t yp f |" in out
+
+
+def test_run_missing_index_not_inferred_when_two_missing(monkeypatch):
+    doc = ("Register description with D-type and D-typf and D-typg marks.\n"
+           "| R0 | D-t yp e | D-t yp f | D-t yp g |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-type", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
+    assert stats["units_inferred_missing"] == 0
+    assert stats["cells_fixed"] == 1 and stats["units_failed"] == 2
+    assert "| R0 | D-type | D-t yp f | D-t yp g |" in out
+
+
+def test_run_missing_index_merge_with_bad_tail_keeps_failure(monkeypatch):
+    # the continuation candidate fails verification for the missing unit ->
+    # nothing is inferred, the merged echo fails the previous unit too
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-type\nCHANGED GARBAGE XX", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
+    assert stats["units_inferred_missing"] == 0
+    assert stats["units_failed"] == 2
+    assert out == _prep(doc)                    # original kept verbatim
+
+
+def test_run_missing_index_not_inferred_on_truncation(monkeypatch):
+    # 'length' finish means the tail may be cut mid-repair -> inference is
+    # deliberately disabled, the unit requeues as a truncated-output loss
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-type", "length"
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
+    assert stats["units_inferred_missing"] == 0
+    assert stats["truncated_calls"] == 1
+    assert stats["unit_fail_log"][-1]["reason"] == "missing from truncated output"
+
+
+def test_run_missing_index_orphan_preamble_does_not_block_recovery(monkeypatch):
+    # a model preamble is an orphan block too; it must not disable (and
+    # cannot pass) the verification of the real orphan candidate
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | 0x08 |\n"
+           "| R1 | D-t yp f | 0x09 |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return ("Here is the corrected output:\n"
+                "0| D-type\n"
+                "CONTEXT:\n"
+                "row: | R0 | D-t yp e | 0x08 |\n"
+                "D-typ f"), None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert "| R1 | D-typ f | 0x09 |" in out
+    assert stats["units_inferred_missing"] == 1
+    assert stats["units_failed"] == 0
+
+
 def test_strip_thinking_blocks():
     open_tag = "<" + "think>"
     close_tag = "<" + "/" + "think>"
@@ -1365,6 +1542,173 @@ def test_batch_truncation_requeues_missing_units(monkeypatch):
     assert "| D-type | 14 | 0x08 |" in out
     assert stats["truncated_calls"] == 1
     assert stats["units_requeued"] == 1 and stats["cells_fixed"] == 1
+    assert stats["truncation_log"][0]["kind"] == "cell"
+    assert stats["truncation_log"][0]["cap"] > 0
+    assert stats["truncation_log"][0]["completion_tokens"] is None  # fake call
+
+
+# ---------------------------------------------------------------------------
+# token meter: exact counting, naive fallback, output budget (llm_tokens)
+# ---------------------------------------------------------------------------
+
+class _FakeTokResp:
+    def __init__(self, n_tokens):
+        self._body = json.dumps({"tokens": list(range(n_tokens))}).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_token_meter_exact_counts_and_caches(monkeypatch):
+    import pdf4llm.llm_tokens as llm_tokens
+    http_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        http_calls.append(json.loads(req.data.decode())["content"])
+        return _FakeTokResp(max(1, len(http_calls[-1]) // 2))
+
+    monkeypatch.setattr(llm_tokens.urllib.request, "urlopen", fake_urlopen)
+    meter = llm_tokens.TokenMeter("m", "http://x/v1", "k")
+    assert meter.count("abcd") == 2          # exact: len//2 tokens
+    assert meter.exact is True
+    assert meter.count("abcd") == 2          # cache hit, no second tokenize
+    assert len(http_calls) == 2              # probe + one tokenize
+
+
+def test_token_meter_naive_fallback_on_unreachable_tokenizer(monkeypatch):
+    import pdf4llm.llm_tokens as llm_tokens
+
+    def fail_urlopen(req, timeout=None):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(llm_tokens.urllib.request, "urlopen", fail_urlopen)
+    meter = llm_tokens.TokenMeter("m", "http://x/v1", "k")
+    assert meter.count("abcd") == 4          # naive: 1 char = 1 token
+    assert meter.exact is False
+
+
+def test_token_meter_cap_and_expansion_ema():
+    import pdf4llm.llm_tokens as llm_tokens
+    meter = llm_tokens.TokenMeter("m", "http://x", "k", exact=False)
+    # init 2.0 (the measured rewrite ceiling)
+    assert meter.cap_for("cell", 100) == 2 * 100 + llm_client._OUT_MARGIN_TOKENS
+    # EMA: 0.7*2.0 + 0.3*3.0 = 2.3 after one observation of 3x
+    meter.record("cell", 100, {"prompt_tokens": 10, "completion_tokens": 300})
+    assert meter.expansion["cell"] == pytest.approx(2.3)
+    assert meter.cap_for("cell", 100) == 230 + llm_client._OUT_MARGIN_TOKENS
+    # other kinds unaffected
+    assert meter.expansion["line"] == 2.0
+    # degenerate observation is clamped at 8x
+    meter.record("cell", 10, {"completion_tokens": 10**6})
+    assert meter.expansion["cell"] == 8.0
+    # usage totals accumulate; empty usage is a no-op
+    meter.record("line", 10, None)
+    meta = meter.meta()
+    assert meta["calls"] == 2 and meta["completion_tokens"] == 10**6 + 300
+    assert meta["exact_tokenizer"] is False and "expansion" in meta
+
+
+def test_call_llm_output_cap_tokens_and_usage_sink(monkeypatch):
+    import types
+    captured = {}
+
+    def fake_completion(**kw):
+        captured.update(kw)
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(
+                message=types.SimpleNamespace(content="hello"),
+                finish_reason="stop")],
+            usage=types.SimpleNamespace(prompt_tokens=11, completion_tokens=7),
+        )
+
+    import litellm
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    sink = {}
+    text, finish = llm_client._call_llm(
+        "s", "u", "m", "http://x", "k",
+        output_cap_tokens=555, usage_sink=sink)
+    assert captured["max_tokens"] == 555     # explicit token cap wins
+    assert sink == {"prompt_tokens": 11, "completion_tokens": 7}
+    assert text == "hello" and finish == "stop"
+
+
+def test_batch_packing_uses_token_budget(monkeypatch):
+    # naive meter (endpoint unreachable): 1 char = 1 token, so three ~1800
+    # char cells pack as 2 + 1 under the 3000-token budget
+    docs = [
+        f"| R{i} | {'alpha beta ' * 150}row{i} end |" for i in range(3)
+    ]
+    doc = "Register description.\n" + "\n".join(docs)
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == _prep(doc)
+    assert stats["batches"] == 2
+    assert stats["tokens"]["exact_tokenizer"] is False
+
+
+def test_context_check_uses_meter(monkeypatch):
+    import pytest
+    from pdf4llm.llm_server import LlmContextError, resolve_workers
+    import pdf4llm.llm_tokens as llm_tokens
+    info = {"models": [{"key": "m", "contextSize": 1000}]}
+    monkeypatch.setattr(llm_server, "probe_swappy", lambda *a, **kw: info)
+
+    # naive meter: 500 chars -> 500 input tokens -> 3x + margin > 1000
+    naive = llm_tokens.TokenMeter("m", "http://x", "k", exact=False)
+    with pytest.raises(LlmContextError) as e:
+        resolve_workers("http://x/v1", "k", "m", 500, None,
+                        note=lambda m: None, meter=naive,
+                        largest_chunk_text="x" * 500)
+    assert "naive" in str(e.value)
+
+    # exact meter counting half the chars: 300 chars -> 150 tokens ->
+    # 3x + margin = 962, fits into 1000
+    exact = llm_tokens.TokenMeter("m", "http://x", "k", exact=True)
+    monkeypatch.setattr(llm_tokens.TokenMeter, "_count_exact",
+                        lambda self, text: len(text) // 2)
+    workers, entry = resolve_workers("http://x/v1", "k", "m", 500, None,
+                                     note=lambda m: None, meter=exact,
+                                     largest_chunk_text="x" * 300)
+    assert workers == 1 and entry["key"] == "m"
+
+
+def test_blank_chunk_never_sent(monkeypatch):
+    # trailing blank lines after a table produce a whitespace-only chunk;
+    # it must never reach the model (wasted whole-chunk call on empty input)
+    doc = ("Register description with D-type marks.\n"
+           "\n"
+           "## Reg\n"
+           "\n"
+           "| D-t yp e | 14 |\n"
+           "| --- | --- |\n"
+           "| 1 | 2 |\n"
+           "\n\n\n")
+    seen = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        seen.append(chunk)
+        return _echo_unchanged(chunk), None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False)
+    assert seen and all(c.strip() for c in seen)   # no blank payload ever sent
+    assert stats["chunks_total"] == 2
+    assert stats["chunks_accepted"] == 2           # blank chunk accepted as-is
+    assert stats["wholechunk_attempts"] == 0       # table chunk, no prose pass
+    assert out == _prep(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -1456,7 +1800,7 @@ def test_batch_output_cap_scales_with_fragments_not_prompt(monkeypatch):
     caps = []
 
     def fake_call(system_prompt, chunk, *a, **kw):
-        caps.append(kw.get("output_cap_chars"))
+        caps.append(kw.get("output_cap_tokens"))
         return _echo_unchanged(chunk), None
 
     monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
@@ -1464,9 +1808,10 @@ def test_batch_output_cap_scales_with_fragments_not_prompt(monkeypatch):
         CELL_DOC, "m", "http://x", "k", verbose=False, classify=False)
     assert out == _prep(CELL_DOC)
     assert len(caps) == 1
-    # the cap source is the FRAGMENT volume ('D-t yp e' = 8 chars), not the
-    # whole prompt (payload + CONTEXT row are much longer)
-    assert 0 < caps[0] < 40
+    # the cap scales with the FRAGMENT token count ('D-t yp e' -> 8 tokens
+    # under the naive 1 char = 1 token fallback), not the whole prompt
+    # (payload + CONTEXT row are much longer): EMA 2.0 x 8 + margin
+    assert caps[0] == 2 * 8 + llm_client._OUT_MARGIN_TOKENS
 
 
 def test_wholechunk_yield_accounting(monkeypatch):
@@ -1495,7 +1840,7 @@ def test_scheduler_packs_only_full_batches_until_drain():
         states, {"cell": "p", "line": "p"}, llm_batch.DocVocab("x"),
         model="m", endpoint="e", api_key="k", sampling=None, retries=1,
         stats={"units_sent": 0}, lock=threading.Lock(), pool=None,
-        note=lambda m: None, batch_chars=10)
+        note=lambda m: None, batch_tokens=10)
     assert not sched._packable("cell")            # empty queue
     sched.enqueue_cell(0, 0, 0, "abc", "| a |")
     # producers still pending and the batch is below batch_chars: wait for

@@ -174,18 +174,22 @@ def resolve_workers(
     max_chunk_chars: int,
     workers: int | None,
     note=None,
+    meter=None,
+    largest_chunk_text: str | None = None,
 ) -> tuple[int, dict | None]:
     """Probe llama-swappy; check the context fit; resolve the worker count.
 
     Worker priority: explicit ``workers`` argument > 1 (default — one batched
     request already saturates the server's decode, so slots are no longer
     translated into workers; the probe still provides the slots/context line
-    and the per-request context check). The context check compares a
-    rough input+output estimate for the largest chunk against the per-request
+    and the per-request context check). The context check compares an
+    input+output estimate for the largest chunk against the per-request
     contextSize reported by llama-swappy (v1.3 semantics: total -c divided
-    by slots) and raises LlmContextError when it does not fit. Missing data
-    (no info endpoint, model key not listed, contextSize absent) degrades
-    with a warning — never aborts.
+    by slots) and raises LlmContextError when it does not fit. When a
+    TokenMeter is passed and its tokenizer answers, the input tokens are
+    counted exactly; otherwise a rough char-based estimate is used. Missing
+    data (no info endpoint, model key not listed, contextSize absent)
+    degrades with a warning — never aborts.
 
     Returns (workers, swappy_model_entry_or_None).
     """
@@ -208,13 +212,21 @@ def resolve_workers(
 
     ctx = entry.get("contextSize")
     if ctx:
-        need = estimate_chunk_tokens(max_chunk_chars)
+        if meter is not None and largest_chunk_text:
+            in_tokens = meter.count(largest_chunk_text)
+            how = "exact" if meter.exact else "naive 1 char = 1 token"
+        else:
+            in_tokens = math.ceil(max_chunk_chars / _CHARS_PER_TOKEN)
+            how = "char estimate"
+        # the whole-chunk prose attempt may legitimately produce ~2x its
+        # input length, hence 3x the input tokens plus a margin
+        need = 3 * in_tokens + _CTX_MARGIN_TOKENS
         if need > ctx:
             raise LlmContextError(
                 f"server context too small: {ctx} tokens/request available "
                 f"(llama-swappy, model {entry.get('key')!r}), but the largest "
-                f"chunk needs ~{need} tokens (in+out, rough estimate; "
-                f"{max_chunk_chars} chars). Reduce the chunk size or increase "
+                f"chunk needs ~{need} tokens (in+out, {how}; "
+                f"{in_tokens} input tokens). Reduce the chunk size or increase "
                 "the server context (-c, divided by -np)."
             )
 

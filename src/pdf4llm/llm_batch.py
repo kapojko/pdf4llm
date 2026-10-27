@@ -29,6 +29,7 @@ from collections import Counter, deque
 
 from .llm_prepass import has_residual_br
 from .llm_protocol import _echo_units
+from .llm_tokens import TokenMeter
 from .progress import LineProgress, _fmt_duration
 from .llm_table import _split_row_cells, _splice_cells
 from .llm_verify import (
@@ -38,20 +39,27 @@ from .llm_verify import (
 )
 
 
-# ~10k chars of *fragments* per batched call (context rows attached once per
+# ~3000 tokens of *fragments* per batched call (context rows attached once per
 # row-group, not per cell; slot context is 32k tok/request, so input is not
-# the constraint — generated output length is; the output cap scales with
-# the fragment total, see llm_client.output_cap_chars).
-# Benchmarked on ling-3.0-tiny-np8 (2026-10, batched pipeline, dflash
-# server): 10k beat 5k by ~16% wall time (77-102s vs 93-106s on the 80-chunk
-# CH32V208DS0 fixture); 20k added nothing and truncated once. Quality
-# (75/80 chunks accepted) was identical across 2.5k/5k/10k/20k.
-BATCH_CHARS = 10000
+# the constraint — generated output length is; the output cap scales with the
+# measured expansion factor x the exact fragment token count, see
+# llm_tokens.TokenMeter). Fragment tokens are counted by the server's own
+# tokenizer when reachable, else the naive 1 char = 1 token estimate —
+# pessimistic: smaller batches, never truncation.
+# (Predecessor BATCH_CHARS=10000 was benchmarked on ling-3.0-tiny-np8,
+# 2026-10: 10k chars beat 5k by ~16% wall time; 20k added nothing. 10k chars
+# of prose ~ 3000 tokens, so the token budget preserves the benchmarked
+# operating point for prose while fixing dense-cell batches, where 10k chars
+# meant up to 3x more tokens than the cap could cover.)
+BATCH_TOKENS = 3000
 
 # Failures per unit are logged for the batch-size drift measurement: flat
 # per-ordinal failure distribution -> batch size can grow; tail-clustered ->
-# ceiling found.
-_FAIL_LOG_CAP = 2000
+# ceiling found. 10k so full-document runs (SAM9X60: 1604 failed units) are
+# diagnosable without the cap truncating the evidence itself. Same cap for
+# the truncation log.
+_FAIL_LOG_CAP = 10000
+_TRUNC_LOG_CAP = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +229,8 @@ class BatchScheduler:
     def __init__(self, states: list[ChunkState], prompts: dict[str, str],
                  vocab: DocVocab, *, model: str, endpoint: str, api_key: str,
                  sampling: dict | None, retries: int, stats: dict,
-                 lock, pool, note=None, batch_chars: int = BATCH_CHARS,
-                 verbose: bool = False) -> None:
+                 lock, pool, note=None, batch_tokens: int = BATCH_TOKENS,
+                 meter=None, verbose: bool = False) -> None:
         self.states = states
         self.prompts = prompts          # kind -> system prompt
         self.vocab = vocab
@@ -235,7 +243,10 @@ class BatchScheduler:
         self.lock = lock
         self.pool = pool
         self.note = note or (lambda msg: None)
-        self.batch_chars = batch_chars
+        self.batch_tokens = batch_tokens
+        # None -> naive offline meter (no network, 1 char = 1 token)
+        self.meter = meter if meter is not None else TokenMeter(
+            model, endpoint, api_key, exact=False)
         self.queues: dict[str, deque[Unit]] = {"cell": deque(), "line": deque()}
         self.active = 0
         self.producers_total = len(states)
@@ -283,14 +294,17 @@ class BatchScheduler:
     def _queue_chars(self, q: deque[Unit]) -> int:
         return sum(len(u.text) for u in q)
 
+    def _queue_tokens(self, q: deque[Unit]) -> int:
+        return sum(self.meter.count(u.text) for u in q)
+
     def _pack(self, kind: str) -> list[Unit]:
         q = self.queues[kind]
         batch: list[Unit] = []
-        chars = 0
-        while q and chars < self.batch_chars:
+        tokens = 0
+        while q and tokens < self.batch_tokens:
             u = q.popleft()
             batch.append(u)
-            chars += len(u.text)
+            tokens += self.meter.count(u.text)
         return batch
 
     def _packable(self, kind: str) -> bool:
@@ -299,7 +313,7 @@ class BatchScheduler:
             return False
         if self.producers_done >= self.producers_total:
             return True  # drain phase: send whatever there is
-        return self._queue_chars(q) >= self.batch_chars
+        return self._queue_tokens(q) >= self.batch_tokens
 
     # -- main loop ------------------------------------------------------------
 
@@ -408,32 +422,48 @@ class BatchScheduler:
             kind = batch[0].kind
             payload, frag_chars = self._build_payload(batch)
             want = {u.gid for u in batch}
-            got, finish = _echo_units(
+            frag_tokens = sum(self.meter.count(u.text) for u in batch)
+            cap = self.meter.cap_for(kind, frag_tokens)
+            usage_sink: dict = {}
+            got, parse_info, finish = _echo_units(
                 self.prompts[kind], payload, want, self.model, self.endpoint,
-                self.api_key, self.sampling, output_cap_chars=frag_chars)
+                self.api_key, self.sampling, output_cap_tokens=cap,
+                usage_sink=usage_sink)
+            self.meter.record(kind, frag_tokens, usage_sink)
             with self.lock:
                 self.batches_sent += 1
                 self.stats["batches"] += 1
                 if finish == "length":
-                    # per-chunk counters merge into truncated_calls at finalize
+                    # per-chunk counters merge into truncated_calls at finalize;
+                    # the log keeps estimated-vs-actual for the cap measurement
                     for c in {u.chunk for u in batch}:
                         self.states[c].truncated += 1
-                self._process_batch(batch, got, finish)
+                    tlog = self.stats.setdefault("truncation_log", [])
+                    if len(tlog) < _TRUNC_LOG_CAP:
+                        tlog.append({
+                            "kind": kind, "frag_tokens": frag_tokens,
+                            "cap": cap,
+                            "completion_tokens": usage_sink.get(
+                                "completion_tokens"),
+                        })
+                self._process_batch(batch, got, finish, parse_info)
                 # verbose batch lines must not clobber the in-place progress
                 # line on a TTY (only when a line is actually printed)
                 if self.verbose and self.prog is not None:
                     self.prog.line_break()
                 self.note(
                     f"  llm: batch {self.batches_sent}: {len(batch)} fragment(s), "
-                    f"{frag_chars} chars"
+                    f"{frag_chars} chars (~{frag_tokens} tok), cap {cap}"
                     + (", truncated" if finish == "length" else ""))
         finally:
             with self.lock:
                 self.active -= 1
 
     def _process_batch(self, batch: list[Unit], got: dict[int, str],
-                       finish: str | None) -> None:
+                       finish: str | None, parse_info=None) -> None:
         """Verify every returned unit; apply or requeue. Lock held."""
+        if parse_info is not None and (finish is None or finish == "stop"):
+            self._try_infer_missing(batch, got, parse_info)
         for ordinal, u in enumerate(batch, 1):
             cs = self.states[u.chunk]
             new = got.get(u.gid)
@@ -463,8 +493,15 @@ class BatchScheduler:
             if u.kind == "cell":
                 segs = _split_row_cells(cs.o_lines[u.line])
                 if segs is not None:
+                    # splice against the CURRENT output line: two cells of
+                    # the same row can both be fixed in one batch, and each
+                    # splice must preserve the other cell's fix
+                    cur = cs.out_lines[u.line]
+                    cur_segs = _split_row_cells(cur)
+                    if cur_segs is None:  # defensive: splice keeps structure
+                        cur, cur_segs = cs.o_lines[u.line], segs
                     cs.out_lines[u.line] = _splice_cells(
-                        cs.o_lines[u.line], segs, {u.cell: new})
+                        cur, cur_segs, {u.cell: new})
                 cs.cells_fixed += 1
             else:
                 cs.out_lines[u.line] = new
@@ -472,6 +509,70 @@ class BatchScheduler:
             cs.enq_done += 1
             if u.attempts:
                 self.stats["units_fixed_after_requeue"] += 1
+
+    # -- deterministic missing-index inference --------------------------------
+
+    def _verify_candidate(self, u: Unit, text: str) -> bool:
+        """Would ``text`` be an acceptable output for unit ``u``?
+
+        Same gates as the main apply path: an unchanged/empty echo needs no
+        verification (nothing would be applied), everything else must pass
+        the per-unit verifier. Lock held.
+        """
+        text_s = text.strip()
+        if not text_s or text_s == u.text.strip():
+            return True
+        if u.kind == "cell":
+            return _verify_pair(u.text, text_s) is None
+        return _verify_line_in_context(
+            self.states[u.chunk].o_lines, u.line, text) is None
+
+    def _try_infer_missing(self, batch: list[Unit], got: dict[int, str],
+                           info) -> None:
+        """Deterministic missing-index inference. Lock held.
+
+        When the reply carries every requested ordinal exactly once except
+        one, the missing unit is unambiguous and its text is recovered from
+        the two shapes real malformed replies produce:
+
+        (a) the 'N| ' prefix was dropped -> the text was parsed as a
+            CONTINUATION of the previous unit's echo (split point = the
+            first newline; the previous unit keeps the head);
+        (b) the text sits before the first index line or right after a
+            CONTEXT/NOTE reset -> it was captured as an ORPHAN block.
+
+        Both candidate texts are verified like any other model output; on
+        any ambiguity (duplicate ordinals, more than one missing unit,
+        failing verification) nothing is touched and the unit takes the
+        normal missing-index failure path — rejection stays safe.
+        """
+        if info.dup_want:
+            return
+        missing = [u for u in batch if u.gid not in got]
+        if len(missing) != 1:
+            return
+        m = missing[0]
+        i = batch.index(m)
+        # (a) continuation-merge: the previous unit's echo swallowed the line
+        if i > 0:
+            p = batch[i - 1]
+            prev_text = got.get(p.gid)
+            if prev_text and "\n" in prev_text:
+                head, tail = prev_text.split("\n", 1)
+                if tail.strip() and self._verify_candidate(p, head) \
+                        and self._verify_candidate(m, tail):
+                    got[p.gid] = head
+                    got[m.gid] = tail
+                    self.stats["units_inferred_missing"] += 1
+                    return
+        # (b) orphan block(s): index dropped before the first index line or
+        # after a CONTEXT/NOTE reset. Preambles land here too, so try each
+        # block — only one can verify as the missing unit's content.
+        for block in info.orphans:
+            if block.strip() and self._verify_candidate(m, block):
+                got[m.gid] = block
+                self.stats["units_inferred_missing"] += 1
+                return
 
     def _fail(self, u: Unit, reason: str, ordinal: int) -> None:
         """Requeue (never in-place retries) or finalize as failed. Lock held."""
@@ -482,6 +583,7 @@ class BatchScheduler:
             self.stats["unit_fail_log"].append({
                 "gid": u.gid, "kind": u.kind, "chunk": u.chunk,
                 "ordinal": ordinal, "attempt": u.attempts, "reason": reason[:120],
+                "model": self.model,   # which model finally failed the unit
             })
         if u.attempts <= self.retries:
             self.queues[u.kind].append(u)

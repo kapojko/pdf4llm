@@ -296,10 +296,11 @@ def convert_cmd(
         None, "--llm-workers", min=1,
         help="Parallel LLM chunk requests (default: 1).",
     ),
-    llm_batch_chars: int = typer.Option(
-        None, "--llm-batch-chars", min=100,
-        help="Fragment-char volume packed into one batched LLM echo request. "
-             "Default: 10000.",
+    llm_batch_tokens: int = typer.Option(
+        None, "--llm-batch-tokens", min=100,
+        help="Fragment-token volume packed into one batched LLM echo request. "
+             "Counted by the server tokenizer when reachable, else 1 char = "
+             "1 token. Default: 3000.",
     ),
     llm_chunk_chars: int = typer.Option(
         None, "--llm-chunk-chars", min=200,
@@ -349,7 +350,7 @@ def convert_cmd(
             pdf, out=out, force=force, copy_to=copy_to, dry_run=dry_run,
             pages=pages, llm_flag=llm_flag, model=model,
             llm_workers=llm_workers, llm_chunk_chars=llm_chunk_chars,
-            llm_batch_chars=llm_batch_chars, verbose=verbose,
+            llm_batch_tokens=llm_batch_tokens, verbose=verbose,
         )
         codes.append(code)
         if code == 130:  # user interrupt: do not start the remaining files
@@ -500,7 +501,7 @@ def _process_one(
     model: str | None,
     llm_workers: int | None,
     llm_chunk_chars: int | None,
-    llm_batch_chars: int | None,
+    llm_batch_tokens: int | None,
     verbose: bool,
 ) -> int:
     """Convert one PDF; returns the exit code for this file (0 = ok)."""
@@ -563,7 +564,7 @@ def _process_one(
                 text, model, endpoint, api_key, verbose=verbose,
                 sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
                 workers=llm_workers, max_chars=chunk_chars,
-                batch_chars=llm_batch_chars,
+                batch_tokens=llm_batch_tokens,
             )
         except LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)

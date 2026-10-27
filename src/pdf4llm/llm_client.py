@@ -84,7 +84,9 @@ def _split_sampling(sampling: dict) -> tuple[dict, dict]:
 def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
               api_key: str, sampling: dict | None = None,
               retry_hint: str | None = None,
-              output_cap_chars: int | None = None) -> tuple[str, str | None]:
+              output_cap_chars: int | None = None,
+              output_cap_tokens: int | None = None,
+              usage_sink: dict | None = None) -> tuple[str, str | None]:
     import litellm  # lazy import
 
     litellm.suppress_debug_info = True
@@ -96,13 +98,20 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
             "Return the corrected text exactly as instructed: no additions, "
             "no omissions, no format changes."
         )
-    # max_tokens is capped relative to the input (output_token_cap): a looping
-    # model is cut off quickly and the truncated output is rejected/salvaged.
-    # For batched echo requests the cap is relative to the FRAGMENT volume
-    # (output_cap_chars), not the whole prompt: CONTEXT rows and retry notes
-    # inflate the prompt but not the expected output, and a prompt-derived cap
-    # would give degenerate input-repeat more runway as batches grow.
-    cap_src = output_cap_chars if output_cap_chars is not None else len(user_content)
+    # max_tokens is capped relative to the input: a looping model is cut off
+    # quickly and the truncated output is rejected/salvaged. Batched echo
+    # requests pass output_cap_tokens (computed by the scheduler from the
+    # exact fragment token count x the measured expansion factor); the
+    # char-based formula below is the fallback for callers without a meter.
+    # In either case the cap is relative to the EXPECTED OUTPUT volume, not
+    # the whole prompt: CONTEXT rows and retry notes inflate the prompt but
+    # not the expected output.
+    if output_cap_tokens is not None:
+        max_tokens = output_cap_tokens
+    else:
+        cap_src = (output_cap_chars if output_cap_chars is not None
+                   else len(user_content))
+        max_tokens = output_token_cap(cap_src)
     try:
         resp = litellm.completion(
             model=f"openai/{model}",
@@ -112,12 +121,20 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
             ],
             api_base=endpoint,
             api_key=api_key,
-            max_tokens=output_token_cap(cap_src),
+            max_tokens=max_tokens,
             timeout=300,
             extra_body={**extra, "chat_template_kwargs": {"enable_thinking": False}},
             **std,
         )
     except Exception as e:  # network/model error: caller keeps the original
         return "", f"llm error: {type(e).__name__}: {e}"[:200]
+    if usage_sink is not None:
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            pt = getattr(u, "prompt_tokens", None) or 0
+            ct = getattr(u, "completion_tokens", None) or 0
+            usage_sink["prompt_tokens"] = usage_sink.get("prompt_tokens", 0) + pt
+            usage_sink["completion_tokens"] = (
+                usage_sink.get("completion_tokens", 0) + ct)
     finish = getattr(resp.choices[0], "finish_reason", None)
     return (resp.choices[0].message.content or "").strip(), finish
