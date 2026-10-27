@@ -2203,6 +2203,53 @@ def test_rescue_fixes_what_main_failed(monkeypatch):
     assert stats['blocks_fixed'] == 1
 
 
+def test_rescue_meta_records_unchanged_echoes(monkeypatch):
+    # rescue model agrees with the ORIGINAL text: the unit is neither fixed
+    # nor failed on the rescue model — it must stay failed AND be visible as
+    # units_unchanged in the level block (not silently vanish from the
+    # sent = fixed + failed accounting)
+    fake = _rescue_transport(
+        _echo_unchanged_and_corrupt, _echo_unchanged)
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    _out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 1.0}],
+    )
+    lv = stats["rescue"]["levels"][0]
+    assert lv["units_sent"] == 1
+    assert lv["units_fixed"] == 0
+    assert lv["units_unchanged"] == 1
+    assert lv["units_failed"] == 0
+    assert stats["units_failed"] == 1   # original text kept, still failed
+    assert stats["units_unchanged"] == 0  # main model never echoed unchanged
+
+
+def _echo_unchanged_and_corrupt(payload: str) -> str:
+    """Echo every unit but corrupt the first one (invariant-A failure)."""
+    lines = _echo_unchanged(payload).split("\n")
+    if lines:
+        lines[0] += "! X"
+    return "\n".join(lines)
+
+
+def test_rescue_progress_units_mode_eta():
+    import threading, time as _time
+    states = [llm_batch.ChunkState(0, "chunk", "")]
+    sched = llm_batch.BatchScheduler(
+        states, {"cell": "p", "line": "p"}, llm_batch.DocVocab("x"),
+        model="r", endpoint="e", api_key="k", sampling=None, retries=0,
+        stats={"units_sent": 0}, lock=threading.Lock(), pool=None,
+        note=lambda m: None, units_total=10)
+    sched.t0 = _time.monotonic() - 100
+    sched._enq_base = 0
+    states[0].enq_done = 2
+    text = sched._progress_text_locked()
+    assert "rescue units 2/10" in text
+    # ETA from the unit rate: 100 s for 2 units, 8 left -> 400 s = 6m40s
+    assert "6m40s" in text
+
+
 def test_rescue_not_configured_no_meta_block(monkeypatch):
     def main(chunk):
         return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e! X")

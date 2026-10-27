@@ -305,6 +305,7 @@ def _rescue_stats() -> dict:
         "units_sent": 0,
         "units_fixed": 0,
         "units_failed": 0,
+        "units_unchanged": 0,
         "units_requeued": 0,
         "units_fixed_after_requeue": 0,
         "units_inferred_missing": 0,
@@ -357,10 +358,14 @@ def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
                           f"max_fraction {max_fraction}",
             })
             continue
-        note(
+        # always shown (not verbose-gated): a silent stretch between the
+        # main pass and the first rescue batch looks like a hang — the
+        # rescue model must be loaded server-side first (measured 75-100 s)
+        print(
             f"  llm: rescue {li}/{len(levels)}: model {rmodel}, {n} failed "
             f"unit(s) ({fraction:.1%} of sent) — first call may stall while "
             "the server loads the model",
+            flush=True,
         )
         rstats = _rescue_stats()
         rsched = BatchScheduler(
@@ -369,6 +374,7 @@ def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
             lock=lock, pool=_DaemonPool(workers), note=note,
             batch_tokens=batch_tokens,
             meter=TokenMeter(rmodel, endpoint, api_key), verbose=verbose,
+            units_total=n,
         )
         with lock:
             for u in pool_units:
@@ -406,15 +412,19 @@ def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
             "model": rmodel,
             "units_sent": rstats["units_sent"],
             "units_fixed": len(rsched.applied),
+            "units_unchanged": rstats.get("units_unchanged", 0),
             "units_failed": rstats["units_failed"],
             "batches": rstats["batches"],
             "truncated_calls": rstats["truncated_api_calls"],
             "duration": round(time.monotonic() - t_level, 1),
             "tokens": rsched.meter.meta(),
         })
-        note(
+        # always shown (not verbose-gated): the outcome of the extra
+        # (possibly expensive) model switch must be visible without -v
+        print(
             f"  llm: rescue {li}: {rstats['units_fixed']} of {n} failed "
             f"unit(s) fixed in {_fmt_duration(time.monotonic() - t_level)}",
+            flush=True,
         )
         pool_units = rsched.final_failed
     stats["rescue"] = {"levels": blocks, "skipped": skipped}
@@ -485,6 +495,7 @@ def correct_with_llm(
             sink = kw.get("usage_sink") or {}
             capture_fh.write(json.dumps({
                 "system": system, "user": user,
+                "model": (a[0] if a else kw.get("model")),
                 "cap_tokens": kw.get("output_cap_tokens"),
                 "reply": reply, "finish": finish,
                 "prompt_tokens": sink.get("prompt_tokens"),
@@ -660,6 +671,7 @@ def _correct_with_llm(
         "units_sent": 0,
         "units_fixed": 0,
         "units_failed": 0,
+        "units_unchanged": 0,
         "units_skipped": 0,
         "units_requeued": 0,
         "units_fixed_after_requeue": 0,
@@ -751,20 +763,22 @@ def _correct_with_llm(
     stats["units_fixed"] = stats["blocks_fixed"]
     stats["tokens"] = meter.meta()
     stats["duration"] = time.monotonic() - t0
-    if verbose:
-        print(
-            f"  llm: done in {_fmt_duration(stats['duration'])}: "
-            f"{len(chunks)} chunks ({stats['chunks_accepted']} accepted, "
-            f"{stats['chunks_salvaged']} salvaged, {stats['chunks_rejected']} "
-            f"rejected, {stats['chunks_toc_skipped']} toc-skipped); "
-            f"{stats['units_sent']} unit(s) sent in {stats['batches']} batch(es), "
-            f"{stats['blocks_fixed']} fixed, {stats['units_failed']} failed, "
-            f"{stats['units_skipped']} vocab-skipped"
-            + (f"; rescue: {rescued} rescued by "
-               + " + ".join(lv["model"] for lv in stats["rescue"]["levels"])
-               if rescued else ""),
-            flush=True,
-        )
+    # always shown (not verbose-gated): the outcome line of a possibly
+    # hours-long pass must not require -v; the in-place progress line it
+    # replaces is gone at this point, so silence here looks like a hang
+    print(
+        f"  llm: done in {_fmt_duration(stats['duration'])}: "
+        f"{len(chunks)} chunks ({stats['chunks_accepted']} accepted, "
+        f"{stats['chunks_salvaged']} salvaged, {stats['chunks_rejected']} "
+        f"rejected, {stats['chunks_toc_skipped']} toc-skipped); "
+        f"{stats['units_sent']} unit(s) sent in {stats['batches']} batch(es), "
+        f"{stats['blocks_fixed']} fixed, {stats['units_failed']} failed, "
+        f"{stats['units_skipped']} vocab-skipped"
+        + (f"; rescue: {rescued} rescued by "
+           + " + ".join(lv["model"] for lv in stats["rescue"]["levels"])
+           if rescued else ""),
+        flush=True,
+    )
 
     # deterministic meta.json regardless of completion order
     stats["rejections"].sort(key=lambda r: r["chunk"])

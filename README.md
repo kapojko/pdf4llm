@@ -59,6 +59,8 @@ exit results); the final exit code is the worst per-file code.
 | `--llm-batch-tokens N` | fragment-token volume packed into one batched LLM echo request; default **3000** (config key `llm_batch_tokens`). Token counts come from the server tokenizer when reachable, else 1 char ≈ 1 token |
 | `--llm-auth` | interactively set & save LLM credentials |
 | `--llm-rescue NAME` | rescue model for this run: units the main model failed after all retries are re-asked ONCE on it (config key `llm_rescue`; an empty value disables rescue for the run) |
+| `--llm-keep-prellm` | write `<name>.prellm.md` — the post-prepass text exactly as the LLM pass chunks it; the `chunk_offsets` in meta.json refer to it, so fail-log `line`/`cell` coordinates resolve back into the document |
+| `--llm-capture` | append every LLM request/reply pair (full prompts, reply, finish reason, token usage, latency, model) to `<name>.exchange.jsonl` — the raw material for offline replay of failures on other models |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
 
@@ -109,9 +111,12 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
    selects the prompt — never the safety rules.
 2. **Constrained edits** — the model may only perform formatting/whitespace
    fixes: join split words (`D-t yp e` → `D-type`), subscript joins
-   (`V CC` → `VCC`, `T amb` → `T_amb`), part-number hyphen joins
+   (`V CC` → `VCC`, only when the joined form `VCC` actually occurs in the
+   document), part-number hyphen joins
    (`SOT108 - 1` → `SOT108-1`), false line-break removal, and `<br>`
-   split-marker removal (see the verifier below). Nothing else.
+   split-marker removal (see the verifier below). Nothing else — the
+   pipeline never inserts entities the source does not contain (e.g. no
+   underscore is ever inserted into `T amb`).
 3. **Structure never passes through the model** — the pass is
    structure-aware, and the granularity matches where a small model is
    actually reliable:
@@ -171,8 +176,10 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
    It fires only when the failure fraction is within the configured ceiling
    (default 0.5 of units sent); a fix on the rescue model counts like any
    other verified fix, a second failure keeps the original text. Measured
-   on SAM9X60: a diverse rescue model fixes ~53% of the exhausted tail
-   (vs ~6.5% for another same-model retry round).
+   on SAM9X60 (2288 pages, full document): a diverse rescue model fixed
+   85% of the exhausted tail in one pass (vs ~6.5% for another same-model
+   retry round), at a ~4–5x slower decode rate — budget roughly the
+   rescue stage's own wall time in addition to the main pass.
    All decisions are
    logged to `meta.json` (`llm` section: classification, accepted/salvaged/
    rejected/toc-skipped counts, units sent/fixed/failed/skipped, batches,
@@ -180,11 +187,17 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
    reasons, `rescue` block with per-level stats and skip reasons).
 
 Deterministic pre-passes run before the LLM pass — no model involvement:
-duplicated-bullet cleanup (`- • x` → `- x`), horizontal-rule stripping,
-TOC dot-leader collapsing (runs of 4+ dots → one space; models reliably try
-to trim dot leaders themselves, which poisons whole chunks), and mechanical
+duplicated-bullet cleanup (`- • x` → `- x`), dash-bullet repair (two-level
+`•`/`–` lists rebuilt deterministically, never matching a dash without
+trailing whitespace), horizontal-rule stripping, TOC dot-leader collapsing
+(runs of 4+ dots → one space; models reliably try
+to trim dot leaders themselves, which poisons whole chunks), mechanical
 `<br>` split-word joins (`Co<br>ntrol` → `Control` where the next character
-is lowercase — the ambiguous cases go to the model as batched units).
+is lowercase — the ambiguous cases go to the model as batched units),
+false-space joins around underscores between word characters
+(`SDRAMC _ WPSR` → `SDRAMC_WPSR`), and evidence-gated subscript joins
+(`V CC` → `VCC` only when `VCC` occurs as written in the document; one-sided
+and unevidenced cases are left as extracted for the model to attempt).
 
 Set credentials once:
 
@@ -218,18 +231,23 @@ against to detect stale conversions.
 
 Chunk producers (deterministic scan + one whole-chunk prose attempt per
 prose chunk) run concurrently with the batch requests in the worker pool.
-The pass prints unconditional progress: a line per batch
-(`llm: batch 12: 20 fragment(s), 4800 chars`), a per-chunk line at the end
-for every rejected or salvaged chunk, and a totals summary — accepted /
+The pass always prints (no `-v` needed): a single in-place progress line
+(`llm: chunks N/M (ok ...), N batch(es), elapsed, ~ETA left`; unit-based
+`llm: rescue units ...` during a rescue stage), the rescue-stage start/done
+lines when a rescue model runs, and a totals summary at the end — accepted /
 salvaged / rejected / toc-skipped chunks, units sent/fixed/failed/skipped,
-elapsed time. With
+elapsed time. `-v/--verbose` additionally prints a line per batch
+(`llm: batch 12: 20 fragment(s), 4800 chars`) and a per-chunk line for every
+rejected or salvaged chunk. With
 a llama-swappy server (v1.3+) the tool probes its `GET /llama-swappy/info`
 self-description endpoint and:
 
 - runs with **1 worker by default**: on the batched pipeline a single large request already saturates the server's decode (benchmarked on ling-3.0-tiny-np8 with dflash, 2026-10: w1/w2/w4/w8 within run-to-run noise at batch 10000; the pre-batching w4→w8 ≈ 1.75x scaling no longer applies). Slots are still surfaced in the probe line, and an explicit `--llm-workers` overrides the default;
 - reads the per-request `contextSize` (total `-c` divided by slots) and checks
-  a rough token estimate (input + up to 2x-size output + margin,
-  ~3.5 chars/token) for the **largest actual chunk** against it; if a chunk
+  the **largest actual chunk** against it (input counted exactly via the
+  server tokenizer when reachable, else ~3.5 chars/token; output budgeted
+  as 3x the input plus a margin — a whole-chunk prose attempt may
+  legitimately produce ~2x its input): if a chunk
   provably cannot fit, the pass is **aborted before any LLM call** (exit code
   4) — reduce the chunk size or raise the server context.
 
@@ -281,14 +299,22 @@ the current pipeline.
   the symptom is unmistakable — a spike of `REJECTED ... truncated x1` chunks
   at 2–4x the usual per-chunk time (thinking burns the output-token cap) —
   and the fix is `--reasoning off` on that server instance.
-- `max_tokens` per request is **capped relative to the input** (2x input
-  tokens, 3.5 chars/token + 256 margin; for batched echo requests the cap
-  scales with the FRAGMENT volume, not the whole prompt — CONTEXT rows and
-  retry notes inflate the prompt but not the expected output): the pass is
+- `max_tokens` per request is **capped relative to the expected output**:
+  `1.35 × learned per-kind expansion EMA × fragment tokens + margin` —
+  token counts come from the server tokenizer when reachable (else a
+  pessimistic 1 char ≈ 1 token), the expansion factor per batch kind
+  (cell / line / whole-chunk) is learned online from actual
+  `usage.completion_tokens`, and the cap scales with the FRAGMENT volume,
+  not the whole prompt — CONTEXT rows and retry notes inflate the prompt
+  but not the expected output. The pass is
   whitespace-only, so a healthy answer fits easily, while a looping model is
   cut off quickly instead of burning thousands of tokens. The truncated
   output then fails verification and the normal requeue machinery runs.
-  Truncated calls are counted in `meta.json` (`llm.truncated_calls`).
+  Truncated calls are counted in `meta.json` (`llm.truncated_calls` as
+  per-chunk incidences, `llm.truncated_api_calls` as real
+  finish=length HTTP calls; replies whose `N|` ordinals drifted from the
+  requested indices are detected and recovered positionally —
+  `llm.replies_renumbered` / `llm.units_renumbered_recovered`).
 - Chunking default is a deliberately small 2000 chars (`--llm-chunk-chars`),
   which keeps small local models (e.g. 9B) on-task and makes per-chunk
   failures cheap.

@@ -269,7 +269,8 @@ class BatchScheduler:
                  vocab: DocVocab, *, model: str, endpoint: str, api_key: str,
                  sampling: dict | None, retries: int, stats: dict,
                  lock, pool, note=None, batch_tokens: int = BATCH_TOKENS,
-                 meter=None, verbose: bool = False) -> None:
+                 meter=None, verbose: bool = False,
+                 units_total: int | None = None) -> None:
         self.states = states
         self.prompts = prompts          # kind -> system prompt
         self.vocab = vocab
@@ -294,6 +295,13 @@ class BatchScheduler:
         self.prog: LineProgress | None = None
         self.t0: float | None = None
         self.verbose = verbose  # gates TTY line-breaks before plain prints
+        # units_total: unit-based progress (rescue pass) instead of the
+        # chunk-based default. The rescue scheduler starts with every chunk
+        # already produced AND settled by the main pass, so chunk-settling
+        # rate (and its ETA) is meaningless there — progress must count the
+        # pooled units it actually re-asks.
+        self.units_total = units_total
+        self._enq_base = 0  # enq_done snapshot at start (units mode)
         self._gid = 0
         # units finalized as failed (retries exhausted) / units whose verified
         # fix was applied. The rescue pass (llm_run) re-enqueues final_failed
@@ -365,6 +373,8 @@ class BatchScheduler:
     def run(self) -> None:
         self.t0 = time.monotonic()
         self.prog = LineProgress()
+        if self.units_total is not None:
+            self._enq_base = sum(cs.enq_done for cs in self.states)
         while True:
             batch = None
             progress = ""
@@ -401,6 +411,16 @@ class BatchScheduler:
         and meta.json, not to a (terminal-width-capped) progress line.
         """
         elapsed = time.monotonic() - self.t0
+        if self.units_total is not None:
+            # rescue mode: ETA from the unit resolve rate, not chunk settles
+            # (every chunk is already settled when the rescue pass starts)
+            resolved = sum(cs.enq_done for cs in self.states) - self._enq_base
+            text = (f"  llm: rescue units {resolved}/{self.units_total}, "
+                    f"{self.batches_sent} batch(es), {_fmt_duration(elapsed)}")
+            if resolved:
+                eta = elapsed / resolved * (self.units_total - resolved)
+                text += f", ~{_fmt_duration(eta)} left"
+            return text
         total = self.producers_total
         ok = salv = rej = toc = settled = 0
         for cs in self.states:
@@ -563,6 +583,8 @@ class BatchScheduler:
                 new = new.strip()
             if not new.strip() or new.strip() == u.text.strip():
                 cs.units_unchanged += 1
+                self.stats["units_unchanged"] = \
+                    self.stats.get("units_unchanged", 0) + 1
                 cs.enq_done += 1
                 continue  # unchanged (or empty) echo: nothing to apply
             if u.kind == "cell":
