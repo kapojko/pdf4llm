@@ -4,6 +4,7 @@ No network access needed — only the pure functions are exercised (the parallel
 --llm-workers path and the llama-swappy probe are tested with stubs).
 """
 import json
+import math
 import re
 
 import pytest
@@ -19,6 +20,7 @@ from pdf4llm import (
     llm_salvage,
     llm_server,
     llm_table,
+    llm_tokens,
     llm_verify,
 )
 
@@ -1238,6 +1240,150 @@ def test_run_missing_index_not_inferred_on_truncation(monkeypatch):
         doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
     assert stats["units_inferred_missing"] == 0
     assert stats["truncated_calls"] == 1
+    assert stats["truncated_api_calls"] == 1   # one HTTP call, one chunk
+    assert stats["unit_fail_log"][-1]["reason"] == "missing from truncated output"
+
+
+def test_truncated_api_call_counted_once_per_call(monkeypatch):
+    # a truncated batch spanning two chunks counts one API call (the real
+    # HTTP truncations) but two per-chunk incidences in truncated_calls
+    doc = ("# H1\n\n| R0 | D-t yp e |\n\n# H2\n\n| R1 | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-type", "length"
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False,
+        retries=0, max_chars=20)
+    assert stats["truncated_calls"] == 2       # per-chunk incidences
+    assert stats["truncated_api_calls"] == 1   # real HTTP calls
+
+
+def test_parse_reply_records_raw_ordinals_for_drift():
+    # the model renumbered the reply 1..n instead of echoing the gids:
+    # nothing matches `want`, but the raw ordinal sequence/text expose the
+    # drift signature and the positional mapping
+    resp = "1| first\ncontinued\n2| second\n9| extra"
+    info = llm_protocol._parse_reply(resp, {10, 11})
+    assert info.got == {}
+    assert info.ord_seq == [1, 2, 9]
+    assert info.ord_text[1] == "first\ncontinued"
+    assert info.ord_text[2] == "second"
+    assert info.ord_text[9] == "extra"
+
+
+def test_run_renumbered_reply_units_fail_as_drift(monkeypatch):
+    # zero overlap AND no clean 1..n prefix -> nothing recoverable: the
+    # whole batch fails with the drift reason (distinct in the fail log)
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "2| D-type\n3| D-typ f", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
+    assert out == _prep(doc)                    # originals kept
+    assert stats["replies_renumbered"] == 1
+    assert stats["units_renumbered_recovered"] == 0
+    assert stats["units_failed"] == 2
+    reasons = {e["reason"] for e in stats["unit_fail_log"]}
+    assert reasons == {"renumbered reply (model drift)"}
+
+
+def test_run_renumbered_reply_recovered_positionally(monkeypatch):
+    # the SAM9X60 requeue failure mode: on a requeued batch (gids above the
+    # reply's 1..n range) the model restarts numbering at 1. A clean 1..n
+    # prefix maps back positionally; every mapped text still passes the
+    # per-unit verifier before it is applied.
+    doc = ("Register description with D-type D-typf D-typg D-typi D-typj D-typk marks.\n"
+           "| R0 | D-t yp e | D-t yp f | D-t yp g | D-t yp h | D-t yp i "
+           "| D-t yp j |")
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        if len(calls) == 1:
+            return ("0| D-t yp e\n1| D-t yp f\n2| D-t yp g\n3| D-t yp h",
+                    "length")                     # units 4,5 lost
+        return "1| D-typ i\n2| D-typ j", None     # renumbered 1..n
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=1)
+    assert "| R0 | D-t yp e | D-t yp f | D-t yp g | D-t yp h | D-typ i | D-typ j |" in out
+    assert stats["replies_renumbered"] == 1
+    assert stats["units_renumbered_recovered"] == 2
+    assert stats["cells_fixed"] == 2 and stats["units_failed"] == 0
+
+
+def test_run_renumbered_drift_failure_carries_hint_on_requeue(monkeypatch):
+    # after a drift failure the requeue payload carries the anti-renumbering
+    # NOTE, and a positional recovery on the next round still applies fixes
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        if len(calls) == 1:
+            return "0| D-t yp e", "length"      # round 1: unit 1 lost
+        if len(calls) == 2:
+            return "2| D-typ f", None           # round 2: drift, not 1..n
+        assert "never renumber" in chunk        # round 3: NOTE hint present
+        return "1| D-typ f", None               # round 3: drift, recoverable
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=2)
+    # round 3: the reply's '1|' collides with the requeued unit's gid 1, so
+    # it is an ordinary (verified) echo — the fix applies on the normal path
+    assert "| R0 | D-t yp e | D-typ f |" in out
+    assert stats["replies_renumbered"] == 1
+    assert stats["units_renumbered_recovered"] == 0
+    assert stats["cells_fixed"] == 1 and stats["units_failed"] == 0
+
+
+def test_run_renumbered_shifted_mapping_fails_verification(monkeypatch):
+    # a shifted/garbage 1..n mapping on non-identical cells cannot sneak
+    # through: the misplaced texts fail invariant A and take the rejection
+    # path (original text kept)
+    doc = ("Register description with D-type D-typf D-typg D-typi D-typj D-typk marks.\n"
+           "| R0 | D-t yp e | D-t yp f | D-t yp g | D-t yp h | D-t yp i "
+           "| D-t yp j |")
+    calls = []
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        calls.append(chunk)
+        if len(calls) == 1:
+            return ("0| D-t yp e\n1| D-t yp f\n2| D-t yp g\n3| D-t yp h",
+                    "length")                          # units 4,5 lost
+        return "1| D-typ h\n2| D-typ i", None          # shifted texts
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=1)
+    # every positionally-mapped text belongs to a different unit: invariant
+    # A rejects both, the original cells are kept verbatim
+    assert out == _prep(doc)
+    assert stats["replies_renumbered"] == 1
+    assert stats["units_renumbered_recovered"] == 2   # remapped, none applied
+    assert stats["cells_fixed"] == 0 and stats["units_failed"] == 2
+    # 'length' finish means the tail may be cut mid-repair -> inference is
+    # deliberately disabled, the unit requeues as a truncated-output loss
+    doc = ("Register description with D-type and D-typf marks elsewhere.\n"
+           "| R0 | D-t yp e | D-t yp f |")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-type", "length"
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False, retries=0)
+    assert stats["units_inferred_missing"] == 0
+    assert stats["truncated_calls"] == 1
     assert stats["unit_fail_log"][-1]["reason"] == "missing from truncated output"
 
 
@@ -1596,12 +1742,15 @@ def test_token_meter_naive_fallback_on_unreachable_tokenizer(monkeypatch):
 def test_token_meter_cap_and_expansion_ema():
     import pdf4llm.llm_tokens as llm_tokens
     meter = llm_tokens.TokenMeter("m", "http://x", "k", exact=False)
-    # init 2.0 (the measured rewrite ceiling)
-    assert meter.cap_for("cell", 100) == 2 * 100 + llm_client._OUT_MARGIN_TOKENS
+    # init 2.0 (the measured rewrite ceiling) x the 1.35 tail headroom
+    # (SAM9X60 2026-10: 16/17 unit-losing cap cuts needed <= 1.31x)
+    assert meter.cap_for("cell", 100) == \
+        math.ceil(2.0 * 1.35 * 100) + llm_client._OUT_MARGIN_TOKENS
     # EMA: 0.7*2.0 + 0.3*3.0 = 2.3 after one observation of 3x
     meter.record("cell", 100, {"prompt_tokens": 10, "completion_tokens": 300})
     assert meter.expansion["cell"] == pytest.approx(2.3)
-    assert meter.cap_for("cell", 100) == 230 + llm_client._OUT_MARGIN_TOKENS
+    assert meter.cap_for("cell", 100) == \
+        math.ceil(2.3 * 1.35 * 100) + llm_client._OUT_MARGIN_TOKENS
     # other kinds unaffected
     assert meter.expansion["line"] == 2.0
     # degenerate observation is clamped at 8x
@@ -1844,8 +1993,8 @@ def test_batch_output_cap_scales_with_fragments_not_prompt(monkeypatch):
     assert len(caps) == 1
     # the cap scales with the FRAGMENT token count ('D-t yp e' -> 8 tokens
     # under the naive 1 char = 1 token fallback), not the whole prompt
-    # (payload + CONTEXT row are much longer): EMA 2.0 x 8 + margin
-    assert caps[0] == 2 * 8 + llm_client._OUT_MARGIN_TOKENS
+    # (payload + CONTEXT row are much longer): EMA 2.0 x headroom 1.35 x 8
+    assert caps[0] == math.ceil(2.0 * 1.35 * 8) + llm_client._OUT_MARGIN_TOKENS
 
 
 def test_wholechunk_yield_accounting(monkeypatch):
@@ -1965,3 +2114,265 @@ def test_chunkstate_apply_line_guarded_by_line_map():
     assert not cs.apply_line(9, "X")              # out-of-range original index
     assert cs.apply_line(2, "C2")
     assert cs.out_lines == ["a b", "C2"]
+
+
+# ---------------------------------------------------------------------------
+# Rescue pass (second-model salvage for exhausted units)
+# ---------------------------------------------------------------------------
+
+_RESCUE_DOC = (
+    "Register table: D-type and flip-flop devices.\n"
+    "\n"
+    "| D-t yp e | 14 |\n"
+    "| fli p -flo p | 13 |\n"
+)
+
+
+def _rescue_transport(main_reply, rescue_reply):
+    """Transport stub: model 'm' always answers main_reply, model 'r' the
+    rescue reply (echoed per numbered unit, so multi-unit payloads work)."""
+    def fake_call(system_prompt, chunk, model, *a, **kw):
+        reply = main_reply if model == "m" else rescue_reply
+        if callable(reply):
+            return reply(chunk), None
+        return reply, None
+    return fake_call
+
+
+def test_rescue_fixes_what_main_failed(monkeypatch):
+    def main(chunk):
+        return _echo_unchanged(chunk).replace(
+            "0| D-t yp e", "0| D-t yp e! X")  # invariant-A violation, every try
+    fake = _rescue_transport(main, "0| D-type")
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 1.0}],
+    )
+    # main model failed cell 0 through all retries (2 requeues -> 3 fails)
+    # and it is re-asked ONCE on the rescue model, which fixes it
+    assert "D-type" in out
+    assert stats["units_failed"] == 0
+    levels = stats["rescue"]["levels"]
+    assert len(levels) == 1
+    lv = levels[0]
+    assert lv["model"] == "r"
+    assert lv["units_sent"] == 1
+    assert lv["units_fixed"] == 1
+    assert lv["units_failed"] == 0
+    assert lv["batches"] == 1
+    # the rescued chunk upgrades: its only failure was rescued, so it is
+    # fully accepted with one applied fix (not merely salvaged)
+    assert stats['chunks_accepted'] == 2
+    assert stats['blocks_fixed'] == 1
+
+
+def test_rescue_not_configured_no_meta_block(monkeypatch):
+    def main(chunk):
+        return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e! X")
+    fake = _rescue_transport(main, "0| D-type")
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    _out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False)
+    assert "rescue" not in stats
+    assert stats["units_failed"] == 1
+
+
+def test_rescue_skipped_no_failures(monkeypatch):
+    fake = _rescue_transport(_echo_unchanged, "0| D-type")
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    _out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 1.0}],
+    )
+    assert stats["rescue"]["levels"] == []
+    assert stats["rescue"]["skipped"][0]["reason"] == "no failed units"
+    assert stats["units_failed"] == 0
+
+
+def test_rescue_skipped_fraction_ceiling(monkeypatch):
+    def main(chunk):
+        return _echo_unchanged(chunk).replace(
+            "0| D-t yp e", "0| D-t yp e! X").replace(
+            "1| fli p -flo p", "1| fli p -flo p! X")
+    fake = _rescue_transport(main, "0| D-type")
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    _out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 0.01}],
+    )
+    assert stats["rescue"]["levels"] == []
+    assert "exceeds max_fraction" in stats["rescue"]["skipped"][0]["reason"]
+    # original text kept: the rescue never ran
+    assert stats["chunks_rejected"] == 2 or stats["chunks_rejected"] >= 1
+    assert "D-t yp e" in _out
+
+
+def test_rescue_single_attempt_no_requeue(monkeypatch):
+    # rescue model also fails the unit: with retries=0 the failure is final
+    # immediately (one rescue request per unit, no same-model requeue)
+    def main(chunk):
+        return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e! X")
+
+    def rescue(chunk):
+        return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e? Y")
+
+    fake = _rescue_transport(main, rescue)
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 1.0}],
+    )
+    lv = stats["rescue"]["levels"][0]
+    assert lv["units_failed"] == 1
+    assert lv["units_fixed"] == 0
+    assert lv["batches"] == 1          # one batch: no requeue round
+    assert "D-t yp e" in out           # original text kept
+    # the rescue failure lands in the shared fail log with the rescue model id
+    last = stats["unit_fail_log"][-1]
+    assert last["model"] == "r"
+
+
+def test_rescue_note_hint_carries_previous_reason(monkeypatch):
+    payloads: list[str] = []
+
+    def main(chunk):
+        return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e! X")
+
+    def rescue(chunk):
+        payloads.append(chunk)
+        return "0| D-type"
+
+    fake = _rescue_transport(main, rescue)
+    monkeypatch.setattr(llm_run, "_call_llm", fake)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake)
+    llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 1.0}],
+    )
+    assert payloads, "rescue request missing"
+    # fresh batch positions: the rescue request renumbers units from 0
+    assert re.search(r"^0\| D-t yp e", payloads[-1], re.M)
+    # and carries the level-0 rejection reason as the per-unit NOTE hint
+    assert re.search(r"NOTE 0: .*REJECTED \(invariant A", payloads[-1])
+
+
+def test_rescue_second_level_gets_remaining_failures(monkeypatch):
+    def main(chunk):
+        return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e! X")
+
+    def r1(chunk):
+        return _echo_unchanged(chunk).replace("0| D-t yp e", "0| D-t yp e? Y")
+
+    fake = _rescue_transport(main, lambda c: r1(c) if True else c)
+    # second rescue model 'r2' fixes it
+    def fake2(system_prompt, chunk, model, *a, **kw):
+        if model == "m":
+            return main(chunk), None
+        if model == "r":
+            return r1(chunk), None
+        return "0| D-type", None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake2)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake2)
+    out, stats = llm_run.correct_with_llm(
+        _RESCUE_DOC, "m", "http://x", "k", verbose=False, classify=False,
+        rescue=[{"model": "r", "max_fraction": 1.0},
+                {"model": "r2", "max_fraction": 1.0}],
+    )
+    models = [lv["model"] for lv in stats["rescue"]["levels"]]
+    assert models == ["r", "r2"]
+    assert stats["rescue"]["levels"][1]["units_fixed"] == 1
+    assert stats["units_failed"] == 0
+    assert "D-type" in out
+
+
+def test_normalize_rescue_spec():
+    assert llm_run.normalize_rescue(None) == []
+    assert llm_run.normalize_rescue("") == []
+    assert llm_run.normalize_rescue("m") == [
+        {"model": "m", "max_fraction": 0.5}]
+    assert llm_run.normalize_rescue(["m", {"model": "n", "max_fraction": 0.1}]) == [
+        {"model": "m", "max_fraction": 0.5},
+        {"model": "n", "max_fraction": 0.1}]
+    with pytest.raises(ValueError):
+        llm_run.normalize_rescue([{"max_fraction": 0.1}])
+    with pytest.raises(ValueError):
+        llm_run.normalize_rescue(42)
+
+
+def test_load_503_retried_then_succeeds(monkeypatch):
+    # llama-swappy (updated 2026-10) answers 503 'Loading' while a model is
+    # being loaded: the transport must retry transiently, bounded
+    import litellm
+
+    class _Msg:
+        content = " OK "
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = "stop"
+
+    class _Resp:
+        choices = [_Choice()]
+
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("OpenAIException - Loading")
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "completion", flaky)
+    monkeypatch.setattr(llm_client, "_LOAD_RETRY_SLEEP_S", 0.0)
+    reply, finish = llm_client._call_llm("sys", "user", "m", "http://x", "k")
+    assert reply == "OK" and finish == "stop" and len(calls) == 3
+
+
+def test_load_503_bounded_then_error(monkeypatch):
+    import litellm
+
+    def always_loading(*a, **kw):
+        raise RuntimeError("OpenAIException - Loading")
+
+    monkeypatch.setattr(litellm, "completion", always_loading)
+    monkeypatch.setattr(llm_client, "_LOAD_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(llm_client, "_LOAD_RETRIES", 2)
+    reply, finish = llm_client._call_llm("sys", "user", "m", "http://x", "k")
+    assert reply == "" and "Loading" in finish
+
+
+def test_token_meter_reprobes_after_failed_probe(monkeypatch):
+    # llama-swappy routes /llama/tokenize to the LOADED model: a rescue
+    # meter probing before the model load degrades to naive — but must
+    # re-probe after _PROBE_RETRY_S instead of degrading forever
+    meter = llm_tokens.TokenMeter("m", "http://x", "k")
+    state = {"ok": False}
+
+    def fake_post(content):
+        return len(content) if state["ok"] else None
+
+    monkeypatch.setattr(meter, "_post_tokenize", fake_post)
+    assert meter.exact is None
+    assert meter.count("abc") == 3          # naive: probe failed
+    assert meter.exact is False
+    assert meter._probe_degraded is True
+    assert meter.count("abcde") == 5        # still within the retry window
+    # time passes (model loaded -> tokenizer answers), next count re-probes
+    state["ok"] = True
+    meter._probe_failed_at -= llm_tokens._PROBE_RETRY_S * 2
+    assert meter.count("abcdef") == 6
+    assert meter.exact is True
+
+
+def test_token_meter_explicit_naive_never_probes():
+    # exact=False is a deliberate offline/test mode: no probing, ever
+    meter = llm_tokens.TokenMeter("m", "http://x", "k", exact=False)
+    assert meter.count("abc") == 3
+    assert meter.exact is False and meter._probe_degraded is False

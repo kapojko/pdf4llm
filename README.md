@@ -56,8 +56,9 @@ exit results); the final exit code is the worst per-file code.
 | `--llm / --no-llm` | run local-LLM broken-text correction (default **on**; `--no-llm` skips it) |
 | `--llm-workers N` | parallel LLM chunk requests; default **1** (rationale: see the llama-swappy section below) |
 | `--llm-chunk-chars N` | max chunk size (chars) for the LLM pass; default **2000** (config key `llm_chunk_chars`). Smaller chunks are more stable on small local models |
-| `--llm-batch-chars N` | fragment-char volume packed into one batched LLM echo request; default **10000**. Benchmarked on ling-3.0-tiny-np8: 10k ≈ 16% faster than 5k, 20k no further gain |
+| `--llm-batch-tokens N` | fragment-token volume packed into one batched LLM echo request; default **3000** (config key `llm_batch_tokens`). Token counts come from the server tokenizer when reachable, else 1 char ≈ 1 token |
 | `--llm-auth` | interactively set & save LLM credentials |
+| `--llm-rescue NAME` | rescue model for this run: units the main model failed after all retries are re-asked ONCE on it (config key `llm_rescue`; an empty value disables rescue for the run) |
 | `--model NAME` | override LLM model (else from saved config) |
 | `-v/--verbose` | verbose output |
 
@@ -162,11 +163,21 @@ safety is enforced by an algorithmic verifier, never by trusting the model:
    its batch queue with its rejection reason attached, up to `llm_retries`
    extra attempts; the next batch carries the reason as a per-unit NOTE line.
    Whatever still fails verification stays as
-   the original — rejection is always safe, never silent. All decisions are
+   the original — rejection is always safe, never silent.
+   **Rescue pass**: when a rescue model is configured (`llm_rescue`, or
+   `--llm-rescue`), units that exhausted all retries on the main model are
+   re-asked once on the rescue model after the main pass ends (fresh batch
+   positions, the rejection reason attached as a NOTE hint; same verifier).
+   It fires only when the failure fraction is within the configured ceiling
+   (default 0.5 of units sent); a fix on the rescue model counts like any
+   other verified fix, a second failure keeps the original text. Measured
+   on SAM9X60: a diverse rescue model fixes ~53% of the exhausted tail
+   (vs ~6.5% for another same-model retry round).
+   All decisions are
    logged to `meta.json` (`llm` section: classification, accepted/salvaged/
    rejected/toc-skipped counts, units sent/fixed/failed/skipped, batches,
    cells sent/fixed, whole-chunk yield, per-unit failure log, per-chunk
-   reasons).
+   reasons, `rescue` block with per-level stats and skip reasons).
 
 Deterministic pre-passes run before the LLM pass — no model involvement:
 duplicated-bullet cleanup (`- • x` → `- x`), horizontal-rule stripping,
@@ -188,7 +199,11 @@ when absent, **no sampling parameters are sent** and the server-side model
 defaults apply — the tool never overrides temperature), `llm_retries`
 (default 2; a unit that fails parsing or verification is requeued up to
 this many extra times — never retried in place — and the next batch carries
-its rejection reason as a per-unit NOTE line) and `llm_chunk_chars`
+its rejection reason as a per-unit NOTE line), `llm_rescue` (rescue model;
+a model name or a list of `{model, max_fraction}` levels — after the main
+pass, exhausted units are re-asked once on it when the failure fraction is
+within `max_fraction`, default 0.5), `llm_batch_tokens` (default 3000; same
+as `--llm-batch-tokens`) and `llm_chunk_chars`
 (default 2000; same as `--llm-chunk-chars`).
 Then:
 

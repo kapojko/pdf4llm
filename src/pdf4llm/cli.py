@@ -30,7 +30,7 @@ import pymupdf
 import typer
 
 from . import __version__, checks, config as cfg, convert, prune
-from .llm_run import correct_with_llm
+from .llm_run import correct_with_llm, normalize_rescue
 from .llm_server import LlmContextError, LlmInterrupted, probe_swappy
 from .progress import LineProgress
 
@@ -81,11 +81,42 @@ def _setup_llm() -> None:
     if model:
         c["model"] = model
 
+    # rescue model (optional): re-asks units the main model failed after all
+    # retries, once, on a different model (see llm_run._run_rescue)
+    cur_rescue = normalize_rescue(c.get("llm_rescue"))
+    cur_rescue_str = ", ".join(lv["model"] for lv in cur_rescue) or "none"
+    rescue = ""
+    if models:
+        typer.echo(
+            "Rescue model — re-asks units the main model failed after all "
+            f"retries (current: {cur_rescue_str}; '-' clears, empty keeps)"
+        )
+        choice = input("Rescue model [1-{n}, name, '-', or empty]: ".format(
+            n=len(models))).strip()
+        if choice == "-":
+            c.pop("llm_rescue", None)
+        elif choice:
+            if choice.isdigit() and 1 <= int(choice) <= len(models):
+                rescue = models[int(choice) - 1]
+            else:
+                rescue = choice
+            c["llm_rescue"] = [{"model": rescue, "max_fraction": 0.5}]
+    else:
+        rescue = input(
+            f"rescue model name [{cur_rescue_str}; '-' clears, empty keeps]: "
+        ).strip()
+        if rescue == "-":
+            c.pop("llm_rescue", None)
+        elif rescue:
+            c["llm_rescue"] = [{"model": rescue, "max_fraction": 0.5}]
+
     path = cfg.save_config(c)
+    rescue_now = normalize_rescue(c.get("llm_rescue"))
+    rescue_str = ", ".join(lv["model"] for lv in rescue_now) or "none"
     typer.echo(
         f"LLM config saved to {path}  "
         f"(model={c.get('model')}, endpoint={c.get('endpoint')}, "
-        f"api_key={cfg.mask(c.get('api_key', ''))})"
+        f"api_key={cfg.mask(c.get('api_key', ''))}, rescue={rescue_str})"
     )
     # server self-description (llama-swappy), same info the conversion stage
     # prints before an --llm pass: slots / per-request context at hand when
@@ -316,8 +347,13 @@ def convert_cmd(
     llm_capture: bool = typer.Option(
         False, "--llm-capture",
         help="Log every LLM request/reply pair to <name>.exchange.jsonl "
-             "(raw transcript for offline replay / model-escalation "
-             "experiments).",
+             "(raw transcript for offline replay / rescue-pass experiments).",
+    ),
+    llm_rescue: str = typer.Option(
+        None, "--llm-rescue", metavar="MODEL",
+        help="Override the rescue model for this run: after the main pass, "
+             "units that failed all retries are re-asked ONCE on this model "
+             "(config key llm_rescue). Pass an empty value to disable rescue.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
@@ -363,6 +399,7 @@ def convert_cmd(
             llm_workers=llm_workers, llm_chunk_chars=llm_chunk_chars,
             llm_batch_tokens=llm_batch_tokens, verbose=verbose,
             llm_keep_prellm=llm_keep_prellm, llm_capture=llm_capture,
+            llm_rescue=llm_rescue,
         )
         codes.append(code)
         if code == 130:  # user interrupt: do not start the remaining files
@@ -516,6 +553,7 @@ def _process_one(
     llm_batch_tokens: int | None,
     llm_keep_prellm: bool,
     llm_capture: bool,
+    llm_rescue: str | None,
     verbose: bool,
 ) -> int:
     """Convert one PDF; returns the exit code for this file (0 = ok)."""
@@ -572,6 +610,11 @@ def _process_one(
             )
             return 3
         chunk_chars = llm_chunk_chars or int(c.get("llm_chunk_chars", 2000))
+        # rescue levels: --llm-rescue overrides the config for this run
+        # (a value overrides, an empty value disables, absent -> config)
+        rescue_spec = (llm_rescue if llm_rescue is not None
+                       else c.get("llm_rescue"))
+        rescue_levels = normalize_rescue(rescue_spec)
         text = md_path.read_text(encoding="utf-8")
         try:
             text, llm_stats = correct_with_llm(
@@ -583,6 +626,7 @@ def _process_one(
                              if llm_keep_prellm else None),
                 capture_path=(str(md_path.with_suffix(".exchange.jsonl"))
                               if llm_capture else None),
+                rescue=rescue_levels,
             )
         except LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)

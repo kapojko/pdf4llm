@@ -103,7 +103,7 @@ def test_setup_llm_picks_model(tmp_path, monkeypatch):
 
     monkeypatch.setattr(config, "config_path", lambda: tmp_path / "config.json")
     monkeypatch.setattr(config, "fetch_models", lambda e, k: ["model-a", "model-b"])
-    answers = iter(["http://h/v1", "key", "2"])  # endpoint, key, pick #2
+    answers = iter(["http://h/v1", "key", "2", ""])  # endpoint, key, pick #2, no rescue
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **k: next(answers))
     cli._setup_llm()
@@ -111,6 +111,23 @@ def test_setup_llm_picks_model(tmp_path, monkeypatch):
     c = config.load_config()
     assert c["model"] == "model-b"
     assert c["endpoint"] == "http://h/v1"
+    assert "llm_rescue" not in c
+
+
+def test_setup_llm_rescue_model(tmp_path, monkeypatch):
+    import pdf4llm.cli as cli
+    from pdf4llm import config
+
+    monkeypatch.setattr(config, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(config, "fetch_models", lambda e, k: ["model-a", "model-b"])
+    answers = iter(["http://h/v1", "key", "1", "2"])  # + rescue = model-b
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **k: next(answers))
+    cli._setup_llm()
+
+    c = config.load_config()
+    assert c["model"] == "model-a"
+    assert c["llm_rescue"] == [{"model": "model-b", "max_fraction": 0.5}]
 
 
 def test_mask_hides_key():

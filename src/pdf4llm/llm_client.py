@@ -54,6 +54,48 @@ def output_token_cap(n_chars: int) -> int:
     return 2 * math.ceil(max(1, n_chars) / _CHARS_PER_TOKEN) + _OUT_MARGIN_TOKENS
 
 
+# llama-swappy (updated 2026-10) answers 503 'Loading' while a newly
+# requested model is being loaded instead of holding the connection. Retry
+# these transient errors with a short backoff — a single-pass rescue request
+# must not be wasted by the model switch it necessarily triggers. Bounded:
+# after _LOAD_RETRIES failed attempts the error travels to the caller (safe
+# rejection). Measured model loads: 75-100 s (74B and 9B alike).
+_LOAD_RETRY_SLEEP_S = 2.0
+_LOAD_RETRIES = 90
+
+
+def _completion_with_load_retry(model, prompt_system, user_content, endpoint,
+                                api_key, max_tokens, extra, std):
+    """litellm.completion with a bounded retry loop for 'Loading' 503s."""
+    import time
+
+    import litellm  # lazy import
+
+    litellm.suppress_debug_info = True
+    for attempt in range(_LOAD_RETRIES + 1):
+        try:
+            return litellm.completion(
+                model=f"openai/{model}",
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": user_content},
+                ],
+                api_base=endpoint,
+                api_key=api_key,
+                max_tokens=max_tokens,
+                timeout=300,
+                extra_body={**extra,
+                            "chat_template_kwargs": {"enable_thinking": False}},
+                **std,
+            )
+        except Exception as e:
+            transient = "Loading" in str(e)
+            if not transient or attempt >= _LOAD_RETRIES:
+                raise
+            time.sleep(_LOAD_RETRY_SLEEP_S)
+    raise AssertionError("unreachable")
+
+
 # Belt-and-braces against reasoning output: the request already sends
 # chat_template_kwargs {enable_thinking: false}, but some servers/templates
 # ignore it. A leading <think>...</think> block is stripped before
@@ -113,19 +155,9 @@ def _call_llm(prompt_system: str, chunk: str, model: str, endpoint: str,
                    else len(user_content))
         max_tokens = output_token_cap(cap_src)
     try:
-        resp = litellm.completion(
-            model=f"openai/{model}",
-            messages=[
-                {"role": "system", "content": prompt_system},
-                {"role": "user", "content": user_content},
-            ],
-            api_base=endpoint,
-            api_key=api_key,
-            max_tokens=max_tokens,
-            timeout=300,
-            extra_body={**extra, "chat_template_kwargs": {"enable_thinking": False}},
-            **std,
-        )
+        resp = _completion_with_load_retry(
+            model, prompt_system, user_content, endpoint, api_key,
+            max_tokens, extra, std)
     except Exception as e:  # network/model error: caller keeps the original
         return "", f"llm error: {type(e).__name__}: {e}"[:200]
     if usage_sink is not None:

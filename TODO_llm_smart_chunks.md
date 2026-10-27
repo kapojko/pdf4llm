@@ -32,8 +32,13 @@ Conclusions:
 - **Two failure regimes**: invariant-A drift dominates on prose-heavy RMs
   (rm0410: 1353/2000 fail entries); **missing-index malformed replies**
   dominate on dense register tables (SAM9X60: 1172/2000, chunks 1190–1480).
-- **Truncation is a shared tax**: 230–1556 calls, requeue salvages only
-  6–9% of requeued units.
+- **Truncation was over-counted**: the old `truncated_calls` is a per-chunk
+  incidence counter, not HTTP calls. Ground truth (SAM9X60 v1.8.1 transcript,
+  1070 calls): 43 real truncations (4%), all dense echo batches at cap — 19
+  are renumbering drift (model restarts ordinals at 1 on requeue batches,
+  whole batch lost regardless of cap), 24 genuine cap cuts (16/17 needed
+  <= 1.31x cap, ~16k tokens total overrun; 7 lost nothing). Now measured
+  honestly: `truncated_api_calls`.
 - Server tokenizer (llama-swappy `/llama/tokenize`, routed since 1.3+):
   prose 3.3 chars/token, dense cells/hex ~2.2–2.5 — the old 3.5 scalar was
   3x wrong for dense batches, baking truncation in.
@@ -84,59 +89,137 @@ cannot accept the repair any model would produce. Fixed deterministically:
    `<name>.exchange.jsonl`, the full request/reply transcript incl. token
    usage). Both opt-in; smoke: 32 KB prellm + 56 KB transcript on 74HC_HCT74.
 7. **Full SAM9X60 re-run** (`--llm-keep-prellm --llm-capture`): crashed at
-   the very end with `IndexError: list assignment index out of range`
-   (`llm_batch._process_batch`) — fixed en route (see below); 1.5 h of
-   conversion survived (crash was in the LLM stage, after the .md was
-   written), and the full exchange transcript + prellm snapshot are on disk.
-   Stats reconstructed from the transcript via
-   `scripts/replay_llm_exchange.py` (offline; 970/1070 captured payloads
-   replayed exactly, remainder lost to batch-composition drift under
-   replay-time — the meta `llm.replayed` block records the fidelity).
-   **Recorded in `<doc>.meta.json` (`llm` block) next to the document;
-   analysis is the next step.**
-
-   Measured (item 1–2 pipeline vs the pre-item-1/2 baseline row):
+   the very end (`IndexError` in `llm_batch._process_batch`) — fixed en
+   route (see below), regression-tested; stats reconstructed from the
+   transcript via `scripts/replay_llm_exchange.py` (970/1070 payloads
+   replayed; meta `llm.replayed` records fidelity). Artifacts:
+   `S:\Электроника\Microchip\SAM9X60\` (`.exchange.jsonl`, `.prellm.md`,
+   `.replayed.md`, `.meta.json` with the replayed `llm` block).
 
    | metric | before | after |
    |---|---|---|
    | chunks rejected | 17.6% | 85/3947 (2.2%) |
-   | truncated calls | 1556 | 242 |
+   | truncated calls (per-chunk incidences) | 1556 | 242 (= 43 real calls, see run analysis) |
    | cells sent / fixed | 3201 / 839 (26%) | 3091 / 337 (11%) |
    | units sent (replay) | — | 7807, 74 batches |
    | fail-log entries | 2000 (capped) | 823, each with line/cell coords |
 
-   The 242 remaining truncated calls are dense CELL batches finishing at
-   their exact caps (`truncation_log`: kind=cell, completion_tokens == cap);
-   the fail log (spread over chunks 10–1410) is now dominated by "missing
-   from truncated output" (449) with "malformed reply (missing index)"
-   down to 159 (was 1172) — replay material for open item 2. Crash bug
-   (fixed + regression-tested, tests 133 in
-   `test_llm.py`): a rejected whole-chunk candidate whose SALVAGE accepted a
-   cross-line join shrank `out_lines`, while disputed line units kept their
-   ORIGINAL indices — an accepted fix then applied out of range (crash) or
-   one line off (silent misapply). Fix: `_salvage` returns a join-aware
-   `line_map` (original index -> output position, None = merged into an
-   accepted block); `ChunkState.set_out_lines/apply_line` resolve apply
-   positions through it and merged lines are never enqueued.
+   Crash bug (fixed + regression-tested): a rejected whole-chunk candidate
+   whose SALVAGE accepted a cross-line join shrank `out_lines`, while
+   disputed line units kept their ORIGINAL indices — an accepted fix then
+   applied out of range (crash) or one line off (silent misapply). Fix:
+   `_salvage` returns a join-aware `line_map`; `ChunkState`
+   `.set_out_lines/.apply_line` resolve apply positions through it and
+   merged lines are never enqueued.
+
+## Done: run analysis (item 7 artifacts, `S:\Электроника\Microchip\SAM9X60`)
+
+- Item-1/2 pipeline vs baseline: rejected 694→85 chunks (2.2%), retries
+  5392→660, final failed 163/7807 (2.1%), fail log 823 entries with
+  line/cell coords + model (449 truncated-missing / 215 invariant-A /
+  159 missing-index).
+- Same-model requeue salvage measured: 43/660 = **6.5%** — escalation
+  ladder (open item 1) is justified by hard data.
+- Missing-index inference (item 1) never fired: the surviving failures are
+  **consecutive pairs/triples**, and inference requires exactly one absent
+  ordinal. Safe no-op; the tail is escalation material.
+- Cell yield 26%→11% is expected: dash-bullet (554 lines) + dup-cell
+  deterministic prepass fixes replaced model work. Net strongly positive.
+- Truncation truth: 43/1070 calls (see corrected conclusion above); 19
+  drift + 24 cap cuts. New hot spot: wide bit-matrix tables
+  (`| Bit | 31 | 30 | ...` grids; chunk 1205 alone: 64 cell losses).
+- Replay fidelity 970/1070 payloads (61 uncaptured, 100 unrequested) —
+  stats approximate for the drifted tail; meta `duration` is replay wall
+  time (real server time = sum of transcript `dt` ≈ 88 min).
+
+## Done: cap headroom + renumbering-drift guard (v1.8.2)
+
+1. **Cap headroom** (`llm_tokens.TokenMeter.cap_for`):
+   `cap = 1.35 x EMA(kind) x echo_tokens + margin` — covers the measured
+   tail error of the mean-based EMA (free: max_tokens is a limit).
+2. **`truncated_api_calls`** — real finish=length HTTP calls, next to the
+   incidence-based `truncated_calls` (live: 8→2 on tlv62569, 12→1 on
+   CH32V208DS0).
+3. **Drift guard** (`llm_batch._batch_task` / `llm_protocol._parse_reply`):
+   a reply whose `N| ` ordinals are disjoint from the requested gids is
+   flagged (`replies_renumbered`); a clean 1..n first-occurrence prefix is
+   remapped positionally (`units_renumbered_recovered`, every text still
+   passes the per-unit verifier); otherwise units fail with reason
+   "renumbered reply (model drift)" and the requeue NOTE carries an
+   anti-renumbering hint. Drift only ever observed on requeue batches with
+   gids above the reply's 1..n range (SAM9X60: 19/43, ~1550 unit-losses —
+   the dominant truncation-class damage).
+- Tests: 211 in `tests/test_llm.py` (drift parse/recover/fail/hint,
+  shifted-mapping safety, honest call counting, new cap formula).
+- Live: 74HC_HCT74 / tlv62569 / CH32V208DS0 — 0 rejections, 0 failed
+  units (`out/drift_check/`).
+
+## Done: model-escalation probes (`scripts/exp9_escalation_probe.py`)
+
+Two offline probes replayed failed units through candidate models with the
+real protocol parser + verifier + drift recovery (production-style batches,
+sampling = server defaults). Reports: `out/exp9_escalation/`.
+
+- **163 final-failed units**: ornith-1.5-9b fixed 87–88 (53–54%),
+  nemotron-74b-a9b 87 (53%), ling fresh positions 47–78 (drift variance).
+  Nemotron ≈ ornith (failure overlap 60/62, rescues ~3% of ornith's tail at
+  ~2.8x cost) → **dominated, not configured**. Zero drift/truncation on big
+  models; ornith's fix sets identical across reps.
+- **163 different fragments, same size** (borderline pool): ling 0 (heavy
+  drift), ornith 32 (20%), nemotron 34 (21%, fixes 2 ornith misses).
+- Conclusions: model diversity is the yield driver (53% vs 6.5% same-model
+  requeue); a 16+23-unit hard core is failed by EVERY model (open work 1:
+  subscript misfire); same-model requeue economics refined (per round: 6.5%
+  fix, ~30% unchanged echo, ~63% re-fail).
+
+## Done: rescue pass (second-model salvage)
+
+After the main pass drains, units failed after all retries are re-asked ONCE
+on the configured rescue model (fresh gids, NOTE hint = level-0 rejection
+reason, retries=0 — value is model diversity; same verifier/drift
+guard/inference; sampling untouched). Fire gate `0 < failed/units_sent <=
+max_fraction` (0.5; min_units dropped by decision). A rescued unit undoes
+finalize-time failure accounting → chunks upgrade rejected→salvaged→accepted.
+Config `llm_rescue` (model name or `[{model, max_fraction}]` levels),
+`--llm-rescue MODEL` override (empty = disable), `--llm-auth` asks for it
+('-' clears, empty keeps). Meta `llm.rescue = {levels[], skipped[]}`;
+rescue failures join the shared fail-log with the model id. Level-0
+`llm_retries=2` unchanged. Tests: 224 in `tests/test_llm.py` (13 new).
+
+Server-behavior fixes found live (74HC_HCT74 smoke):
+
+1. updated llama-swappy answers **503 'Loading'** while a model loads →
+   bounded transport retry (`llm_client._completion_with_load_retry`,
+   90 x 2 s; measured loads 75–100 s);
+2. rescue TokenMeter probed the tokenizer before the model load and cached
+   naive mode forever → periodic re-probe (`_PROBE_RETRY_S = 60`); explicit
+   `exact=False` (offline) never probes.
+
+Live smoke: fire path (real model switch, per-level meta), skip path, and a
+4-unit ornith→ling rescue all verified; one Loading-503 hit en route → fix 1.
 
 ## Open work (priority order)
 
-1. (Optional, low priority) NOTE hint variant for missing-index failures —
-   mostly moot after item 1.
-2. **Model escalation ladder for exhausted retries** — same-model requeue
-   salvages only 6-9% of requeued units. Design (agreed): auto-switching
-   proxy on the server (switching = changing the model id); config
-   `llm_escalation: [{model, max_fraction, min_units}, ...]` via
-   `--llm-auth` (level 0 = existing `model`). Salvage passes run AFTER the
-   main pass: each level fires only if
-   `failed_units/units_sent <= max_fraction` AND `failed_units >= min_units`
-   (defaults 0.5 then 0.1). Reuses the batch scheduler/verifier/NOTE hints
-   with fresh batch positions; final failures keep the original text;
-   sampling stays server-side per model. Scope v1: units only. meta:
-   per-level `escalation: [{model, units_sent, units_fixed,
-   truncated_calls, duration}]` + `escalation_skipped` reasons; the
-   fail-log `model` field is already in place. Prereqs (items 1–2) landed.
-   Validate on the deferred full SAM9X60 re-run.
+1. **Subscript misfire breaks common words** (root cause found, fix needed):
+   `fix_subscripts` turns ligature-split fragments into unfixable ones —
+   extraction gives `'f l a g'` (whitespace-only, model-fixable), the
+   subscript pass matches `f` (quantity symbol) + single-letter suffix and
+   inserts `_` → `'f_l a g'`, which the prompt forbids models to repair and
+   the verifier (rightly) rejects. Probed models were RIGHT — they produced
+   `'flag'` and got rejected. SAM9X60: 409 damaged groups (`'f_l a g'` 103,
+   `'t_yp e'`, `'f_i eld'`, `'f_ect'` (affect), `'f_set'` (offset)); 16+23
+   probe hard-core units are exactly this class. Fix: gate the insertion on
+   document evidence (joined form occurs in doc → leave spaces for the
+   model; build vocab BEFORE the subscript pass), or a repair step right
+   after (evidence-gated `_` drop restricted to subscript-shaped
+   underscores); `SDRAMC _ WPSR`-style spaces around real underscores are a
+   separate safe whitespace-only rule. First measure legit-vs-misfire ratio
+   on rm0410 / CH32V208 / OV2640 (2591 insertions in SAM9X60, mostly legit).
+2. **Whole-chunk rescue for still-rejected chunks** (v2 candidate): a
+   second whole-chunk echo attempt on the rescue model for chunks whose
+   failures are not unit-shaped. Unmeasured on already-failed chunks;
+   token-expensive (~2x chunk output). Only after unit-rescue data from
+   full-document runs.
 
 ## Rejected ideas (recorded so they are not re-proposed)
 
@@ -166,19 +249,15 @@ cannot accept the repair any model would produce. Fixed deterministically:
 
 ## Validation status
 
-- Full-document runs of the pre-item-1/2 pipeline: all done (table above);
-  baselines preserved next to the documents.
-- Items 1–5 validation: offline suite; live fragment run + real-content
-  replay (see item 5); finalize check on 74HC_HCT74 / tlv62569 /
-  CH32V208DS0 — 0 rejections, 0 failed units, 0 truncated calls, meta
-  additions present (`out/finalize_check/`).
-- Item 7: full SAM9X60 run executed (crashed at the end; bug fixed, stats
-  reconstructed — see above). Artifacts on disk next to the PDF:
-  `.exchange.jsonl` (1070 request/reply pairs, raw material for the
-  escalation experiment), `.prellm.md`, `.replayed.md` (reconstructed
-  corrected text), `.meta.json` with the replayed `llm` stats block.
-- Remaining: **analyse the recorded SAM9X60 stats + transcript** (next
-  session), then implement open item 2.
+- Offline suite: 224 tests in `tests/test_llm.py` (+13 rescue, +2 transport,
+  +2 token meter).
+- Full-document SAM9X60 run of the item-1/2 pipeline: done, analysed (see
+  Done above); artifacts on `S:\Электроника\Microchip\SAM9X60`.
+- Cap headroom + drift guard: live-checked on 74HC_HCT74 / tlv62569 /
+  CH32V208DS0 (`out/drift_check/`) — 0 rejections, 0 failed units.
+- Rescue pass: probe-validated on SAM9X60 fail-log fragments; live-smoked
+  on 74HC_HCT74 (fire + skip paths). Full-document rescue validation
+  pending (next SAM9X60 rerun).
 
 ## Done (for context)
 
@@ -195,7 +274,7 @@ cannot accept the repair any model would produce. Fixed deterministically:
   vocabulary SEND/SKIP filter, per-unit yield accounting in meta.json.
 - Per-unit rejection-reason hints as NOTE lines.
 - Sampling never overridden; CLI single strict mode.
-- Tests: offline suite in `tests/test_llm.py` (133) covers the batch
+- Tests: offline suite in `tests/test_llm.py` (211) covers the batch
   scheduler, token meter, missing-index inference, `<br>` classes,
   chunking, verifier adversarial cases, TOC detection, escaped pipes,
   sampling pass-through, join-aware line mapping (crash regression).

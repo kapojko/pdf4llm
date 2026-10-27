@@ -30,16 +30,24 @@ class ReplyParse:
     - ``orphans``: text blocks that could not attach to any index — lines
       before the first index line, or after a CONTEXT/NOTE reset. A unit
       whose index prefix the model dropped lands here when it follows a
-      reset (the common cell-batch shape: CONTEXT between row-groups).
+      reset (the common cell-batch shape: CONTEXT between row-groups);
+    - ``ord_seq`` / ``ord_text``: RAW reply ordinals (first-occurrence
+      order / first text incl. continuation lines), independent of
+      ``want``. They expose the renumbering-drift signature — the model
+      restarting the sequence at 1 instead of echoing the given gids —
+      that the drift guard in llm_batch recovers from.
     """
 
-    __slots__ = ("got", "dup_want", "orphans", "order")
+    __slots__ = ("got", "dup_want", "orphans", "order", "ord_seq",
+                 "ord_text")
 
     def __init__(self) -> None:
         self.got: dict[int, str] = {}
         self.dup_want: set[int] = set()
         self.orphans: list[str] = []
         self.order: list[int] = []  # want-gids in first-occurrence order
+        self.ord_seq: list[int] = []       # raw ordinals, first occurrence
+        self.ord_text: dict[int, str] = {} # raw ordinal -> text (first)
 
 
 def _parse_reply(resp: str, want: set[int]) -> ReplyParse:
@@ -70,14 +78,20 @@ def _parse_reply(resp: str, want: set[int]) -> ReplyParse:
         if m:
             flush_orphan()
             last = int(m.group(1))
+            if last not in info.ord_text:
+                info.ord_seq.append(last)
+                info.ord_text[last] = m.group(2)
             if last in want:
                 counts[last] = counts.get(last, 0) + 1
                 if last not in got:
                     info.order.append(last)
                 got[last] = m.group(2)
-        elif (stripped_line and last is not None and last in want
+        elif (stripped_line and last is not None
               and not stripped_line.startswith("|")):
-            got[last] += "\n" + raw
+            if last in want:
+                got[last] += "\n" + raw
+            if last in info.ord_text:
+                info.ord_text[last] += "\n" + raw
         elif stripped_line and last is None and not stripped_line.startswith("|"):
             orphan_buf.append(raw)
     flush_orphan()

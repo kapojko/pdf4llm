@@ -294,6 +294,12 @@ class BatchScheduler:
         self.t0: float | None = None
         self.verbose = verbose  # gates TTY line-breaks before plain prints
         self._gid = 0
+        # units finalized as failed (retries exhausted) / units whose verified
+        # fix was applied. The rescue pass (llm_run) re-enqueues final_failed
+        # on the next configured model; applied() lets it undo the per-chunk
+        # failure accounting for units it rescues.
+        self.final_failed: list[Unit] = []
+        self.applied: list[Unit] = []
 
     # -- enqueue (producer side, lock held inside) ---------------------------
 
@@ -443,10 +449,14 @@ class BatchScheduler:
                 parts.append(f"{u.gid}| {u.text}")
                 frag_chars += len(u.text)
                 if u.last_fail:
-                    parts.append(
-                        f"NOTE {u.gid}: your previous answer for unit {u.gid} "
-                        f"was REJECTED ({u.last_fail}). Return the corrected "
-                        "text exactly as instructed.")
+                    hint = (f"NOTE {u.gid}: your previous answer for unit "
+                            f"{u.gid} was REJECTED ({u.last_fail}). Return "
+                            "the corrected text exactly as instructed.")
+                    if u.last_fail.startswith("renumbered reply"):
+                        hint += (f" Your previous reply restarted the "
+                                 f"numbering at 1: reply with the SAME index "
+                                 f"{u.gid} as the input line, never renumber.")
+                    parts.append(hint)
             if ctx:
                 parts.append("")
                 parts.append("CONTEXT:")
@@ -471,7 +481,18 @@ class BatchScheduler:
             with self.lock:
                 self.batches_sent += 1
                 self.stats["batches"] += 1
+                # renumbering drift: the reply carries 'N| ' lines but NONE of
+                # the requested gids — the model restarted the sequence at 1
+                # (measured on SAM9X60 requeue batches: 19/43 truncated calls,
+                # whole batch lost regardless of the output cap)
+                drift = False
+                if parse_info is not None and not got and parse_info.ord_seq:
+                    drift = True
+                    self.stats["replies_renumbered"] += 1
+                    self.stats["units_renumbered_recovered"] += \
+                        self._recover_renumbered(batch, got, parse_info)
                 if finish == "length":
+                    self.stats["truncated_api_calls"] += 1
                     # per-chunk counters merge into truncated_calls at finalize;
                     # the log keeps estimated-vs-actual for the cap measurement
                     for c in {u.chunk for u in batch}:
@@ -484,7 +505,7 @@ class BatchScheduler:
                             "completion_tokens": usage_sink.get(
                                 "completion_tokens"),
                         })
-                self._process_batch(batch, got, finish, parse_info)
+                self._process_batch(batch, got, finish, parse_info, drift=drift)
                 # verbose batch lines must not clobber the in-place progress
                 # line on a TTY (only when a line is actually printed)
                 if self.verbose and self.prog is not None:
@@ -497,10 +518,31 @@ class BatchScheduler:
             with self.lock:
                 self.active -= 1
 
+    def _recover_renumbered(self, batch: list[Unit], got: dict[int, str],
+                            info) -> int:
+        """Map a renumbered reply back positionally. Lock held.
+
+        The drift reply numbers units 1..n (fresh positions) instead of
+        echoing the payload gids. When its first-occurrence ordinals start
+        with EXACTLY 1..len(batch), each position unambiguously identifies
+        one requested unit; every mapped text still passes the normal
+        per-unit verifier in _process_batch before it is applied, so a
+        shifted mapping on non-uniform batches fails verification and takes
+        the ordinary rejection path. Returns the number of units remapped.
+        """
+        n = len(batch)
+        if info.ord_seq[:n] != list(range(1, n + 1)):
+            return 0
+        for u, pos in zip(batch, range(1, n + 1)):
+            got[u.gid] = info.ord_text[pos]
+        return n
+
     def _process_batch(self, batch: list[Unit], got: dict[int, str],
-                       finish: str | None, parse_info=None) -> None:
+                       finish: str | None, parse_info=None,
+                       drift: bool = False) -> None:
         """Verify every returned unit; apply or requeue. Lock held."""
-        if parse_info is not None and (finish is None or finish == "stop"):
+        if parse_info is not None and not drift \
+                and (finish is None or finish == "stop"):
             self._try_infer_missing(batch, got, parse_info)
         for ordinal, u in enumerate(batch, 1):
             cs = self.states[u.chunk]
@@ -508,6 +550,8 @@ class BatchScheduler:
             if new is None:
                 if finish and finish.startswith("llm error"):
                     reason = finish
+                elif drift:
+                    reason = "renumbered reply (model drift)"
                 elif finish == "length":
                     reason = "missing from truncated output"
                 else:
@@ -528,6 +572,7 @@ class BatchScheduler:
                 self._fail(u, reason, ordinal)
                 continue
             # accepted: apply back to the chunk buffer
+            self.applied.append(u)
             if u.kind == "cell":
                 segs = _split_row_cells(cs.o_lines[u.line])
                 if segs is not None:
@@ -650,6 +695,7 @@ class BatchScheduler:
         cs.units_failed += 1
         cs.enq_done += 1
         self.stats["units_failed"] += 1
+        self.final_failed.append(u)
         cs.note_reason(f"{u.where}: {reason}")
 
     # -- finalization (main thread, after run()) ------------------------------

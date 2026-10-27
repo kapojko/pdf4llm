@@ -137,6 +137,8 @@ def _produce_prose(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
     candidate = _strip_thinking(candidate)
     if finish == "length":
         cs.truncated += 1  # merged into truncated_calls at finalize
+        with sched.lock:
+            cfg.stats["truncated_api_calls"] += 1
         cs.note_reason("whole-chunk output truncated (finish_reason=length)")
     if _verify_chunk(chunk, candidate) is None:
         # whole-chunk accepted: the producer returns immediately, so no line
@@ -263,6 +265,161 @@ def _finish_interrupted(stats: dict) -> None:
     raise LlmInterrupted(stats)
 
 
+# ---------------------------------------------------------------------------
+# Rescue pass (second-model salvage for exhausted units)
+# ---------------------------------------------------------------------------
+
+
+def normalize_rescue(spec) -> list[dict]:
+    """Normalize the ``llm_rescue`` config/CLI spec into level dicts.
+
+    Accepts None/[]/"" (no rescue), a model name (one level, default
+    ceiling 0.5), or a list of model names / {"model": ..., "max_fraction":
+    ...} dicts. Malformed entries raise ValueError — a silently ignored
+    rescue config would look like a working one.
+    """
+    if spec is None:
+        return []
+    if isinstance(spec, str):
+        spec = [spec]
+    if not isinstance(spec, list):
+        raise ValueError(
+            "llm_rescue must be a model name or a list of "
+            "{model, max_fraction} levels")
+    levels: list[dict] = []
+    for item in spec:
+        if isinstance(item, str):
+            levels.append({"model": item, "max_fraction": 0.5})
+        elif isinstance(item, dict) and item.get("model"):
+            levels.append({"model": str(item["model"]),
+                           "max_fraction": float(item.get("max_fraction", 0.5))})
+        else:
+            raise ValueError(f"bad llm_rescue level: {item!r}")
+    return [lv for lv in levels if lv["model"]]
+
+
+def _rescue_stats() -> dict:
+    """Fresh per-level stats dict with every key the scheduler touches."""
+    return {
+        "units_sent": 0,
+        "units_fixed": 0,
+        "units_failed": 0,
+        "units_requeued": 0,
+        "units_fixed_after_requeue": 0,
+        "units_inferred_missing": 0,
+        "batches": 0,
+        "truncated_api_calls": 0,
+        "replies_renumbered": 0,
+        "units_renumbered_recovered": 0,
+        "unit_fail_log": [],
+        "truncation_log": [],
+    }
+
+
+def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
+                sampling, stats, lock, workers, note, verbose, batch_tokens,
+                prev_failed) -> int:
+    """Rescue passes: re-ask final-failed units on the next configured model.
+
+    Runs AFTER the main pass drained. Each level fires only when there is
+    something to rescue AND the failure fraction is within its ceiling
+    (max_fraction, fraction of the main pass's units_sent); the model switch
+    happens server-side on the level's first request. One single pass per
+    level (retries=0): the value is model diversity, not more attempts —
+    measured on SAM9X60 (2026-10): same-model requeue salvage is ~6.5% per
+    round, while a fresh diverse model fixes ~53% of the exhausted tail in
+    one pass (probe: ornith-1.5-9b 87-88/163, nemotron-74b 87/163). Every
+    unit still passes the normal verifier; a unit that fails on the rescue
+    model too is final (original text kept). Sampling is never overridden.
+
+    Returns the number of units rescued (applied fixes on previously failed
+    units); per-level blocks land in ``stats['rescue']``.
+    """
+    from .llm_batch import _FAIL_LOG_CAP
+
+    blocks: list[dict] = []
+    skipped: list[dict] = []
+    pool_units = list(prev_failed)
+    rescued_total = 0
+    for li, level in enumerate(levels, 1):
+        rmodel = level["model"]
+        max_fraction = float(level.get("max_fraction", 0.5))
+        n = len(pool_units)
+        if n == 0:
+            skipped.append({"model": rmodel, "reason": "no failed units"})
+            break
+        fraction = n / max(1, stats["units_sent"])
+        if fraction > max_fraction:
+            skipped.append({
+                "model": rmodel,
+                "reason": f"failed fraction {fraction:.3f} exceeds "
+                          f"max_fraction {max_fraction}",
+            })
+            continue
+        note(
+            f"  llm: rescue {li}/{len(levels)}: model {rmodel}, {n} failed "
+            f"unit(s) ({fraction:.1%} of sent) — first call may stall while "
+            "the server loads the model",
+        )
+        rstats = _rescue_stats()
+        rsched = BatchScheduler(
+            states, prompts, vocab, model=rmodel, endpoint=endpoint,
+            api_key=api_key, sampling=sampling, retries=0, stats=rstats,
+            lock=lock, pool=_DaemonPool(workers), note=note,
+            batch_tokens=batch_tokens,
+            meter=TokenMeter(rmodel, endpoint, api_key), verbose=verbose,
+        )
+        with lock:
+            for u in pool_units:
+                u.attempts = 0  # fresh SINGLE attempt on this model
+                # u.last_fail stays: the NOTE hint carries the reason the
+                # previous model finally rejected this unit
+                rsched.queues[u.kind].append(u)
+                states[u.chunk].units_enqueued += 1
+                rstats["units_sent"] += 1
+            # no producers: pure drain of the pre-loaded queues
+            rsched.producers_done = rsched.producers_total
+        t_level = time.monotonic()
+        try:
+            rsched.run()
+            rsched.stop_progress()
+            rsched.pool.drain_and_shutdown()
+        except KeyboardInterrupt:
+            rsched.pool.shutdown_now()
+            rsched.stop_progress()
+            _finish_interrupted(stats)
+            raise  # unreachable, keeps type-checkers happy
+        # a rescued unit is no longer failed: undo the finalize-time failure
+        # accounting so chunk classification reflects the post-rescue state
+        # (_process_batch already added the fix to cs.units_fixed)
+        applied_gids = {u.gid for u in rsched.applied}
+        with lock:
+            for u in pool_units:
+                if u.gid in applied_gids:
+                    states[u.chunk].units_failed -= 1
+                    rescued_total += 1
+        for e in rstats["unit_fail_log"]:
+            if len(stats["unit_fail_log"]) < _FAIL_LOG_CAP:
+                stats["unit_fail_log"].append(e)
+        blocks.append({
+            "model": rmodel,
+            "units_sent": rstats["units_sent"],
+            "units_fixed": len(rsched.applied),
+            "units_failed": rstats["units_failed"],
+            "batches": rstats["batches"],
+            "truncated_calls": rstats["truncated_api_calls"],
+            "duration": round(time.monotonic() - t_level, 1),
+            "tokens": rsched.meter.meta(),
+        })
+        note(
+            f"  llm: rescue {li}: {rstats['units_fixed']} of {n} failed "
+            f"unit(s) fixed in {_fmt_duration(time.monotonic() - t_level)}",
+        )
+        pool_units = rsched.final_failed
+    stats["rescue"] = {"levels": blocks, "skipped": skipped}
+    return rescued_total
+
+
 def _apply_chunk_delta(stats: dict, delta: dict) -> None:
     """Merge one chunk's stats delta into the global stats dict."""
     if delta.get("toc_skipped"):
@@ -302,6 +459,7 @@ def correct_with_llm(
     batch_tokens: int | None = None,
     keep_prellm: str | None = None,
     capture_path: str | None = None,
+    rescue: list[dict] | None = None,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass (single strict mode).
 
@@ -309,8 +467,11 @@ def correct_with_llm(
     pass chunks; meta's chunk_offsets refer to it) to the given path.
     ``capture_path`` appends every LLM request/reply pair (full payloads,
     replies, finish reason, token usage) to a JSONL transcript — the raw
-    material for offline replay / model-escalation experiments. Both are
+    material for offline replay / rescue-pass experiments. Both are
     opt-in; ordinary runs write only the corrected .md and meta.json.
+    ``rescue`` (optional) is a normalized level list (see normalize_rescue):
+    after the main pass, units that failed all retries are re-asked ONCE on
+    each configured rescue model whose failure-fraction ceiling allows it.
     """
     real_call = _call_llm
     capture_fh = None
@@ -336,7 +497,7 @@ def correct_with_llm(
     try:
         return _correct_with_llm(
             text, model, endpoint, api_key, verbose, max_chars, classify,
-            sampling, retries, workers, batch_tokens, keep_prellm)
+            sampling, retries, workers, batch_tokens, keep_prellm, rescue)
     finally:
         if capture_fh is not None:
             _set_transport(real_call)
@@ -363,6 +524,7 @@ def _correct_with_llm(
     workers: int | None = None,
     batch_tokens: int | None = None,
     keep_prellm: str | None = None,
+    rescue: list[dict] | None = None,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass (single strict mode).
 
@@ -506,6 +668,9 @@ def _correct_with_llm(
         "wholechunk_linejoin_fixes": 0,
         "retries_used": 0,
         "truncated_calls": 0,
+        "truncated_api_calls": 0,
+        "replies_renumbered": 0,
+        "units_renumbered_recovered": 0,
         "rejections": [],
         "unit_fail_log": [],
         "truncation_log": [],
@@ -558,6 +723,18 @@ def _correct_with_llm(
         _finish_interrupted(stats)
         raise  # unreachable, keeps type-checkers happy
 
+    rescued = 0
+    if rescue:
+        rescued = _run_rescue(
+            states, {"cell": cell_prompt, "line": line_prompt}, vocab,
+            rescue, endpoint=endpoint, api_key=api_key, sampling=sampling,
+            stats=stats, lock=lock, workers=workers, note=note,
+            verbose=verbose,
+            batch_tokens=batch_tokens if batch_tokens else BATCH_TOKENS,
+            prev_failed=sched.final_failed,
+        )
+        stats["units_failed"] -= rescued
+
     results, deltas = sched.finalize()
     for delta in deltas:
         _apply_chunk_delta(stats, delta)
@@ -578,7 +755,10 @@ def _correct_with_llm(
             f"rejected, {stats['chunks_toc_skipped']} toc-skipped); "
             f"{stats['units_sent']} unit(s) sent in {stats['batches']} batch(es), "
             f"{stats['blocks_fixed']} fixed, {stats['units_failed']} failed, "
-            f"{stats['units_skipped']} vocab-skipped",
+            f"{stats['units_skipped']} vocab-skipped"
+            + (f"; rescue: {rescued} rescued by "
+               + " + ".join(lv["model"] for lv in stats["rescue"]["levels"])
+               if rescued else ""),
             flush=True,
         )
 
