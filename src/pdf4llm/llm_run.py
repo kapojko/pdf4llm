@@ -139,7 +139,9 @@ def _produce_prose(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
         cs.truncated += 1  # merged into truncated_calls at finalize
         cs.note_reason("whole-chunk output truncated (finish_reason=length)")
     if _verify_chunk(chunk, candidate) is None:
-        cs.out_lines = candidate.split("\n")
+        # whole-chunk accepted: the producer returns immediately, so no line
+        # units are ever enqueued for this chunk afterwards (identity map)
+        cs.set_out_lines(candidate)
         cs.units_fixed += 1
         with sched.lock:
             cfg.stats["wholechunk_accepted"] += 1
@@ -147,8 +149,9 @@ def _produce_prose(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
                 # the whole-chunk call's UNIQUE yield: a cross-line join
                 cfg.stats["wholechunk_linejoin_fixes"] += 1
         return
-    salvaged, fixed, n_total, sreasons, failed_idx = _salvage(chunk, candidate)
-    cs.out_lines = salvaged.split("\n")
+    salvaged, fixed, n_total, sreasons, failed_idx, line_map = _salvage(
+        chunk, candidate)
+    cs.set_out_lines(salvaged, line_map)
     cs.units_fixed += fixed
     cs.units_total += n_total
     for r in sreasons[:2]:
@@ -159,6 +162,10 @@ def _produce_prose(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
         # junk): one batched line-mode attempt over every line as the last
         # resort (targeted re-asks: NOT gated by the vocabulary filter)
         disputed = [i for i, l in enumerate(o_lines) if l.strip()]
+    # lines merged into an accepted join have no standalone output position
+    # (their text already lives inside the merged line): skip them rather
+    # than enqueue a fix that could not be applied safely
+    disputed = [i for i in disputed if cs.out_index(i) is not None]
     for i in disputed:
         sched.enqueue_line(cs.index, i, o_lines[i])
 

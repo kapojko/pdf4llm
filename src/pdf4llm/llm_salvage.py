@@ -53,9 +53,12 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str], set[int]]:
     safe by construction, even when the candidate was hallucinated.
 
     Returns (salvaged_text, pieces_fixed, pieces_total, reasons,
-    failed_orig_indices) where failed_orig_indices are the 0-based original
-    line numbers the candidate tried to change (or dropped) without passing
-    verification — the input for the batched disputed-line re-ask.
+    failed_orig_indices, line_map) where failed_orig_indices are the 0-based
+    original line numbers the candidate tried to change (or dropped) without
+    passing verification — the input for the batched disputed-line re-ask —
+    and line_map[i] is the index of original line i in the returned text's
+    lines, or None when the line was merged into an accepted multi-line block
+    (no safe standalone apply position for a later fix).
     """
     o_lines = orig.split("\n")
     c_lines = cand.split("\n")
@@ -63,22 +66,30 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str], set[int]]:
     out_lines: list[str] = []
     reasons: list[str] = []
     failed: set[int] = set()
+    line_map: list[int | None] = [None] * len(o_lines)
     fixed = 0
     total = 0
+
+    def emit(o_idx: int, line: str) -> None:
+        # append one output line and record where original line o_idx landed
+        line_map[o_idx] = len(out_lines)
+        out_lines.append(line)
+
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
-            out_lines.extend(o_lines[i1:i2])
+            for k in range(i1, i2):
+                emit(k, o_lines[k])
             continue
         o_blk = o_lines[i1:i2]
         c_blk = c_lines[j1:j2]
         if len(o_blk) == len(c_blk):
             for k, (o_line, c_line) in enumerate(zip(o_blk, c_blk)):
                 if o_line == c_line:
-                    out_lines.append(o_line)
+                    emit(i1 + k, o_line)
                     continue
                 total += 1
                 if not c_line.strip():
-                    out_lines.append(o_line)
+                    emit(i1 + k, o_line)
                     failed.add(i1 + k)
                     continue
                 if _is_table_row(o_line) or _is_table_row(c_line):
@@ -86,12 +97,12 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str], set[int]]:
                 else:
                     reason = _verify_line_in_context(o_lines, i1 + k, c_line)
                 if reason is None:
-                    out_lines.append(c_line)
+                    emit(i1 + k, c_line)
                     fixed += 1
                 else:
                     reasons.append(reason)
                     failed.add(i1 + k)
-                    out_lines.append(o_line)
+                    emit(i1 + k, o_line)
         else:
             # unequal line counts: first try the block as a whole (this
             # handles legitimate false-line-break joins); if that fails, pair
@@ -102,19 +113,19 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str], set[int]]:
                 out_lines.extend(c_blk)
                 fixed += 1
                 total += 1
-                continue
+                continue  # merged originals keep line_map[i] = None
             pairs = _pair_by_similarity(o_blk, c_blk)
             for k, o_line in enumerate(o_blk):
                 j = pairs.get(k)
                 c_line = c_blk[j] if j is not None else None
                 if c_line is None or o_line == c_line:
-                    out_lines.append(o_line)
+                    emit(i1 + k, o_line)
                     if c_line is None and o_line.strip():
                         failed.add(i1 + k)   # candidate dropped this line
                     continue
                 total += 1
                 if not c_line.strip():
-                    out_lines.append(o_line)
+                    emit(i1 + k, o_line)
                     failed.add(i1 + k)
                     continue
                 abs_idx = i1 + k
@@ -123,10 +134,10 @@ def _salvage(orig: str, cand: str) -> tuple[str, int, int, list[str], set[int]]:
                 else:
                     reason = _verify_line_in_context(o_lines, abs_idx, c_line)
                 if reason is None:
-                    out_lines.append(c_line)
+                    emit(abs_idx, c_line)
                     fixed += 1
                 else:
                     reasons.append(reason)
                     failed.add(abs_idx)
-                    out_lines.append(o_line)
-    return "\n".join(out_lines), fixed, total, reasons, failed
+                    emit(abs_idx, o_line)
+    return "\n".join(out_lines), fixed, total, reasons, failed, line_map

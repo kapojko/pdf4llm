@@ -508,7 +508,7 @@ def test_salvage_keeps_good_lines_drops_bad():
         "excess of VCC.\n"
         "*Table 1. Ordering info*"
     )
-    salvaged, fixed, total, _reasons, failed = llm_salvage._salvage(orig, cand)
+    salvaged, fixed, total, _reasons, failed, _lmap = llm_salvage._salvage(orig, cand)
     assert "excess of VCC." in salvaged          # good fix kept
     assert "Ordering info" in salvaged           # good fix kept
     assert "D-t yp e" in salvaged                # hallucinated line reverted
@@ -546,7 +546,7 @@ def test_salvage_rejects_inserted_content_block():
 
 def test_salvage_empty_candidate_marks_all_lines_disputed():
     orig = "line one\nline two"
-    salvaged, fixed, _total, _r, failed = llm_salvage._salvage(orig, "")
+    salvaged, fixed, _total, _r, failed, _lmap = llm_salvage._salvage(orig, "")
     assert salvaged == orig and fixed == 0
     assert failed == {0, 1}
 
@@ -1402,7 +1402,7 @@ def test_salvage_survives_deleted_horizontal_rule():
     orig = "---\n\n| V CC | 14 | supply voltage |\n| 2RD | 13 | reset |\n\n---"
     # model deleted the FIRST '---' but fixed cells
     cand = "\n| VCC | 14 | supply voltage |\n| 2RD | 13 | reset |\n\n---"
-    salvaged, fixed, _total, _r, _failed = llm_salvage._salvage(orig, cand)
+    salvaged, fixed, _total, _r, _failed, _lmap = llm_salvage._salvage(orig, cand)
     assert "---" in salvaged                     # rule preserved from orig
     assert "| VCC | 14 | supply voltage |" in salvaged  # good row fix applied
     assert "| 2RD | 13 | reset |" in salvaged
@@ -1888,3 +1888,80 @@ def test_scheduler_packs_only_full_batches_until_drain():
     sched.producer_done()                         # drain phase: any residue goes
     sched.enqueue_line(0, 2, "x")
     assert sched._packable("line")
+
+
+# -- regression: accepted salvage joins shrink the output buffer --------------
+# A rejected whole-chunk candidate whose salvage accepted a cross-line join
+# produced an out_lines SHORTER than o_lines, while disputed line units kept
+# their original indices -> applying an accepted fix crashed with
+# IndexError: list assignment index out of range (full SAM9X60 run, 2026-10).
+
+def test_salvage_line_map_maps_around_accepted_joins():
+    orig = ("intro line alpha\nsecond line beta\nmiddle stays put\n"
+            "register 0x1A2B with ty po")
+    cand = ("intro line alpha second line beta\nmiddle stays put\n"
+            "register 0x1A2C with ty po")
+    salvaged, _f, _t, _r, failed, line_map = llm_salvage._salvage(orig, cand)
+    assert salvaged.split("\n") == [
+        "intro line alpha second line beta", "middle stays put",
+        "register 0x1A2B with ty po"]
+    assert failed == {3}
+    # joined originals have no standalone output position; later lines shift
+    assert line_map == [None, None, 1, 2]
+
+
+def test_run_prose_join_then_disputed_fix_applies(monkeypatch):
+    orig = ("intro line alpha\nsecond line beta\nmiddle stays put\n"
+            "register 0x1A2B with ty po")
+    bad = ("intro line alpha second line beta\nmiddle stays put\n"
+           "register 0x1A2C with ty po")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        if "0|" not in chunk:
+            return bad, None  # whole-chunk: rejected (numeric token changed)
+        assert "0| register 0x1A2B with ty po" in chunk
+        return "0| register 0x1A2B with typo", None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        orig, "m", "http://x", "k", verbose=False, classify=False)
+    # the disputed fix must land AFTER the accepted join, at its mapped
+    # position — not crash, not overwrite the joined line
+    assert out == ("intro line alpha second line beta\nmiddle stays put\n"
+                   "register 0x1A2B with typo")
+    assert stats["chunks_accepted"] == 1
+    assert stats["blocks_fixed"] == 2  # salvage join + disputed line fix
+
+
+def test_run_prose_disputed_before_join_applies_at_mapped_position(monkeypatch):
+    orig = ("register 0x1A2B with ty po\nmiddle stays put\n"
+            "intro line alpha\nsecond line beta\ntail line")
+    bad = ("register 0x1A2C with ty po\nmiddle stays put\n"
+           "intro line alpha second line beta\ntail line")
+
+    def fake_call(system_prompt, chunk, *a, **kw):
+        if "0|" not in chunk:
+            return bad, None
+        assert "0| register 0x1A2B with ty po" in chunk
+        return "0| register 0x1A2B with typo", None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    out, stats = llm_run.correct_with_llm(
+        orig, "m", "http://x", "k", verbose=False, classify=False)
+    assert out == ("register 0x1A2B with typo\nmiddle stays put\n"
+                   "intro line alpha second line beta\ntail line")
+    assert stats["chunks_accepted"] == 1
+
+
+def test_chunkstate_apply_line_guarded_by_line_map():
+    cs = llm_batch.ChunkState(0, "a\nb\nc", "")
+    assert cs.line_map is None                    # identity by default
+    assert cs.apply_line(2, "C")
+    assert cs.out_lines == ["a", "b", "C"]
+    cs.set_out_lines("a b\nc", [None, None, 1])   # 'a'+'b' merged into 'a b'
+    assert not cs.apply_line(0, "X")              # merged line: never applied
+    assert not cs.apply_line(9, "X")              # out-of-range original index
+    assert cs.apply_line(2, "C2")
+    assert cs.out_lines == ["a b", "C2"]

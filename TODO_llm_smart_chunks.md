@@ -83,6 +83,41 @@ cannot accept the repair any model would produce. Fixed deterministically:
    text chunk_offsets refer to) and `--llm-capture` (writes
    `<name>.exchange.jsonl`, the full request/reply transcript incl. token
    usage). Both opt-in; smoke: 32 KB prellm + 56 KB transcript on 74HC_HCT74.
+7. **Full SAM9X60 re-run** (`--llm-keep-prellm --llm-capture`): crashed at
+   the very end with `IndexError: list assignment index out of range`
+   (`llm_batch._process_batch`) — fixed en route (see below); 1.5 h of
+   conversion survived (crash was in the LLM stage, after the .md was
+   written), and the full exchange transcript + prellm snapshot are on disk.
+   Stats reconstructed from the transcript via
+   `scripts/replay_llm_exchange.py` (offline; 970/1070 captured payloads
+   replayed exactly, remainder lost to batch-composition drift under
+   replay-time — the meta `llm.replayed` block records the fidelity).
+   **Recorded in `<doc>.meta.json` (`llm` block) next to the document;
+   analysis is the next step.**
+
+   Measured (item 1–2 pipeline vs the pre-item-1/2 baseline row):
+
+   | metric | before | after |
+   |---|---|---|
+   | chunks rejected | 17.6% | 85/3947 (2.2%) |
+   | truncated calls | 1556 | 242 |
+   | cells sent / fixed | 3201 / 839 (26%) | 3091 / 337 (11%) |
+   | units sent (replay) | — | 7807, 74 batches |
+   | fail-log entries | 2000 (capped) | 823, each with line/cell coords |
+
+   The 242 remaining truncated calls are dense CELL batches finishing at
+   their exact caps (`truncation_log`: kind=cell, completion_tokens == cap);
+   the fail log (spread over chunks 10–1410) is now dominated by "missing
+   from truncated output" (449) with "malformed reply (missing index)"
+   down to 159 (was 1172) — replay material for open item 2. Crash bug
+   (fixed + regression-tested, tests 133 in
+   `test_llm.py`): a rejected whole-chunk candidate whose SALVAGE accepted a
+   cross-line join shrank `out_lines`, while disputed line units kept their
+   ORIGINAL indices — an accepted fix then applied out of range (crash) or
+   one line off (silent misapply). Fix: `_salvage` returns a join-aware
+   `line_map` (original index -> output position, None = merged into an
+   accepted block); `ChunkState.set_out_lines/apply_line` resolve apply
+   positions through it and merged lines are never enqueued.
 
 ## Open work (priority order)
 
@@ -133,16 +168,17 @@ cannot accept the repair any model would produce. Fixed deterministically:
 
 - Full-document runs of the pre-item-1/2 pipeline: all done (table above);
   baselines preserved next to the documents.
-- Items 1–5 validation: 199 offline tests; live fragment run + real-content
+- Items 1–5 validation: offline suite; live fragment run + real-content
   replay (see item 5); finalize check on 74HC_HCT74 / tlv62569 /
   CH32V208DS0 — 0 rejections, 0 failed units, 0 truncated calls, meta
   additions present (`out/finalize_check/`).
-- Remaining: full SAM9X60 re-run (2 h, explicit command) with
-  `--llm-keep-prellm --llm-capture` — expect the missing-index share of the
-  fail log to collapse and `truncated_calls` to drop; the prellm snapshot +
-  transcript + fail-log coordinates then feed the model-escalation
-  experiment (replay exhausted-retry units against candidate models, the
-  verifier is the metric) before implementing open item 2.
+- Item 7: full SAM9X60 run executed (crashed at the end; bug fixed, stats
+  reconstructed — see above). Artifacts on disk next to the PDF:
+  `.exchange.jsonl` (1070 request/reply pairs, raw material for the
+  escalation experiment), `.prellm.md`, `.replayed.md` (reconstructed
+  corrected text), `.meta.json` with the replayed `llm` stats block.
+- Remaining: **analyse the recorded SAM9X60 stats + transcript** (next
+  session), then implement open item 2.
 
 ## Done (for context)
 
@@ -159,7 +195,7 @@ cannot accept the repair any model would produce. Fixed deterministically:
   vocabulary SEND/SKIP filter, per-unit yield accounting in meta.json.
 - Per-unit rejection-reason hints as NOTE lines.
 - Sampling never overridden; CLI single strict mode.
-- Tests: offline suite in `tests/test_llm.py` (199) covers the batch
+- Tests: offline suite in `tests/test_llm.py` (133) covers the batch
   scheduler, token meter, missing-index inference, `<br>` classes,
   chunking, verifier adversarial cases, TOC detection, escaped pipes,
-  sampling pass-through.
+  sampling pass-through, join-aware line mapping (crash regression).

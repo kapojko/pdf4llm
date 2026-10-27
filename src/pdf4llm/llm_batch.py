@@ -180,11 +180,11 @@ class Unit:
 class ChunkState:
     """Per-chunk buffers and counters (touched by producer + batch tasks)."""
 
-    __slots__ = ("index", "chunk", "sep", "o_lines", "out_lines", "toc_skipped",
-                 "produced", "units_total", "units_enqueued", "units_fixed",
-                 "units_failed", "units_unchanged", "enq_done", "units_skipped",
-                 "cells_sent", "cells_fixed", "reasons", "truncated",
-                 "retries_used", "salvage_note")
+    __slots__ = ("index", "chunk", "sep", "o_lines", "out_lines", "line_map",
+                 "toc_skipped", "produced", "units_total", "units_enqueued",
+                 "units_fixed", "units_failed", "units_unchanged", "enq_done",
+                 "units_skipped", "cells_sent", "cells_fixed", "reasons",
+                 "truncated", "retries_used", "salvage_note")
 
     def __init__(self, index: int, chunk: str, sep: str) -> None:
         self.index = index
@@ -192,6 +192,10 @@ class ChunkState:
         self.sep = sep
         self.o_lines = chunk.split("\n")
         self.out_lines = list(self.o_lines)
+        # None = identity: out_lines is aligned with o_lines (table chunks and
+        # untouched prose). set_out_lines() installs an explicit map when an
+        # accepted join changes the line count.
+        self.line_map: list[int | None] | None = None
         self.toc_skipped = False
         self.produced = False  # producer finished scanning this chunk
         self.units_total = 0
@@ -211,6 +215,40 @@ class ChunkState:
     def note_reason(self, reason: str, cap: int = 8) -> None:
         if len(self.reasons) < cap:
             self.reasons.append(reason)
+
+    def set_out_lines(self, text: str,
+                      line_map: list[int | None] | None = None) -> None:
+        """Replace the output buffer (whole-chunk accept / salvage result).
+
+        ``line_map`` translates original line indices to positions in the new
+        buffer; None entries are lines merged into an accepted multi-line
+        block. Only the salvage path passes a real map — after a whole-chunk
+        accept no line units exist for this chunk (the producer returns), so
+        the identity default is never consulted there.
+        """
+        self.out_lines = text.split("\n")
+        self.line_map = line_map
+
+    def out_index(self, orig_idx: int) -> int | None:
+        """Output-buffer position of original line ``orig_idx`` (None: merged)."""
+        if self.line_map is not None:
+            if 0 <= orig_idx < len(self.line_map):
+                return self.line_map[orig_idx]
+            return None
+        return orig_idx if 0 <= orig_idx < len(self.out_lines) else None
+
+    def apply_line(self, orig_idx: int, new: str) -> bool:
+        """Apply a verified line fix through the (join-aware) index map.
+
+        Returns False when the line has no safe standalone position (merged
+        into an accepted join, or out of range) — the caller keeps the
+        original text in that case, never misplaces the fix.
+        """
+        j = self.out_index(orig_idx)
+        if j is None or not (0 <= j < len(self.out_lines)):
+            return False
+        self.out_lines[j] = new
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +542,24 @@ class BatchScheduler:
                         cur, cur_segs, {u.cell: new})
                 cs.cells_fixed += 1
             else:
-                cs.out_lines[u.line] = new
+                if not cs.apply_line(u.line, new):
+                    # defensive backstop (unreachable: enqueue filters merged
+                    # lines) — keep the original text, never misplace a fix
+                    cs.units_failed += 1
+                    cs.enq_done += 1
+                    self.stats["units_failed"] += 1
+                    if len(self.stats["unit_fail_log"]) < _FAIL_LOG_CAP:
+                        self.stats["unit_fail_log"].append({
+                            "gid": u.gid, "kind": u.kind, "chunk": u.chunk,
+                            "line": u.line, "cell": u.cell,
+                            "ordinal": ordinal, "attempt": u.attempts,
+                            "reason": "no standalone output position (line "
+                                      "merged into an accepted join)",
+                            "model": self.model,
+                        })
+                    cs.note_reason(
+                        f"{u.where}: output position lost to an accepted join")
+                    continue
             cs.units_fixed += 1
             cs.enq_done += 1
             if u.attempts:
