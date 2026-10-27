@@ -50,6 +50,42 @@ Conclusions drawn from this data:
 - The 2000-entry `unit_fail_log` cap truncates the evidence itself
   (SAM9X60: 1604 failed units vs 2000 log entries).
 
+## Resolved: model-unreachable failure classes (SAM9X60 fragment experiments)
+
+Fragment-level reproduction runs (`out/exp_fragments/`, real pipeline with
+captured request/reply logs) on the worst SAM9X60 chunks showed the top
+failure classes are **independent of the model** — under invariant A the
+desired repair is outside the verifier's acceptance set, so no model can
+produce it; the only passing output is the verbatim echo (no repair):
+
+- **Marker + en/em dash bullets (`- –   text`, 554 lines)**: the PDF uses
+  two-level lists ('•' top, '–' sub-items); the converter emits the marker
+  AND keeps the glyph. Models invariably delete the marker (content change
+  -> rejection, all retries, NOTE hints don't help). Fixed deterministically:
+  `llm_prepass.fix_dash_bullets` nests under the preceding list item (runs
+  inherit the previous dash item's level; page-break `---` artifacts are
+  stripped first so hr-split lists resolve), flattens when the context is a
+  paragraph/heading (top-level '–' list), and never matches without
+  whitespace after the glyph (negative numbers, ranges, '– – – –' separator
+  lines). SAM9X60 snapshot: 554 lines repaired (537 nested, 17 flattened),
+  0 residue. meta: `dash_bullets_fixed`.
+- **Container-direction duplicate cells (RGBMODE-style, 1454 rows)**:
+  description cell contains the name cell; the model tries to dedupe ->
+  invariant-A rejection. `llm_table.dup_cell_indices` now skips both
+  directions, gated on contained-key length (>= 8) and a 3x container ratio
+  (a false miss is cheap — safe rejection; a false skip loses a real fix).
+- Chunk 1205's 33 'missing from truncated output' cell failures do **not**
+  reproduce in isolation — they are batch-packing artifacts, confirming
+  open item 2 below. Missing-index failures are batch-size dependent and
+  non-deterministic, confirming item 1.
+
+Validation: offline suite extended (181 tests); fragment experiment
+39->5 units sent, 7->0 failures, 28->0 cells on the 5-chunk set; full
+pipeline on 74HC_HCT74 / tlv62569 / CH32V208DS0 — 0 unit failures, 0
+rejected chunks, 0 residual double-bullets (`dash_bullets_fixed` = 0 there:
+the two-level '•'/'–' convention is Microchip-specific). Full SAM9X60 LLM
+re-run deferred until items 1-2 land — one run then validates all three.
+
 ## Open work (priority order)
 
 1. **Deterministic missing-index inference** — highest value.
@@ -70,6 +106,27 @@ Conclusions drawn from this data:
 4. (Optional, low priority) NOTE hint variant for missing-index failures
    ("your previous reply dropped the index") — cheap, but item 1 makes most
    of these moot.
+5. **Model escalation ladder for exhausted retries** — same-model requeue
+   salvages only 6-9% of requeued units, so the ladder replaces bare retry
+   as the recovery mechanism. Design (agreed): auto-switching proxy on the
+   server, so switching = changing the model id; config
+   `llm_escalation: [{model, max_fraction, min_units}, ...]` via
+   `--llm-auth` (level 0 = existing `model`). Salvage passes run AFTER the
+   main pass (never mid-run): each level fires only if
+   `failed_units/units_sent <= max_fraction` (ceiling on big-model exposure
+   — bounds worst-case run time) AND `failed_units >= min_units` (no reload
+   for 3 fragments). Defaults per the original proposal: 0.5 then 0.1.
+   Salvage passes reuse the batch scheduler/verifier/NOTE hints with fresh
+   batch positions (drift-isolated); final failures keep the original text
+   (rejection-is-safe contract unchanged); sampling stays server-side per
+   model. Scope v1: units only (not whole-chunk prose attempts — chunk-sized
+   echoes are too expensive on a 10x model). meta: per-level
+   `escalation: [{model, units_sent, units_fixed, truncated_calls,
+   duration}]` + `escalation_skipped` reasons; fail log records the model
+   that finally failed the unit (merges with item 3). Prereq: items 1-2 —
+   deterministic repair first, so the gates measure only model-sensitive
+   residue (the two model-unreachable classes above are already gone).
+   Validate on the deferred full SAM9X60 re-run.
 
 ## Rejected ideas (recorded so they are not re-proposed)
 

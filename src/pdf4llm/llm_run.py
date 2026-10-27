@@ -55,6 +55,7 @@ from .llm_prepass import (
     collapse_dot_leaders,
     dedupe_bullets,
     fix_br_word_splits,
+    fix_dash_bullets,
     fix_subscripts,
     strip_horizontal_rules,
 )
@@ -75,6 +76,7 @@ from .llm_table import (
     _is_toc_like,
     _split_row_cells,
     _suspicious_cell,
+    dup_cell_indices as _dup_cell_indices,
 )
 from .llm_verify import _verify_chunk
 
@@ -166,23 +168,12 @@ def _produce_table(sched: BatchScheduler, cfg: SimpleNamespace, cs: ChunkState,
         if segs is None:
             continue
         cells = [core for _l, core, _t in segs]
-        # Cells duplicated within their row (equal to, or contained in, a
-        # sibling cell — the extractor sometimes splits a title across two
-        # cells) are extraction artifacts: the model reliably tries to
-        # deduplicate or reword them, which is a content change, so they are
-        # never sent. A duplicated cell is already identical to its sibling —
-        # there is nothing to fix in it anyway.
-        stripped = [c.strip() for c in cells]
-        keys = [re.sub(r"[^0-9a-z]+", "", c.lower()) for c in stripped]
-
-        def _is_dup(k: int) -> bool:
-            key = keys[k]
-            if len(key) < 8:
-                return False
-            return any(j != k and key in other for j, other in enumerate(keys))
-
+        # Cells duplicated within their row (see dup_cell_indices) are
+        # extraction artifacts: the model reliably tries to deduplicate or
+        # reword them, which is a content change, so they are never sent.
+        dups = _dup_cell_indices(cells)
         targets = [k for k, c in enumerate(cells)
-                   if _suspicious_cell(c) and not _is_dup(k)]
+                   if _suspicious_cell(c) and k not in dups]
         for k in targets:
             if cfg.vocab.admits(cells[k]):
                 sched.enqueue_cell(cs.index, i, k, cells[k], line)
@@ -329,6 +320,7 @@ def correct_with_llm(
     """
     text = dedupe_bullets(text)
     text, hr_removed = strip_horizontal_rules(text)
+    text, dash_fixed = fix_dash_bullets(text)
     text, dots_collapsed = collapse_dot_leaders(text)
     text, br_joined = fix_br_word_splits(text)
 
@@ -357,7 +349,8 @@ def correct_with_llm(
             f"  llm: document classified {'technical' if is_technical else 'general'} "
             f"({source})"
             + (f"; {sub_count} subscripts normalised" if sub_count else "")
-            + (f"; {br_joined} '<br>' splits joined" if br_joined else ""),
+            + (f"; {br_joined} '<br>' splits joined" if br_joined else "")
+            + (f"; {dash_fixed} dash bullets repaired" if dash_fixed else ""),
             flush=True,
         )
 
@@ -389,6 +382,7 @@ def correct_with_llm(
         "subscripts_normalised": sub_count,
         "br_joined": br_joined,
         "horizontal_rules_removed": hr_removed,
+        "dash_bullets_fixed": dash_fixed,
         "dot_leaders_collapsed": dots_collapsed,
         "chunks_total": len(chunks),
         "chunks_accepted": 0,

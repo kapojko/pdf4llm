@@ -286,6 +286,92 @@ def test_dedupe_bullets():
     assert "•" not in out
 
 
+def test_dedupe_bullets_dash_glyphs_untouched():
+    # dash glyphs are the LEVEL-2 bullet glyph: handled by fix_dash_bullets
+    # with list context, dedupe_bullets must not touch them
+    src = "- –   Static memory controller\n\n- —  1: value definition\n\n- normal item"
+    out = llm_prepass.dedupe_bullets(src)
+    assert "- –   Static memory controller" in out
+    assert "- —  1: value definition" in out
+    assert "- normal item" in out
+
+
+def test_fix_dash_bullets_nest_and_flatten():
+    # level-2 items under a list parent -> nested one level deeper;
+    # runs of dash items inherit the level of the previous dash item
+    src = """- Peripherals
+
+- –   LCD Controller
+
+- –   2D Graphics Controller
+
+Plain paragraph:
+
+- –   top-level dash item
+
+## Heading
+
+- –   another top-level item"""
+    out, n = llm_prepass.fix_dash_bullets(src)
+    assert n == 4
+    assert "  - LCD Controller" in out
+    assert "  - 2D Graphics Controller" in out
+    assert "- top-level dash item" in out
+    assert "- another top-level item" in out
+
+
+def test_fix_dash_bullets_safety():
+    # negative numbers / ranges / separator lines never match
+    src = """- -5 V is a negative value
+
+- –5 without space stays
+
+2019–20 range stays
+
+– – – – separator stays
+
+- Operating range – stays (dash at line end)"""
+    out, n = llm_prepass.fix_dash_bullets(src)
+    assert n == 0
+    assert out == src
+
+
+def test_fix_dash_bullets_after_hr_strip():
+    # production order: dedupe_bullets -> strip_horizontal_rules ->
+    # fix_dash_bullets; a page-break '---' artifact splits one list, and the
+    # dash item after it must still nest (its real parent is 3 lines up)
+    src = """- Peripherals
+
+- –   LCD Controller
+
+---
+
+- –   ITU-R BT. 601/656"""
+    text, _ = llm_prepass.strip_horizontal_rules(llm_prepass.dedupe_bullets(src))
+    out, n = llm_prepass.fix_dash_bullets(text)
+    assert n == 2
+    assert "  - LCD Controller" in out
+    assert "  - ITU-R BT. 601/656" in out
+
+
+def test_dup_cell_indices():
+    # RGBMODE pattern (SAM9X60 chunks 1468/1506): the description cell
+    # CONTAINS the name cell — the container direction, previously missed.
+    cells = ["0", "", "12BPP _ RGB _ 444", "12BPP _ RGB _ 444 12 b pp  RGB 444"]
+    assert llm_table.dup_cell_indices(cells) == {2, 3}
+    # contained direction (title split across two cells; within the 3x cap):
+    # both cells are artifacts of each other, both are skipped
+    cells = ["Embedded", "Embedded overview"]
+    assert llm_table.dup_cell_indices(cells) == {0, 1}
+    # ...but containment beyond 3x is prose mentioning a sibling, not a dup:
+    # a false miss is cheap (safe rejection), a false skip loses a real fix
+    cells = ["Register", "This register is used for configuration of the device"]
+    assert llm_table.dup_cell_indices(cells) == set()
+    # short keys never trigger
+    cells = ["value", "value mode"]
+    assert llm_table.dup_cell_indices(cells) == set()
+
+
 def test_classify_heuristic_technical():
     text = (
         "74HC74 Product data sheet Rev. 9\n"

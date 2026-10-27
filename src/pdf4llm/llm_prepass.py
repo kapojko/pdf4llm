@@ -67,10 +67,82 @@ _BULLET_TRAIL_RE = re.compile(r"(?m)^(\s*[-*+].*?)\s+[•\u2022]\s*$")
 
 
 def dedupe_bullets(text: str) -> str:
-    """Remove '•' glyphs that duplicate a Markdown list marker."""
+    """Remove '•' (U+2022) glyphs that duplicate a Markdown list marker.
+
+    In this document family '•' is always the TOP-level bullet glyph, so a
+    '•' right after the '- ' marker is an extraction artifact and its
+    deletion is always right (both with and without a preceding list item).
+    En/em dashes are NOT handled here — they are the level-2 bullet glyph,
+    so 'marker + dash' needs list CONTEXT; see :func:`fix_dash_bullets`.
+    Only the LEAD position is touched — a glyph at line END is ambiguous
+    (ranges, 'see 3–') and is left alone.
+    """
     text = _BULLET_LEAD_RE.sub(r"\1 ", text)
     text = _BULLET_TRAIL_RE.sub(r"\1", text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-pass: marker + en/em dash bullet repair (no LLM).
+# PDF lists are two-level: '•' bullets at top level, '–'/'—' bullets one
+# level deeper. The converter emits the markdown marker AND keeps the PDF
+# glyph, producing '- –   text' — which reads as a double bullet, and every
+# model 'fixes' it by deleting the marker (a content change -> invariant-A
+# rejection; SAM9X60: 554 lines, unfixable by any model). The real repair
+# depends on list context:
+#   previous list item is another marker+dash line -> SAME level as it
+#     (inherit its disposition: nested runs stay nested, flat runs stay flat);
+#   previous line is any other list item -> NEST one level under it
+#     ('- Parent:' then '- –   child' becomes '  - child');
+#   otherwise (paragraph/heading/table) -> top-level '–' list -> FLATTEN
+#     (delete the glyph: '- –   text' becomes '- text').
+# The dash must be followed by whitespace: '- -5' (negative number), ranges
+# and '– – – –' separator lines never match (0 occurrences in SAM9X60).
+# Whitespace/glyph edits only — words and digits are physically untouched.
+# Runs AFTER strip_horizontal_rules: page-break '---' artifacts split lists,
+# and with them gone the nearest non-blank line is the true list context.
+# ---------------------------------------------------------------------------
+
+_DASH_BULLET_RE = re.compile(r"^(\s*)([-*+])[ \t]+[\u2013\u2014][ \t]+(\S.*)$")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])[ \t]+\S")
+
+
+def fix_dash_bullets(text: str) -> tuple[str, int]:
+    """Repair 'marker + en/em dash' bullet lines (nested-list artifacts).
+
+    Returns (text, repaired_line_count). See the block comment above for
+    the rule; the previous non-blank line decides, and a dash line that
+    FOLLOWS a dash line inherits that line's disposition so runs stay at a
+    consistent level across hr/blank interruptions.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    n = 0
+    last_indent: str | None = None  # None = flattened, else nested indent
+    last_dash_idx = -1              # index in `out` of the last repaired line
+    for line in lines:
+        m = _DASH_BULLET_RE.match(line)
+        if m:
+            mark, rest = m.group(2), m.group(3)
+            prev_idx = next((len(out) - 1 - k for k, l in enumerate(reversed(out))
+                             if l.strip()), -1)
+            if prev_idx == last_dash_idx:
+                indent = last_indent            # sibling: inherit level
+            elif prev_idx >= 0 and _LIST_ITEM_RE.match(out[prev_idx]):
+                prev = out[prev_idx]
+                pind = len(prev) - len(prev.lstrip())
+                indent = prev[:pind] + "  "     # child of the parent item
+                last_indent = indent
+            else:
+                indent = None                   # top-level dash list
+                last_indent = None
+            out.append(f"{mark} {rest}" if indent is None
+                       else f"{indent}{mark} {rest}")
+            last_dash_idx = len(out) - 1
+            n += 1
+            continue
+        out.append(line)
+    return "\n".join(out), n
 
 
 # ---------------------------------------------------------------------------

@@ -108,3 +108,36 @@ _SUSPICIOUS_SHORT = re.compile(r"\b[A-Za-z] [A-Za-z]{1,2}\b")
 
 def _suspicious_cell(text: str) -> bool:
     return bool(_SUSPICIOUS_ANY.search(text) or _SUSPICIOUS_SHORT.search(text))
+
+
+def dup_cell_indices(cells: list[str]) -> set[int]:
+    """Indices of extraction-artifact cells that must never be sent.
+
+    A cell duplicated within its row — equal to, or contained in, a sibling
+    cell, in EITHER direction (the extractor sometimes splits a title across
+    two cells, and sometimes repeats the name cell inside the description:
+    '12BPP _ RGB _ 444 | 12BPP _ RGB _ 444 12 b pp  RGB 444') — is an
+    artifact: the model reliably tries to deduplicate or reword it, which is
+    a content change, so it is never sent. A duplicated cell is already
+    identical to (or a superset of) its sibling — there is nothing to fix in
+    it that the verifier would accept anyway.
+
+    Both directions are length-gated on the CONTAINED key (>= 8 normalized
+    chars, so 'value'/'register' cannot trigger it) and the container is
+    capped at ~3x the contained length, so a long prose cell that merely
+    mentions a short sibling is not skipped.
+    """
+    stripped = [c.strip() for c in cells]
+    keys = [re.sub(r"[^0-9a-z]+", "", c.lower()) for c in stripped]
+    dups: set[int] = set()
+    for k, key in enumerate(keys):
+        if len(key) < 8:
+            continue
+        for j, other in enumerate(keys):
+            if j == k or len(other) < 8:
+                continue
+            if (key in other or other in key) and \
+                    max(len(key), len(other)) <= 3 * min(len(key), len(other)):
+                dups.add(k)
+                break
+    return dups
