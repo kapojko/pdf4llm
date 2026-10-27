@@ -58,6 +58,7 @@ from .llm_prepass import (
     dedupe_bullets,
     fix_br_word_splits,
     fix_dash_bullets,
+    fix_spaced_underscores,
     fix_subscripts,
     strip_horizontal_rules,
 )
@@ -569,6 +570,7 @@ def _correct_with_llm(
     text, dash_fixed = fix_dash_bullets(text)
     text, dots_collapsed = collapse_dot_leaders(text)
     text, br_joined = fix_br_word_splits(text)
+    text, spaced_underscores = fix_spaced_underscores(text)
 
     # always shown (not verbose-gated): the first LLM call can stall for a
     # long time if the server must load the model — silence here looks
@@ -597,7 +599,9 @@ def _correct_with_llm(
         print(
             f"  llm: document classified {'technical' if is_technical else 'general'} "
             f"({source})"
-            + (f"; {sub_count} subscripts normalised" if sub_count else "")
+            + (f"; {sub_count} subscript terms joined" if sub_count else "")
+            + (f"; {spaced_underscores} spaced underscores joined"
+               if spaced_underscores else "")
             + (f"; {br_joined} '<br>' splits joined" if br_joined else "")
             + (f"; {dash_fixed} dash bullets repaired" if dash_fixed else ""),
             flush=True,

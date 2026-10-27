@@ -593,6 +593,7 @@ def _fixed(chunk: str) -> str:
 def _prep(text: str) -> str:
     """Mirror correct_with_llm's deterministic pre-passes (classify=False path)."""
     text, _ = llm_prepass.strip_horizontal_rules(llm_prepass.dedupe_bullets(text))
+    text, _ = llm_prepass.fix_spaced_underscores(text)
     text, _ = llm_prepass.fix_subscripts(text)
     return text
 
@@ -1425,25 +1426,39 @@ def test_strip_thinking_blocks():
 # deterministic subscript normalisation
 # ---------------------------------------------------------------------------
 
-def test_fix_subscripts_joins_established_terms():
+def test_fix_subscripts_joins_with_document_evidence():
+    text = "| VCC | supply | in excess of V CC . | VDD and V DD pins |"
+    out, n = llm_prepass.fix_subscripts(text)
+    assert "of VCC ." in out and "VDD pins" in out and n == 2
+
+
+def test_fix_subscripts_without_evidence_leaves_untouched():
+    # no joined precedent in this document -> nothing is rewritten
     text = "in excess of V CC . | V IH | V IL | t PLH |"
     out, n = llm_prepass.fix_subscripts(text)
-    assert "VCC" in out and "VIH" in out and "VIL" in out and "tPLH" in out
-    assert n == 4
+    assert out == text and n == 0
 
 
-def test_fix_subscripts_underscore_for_mixed_suffixes():
-    text = "T amb  = -40 ; P tot ; t pd ; C L ; R L ; Q n+1"
+def test_fix_subscripts_never_inserts_underscores():
+    # lowercase/mixed/single-letter suffixes are never rewritten:
+    # 'T_amb'-style insertion is an entity the source never used
+    text = "T amb  = -40 ; P tot ; t pd ; C L ; R L ; Q n+1 ; | I IK |"
     out, n = llm_prepass.fix_subscripts(text)
-    assert "T_amb" in out and "P_tot" in out and "t_pd" in out
-    assert "C_L" in out and "R_L" in out and "Q_n+1" in out
-    assert n == 6
+    assert out == text and n == 0
 
 
-def test_fix_subscripts_current_symbol_uses_underscore():
-    # I+IK joined would read 'IIK' — unreadable, so underscore form
-    out, n = llm_prepass.fix_subscripts("| I IK | input clamping current | I O |")
-    assert "I_IK" in out and "I_O" in out and n == 2
+def test_fix_subscripts_current_symbol_joins_with_evidence():
+    # 'I EEE' -> 'IEEE' attested by the document's own 'IEEE' usage
+    text = "IEEE 1149.1 boundary scan per I EEE 1149.1"
+    out, n = llm_prepass.fix_subscripts(text)
+    assert out == "IEEE 1149.1 boundary scan per IEEE 1149.1" and n == 1
+
+
+def test_fix_subscripts_debris_never_joins_without_exact_token():
+    # 'C LU' (debris of 'CLUT') must not join: 'CLU' never occurs in the doc
+    text = "| CLUT[IDX0].R | C LU T[I DX 0]. B |"
+    out, n = llm_prepass.fix_subscripts(text)
+    assert out == text and n == 0
 
 
 def test_fix_subscripts_never_rewrites_prose():
@@ -1453,12 +1468,13 @@ def test_fix_subscripts_never_rewrites_prose():
 
 
 def test_fix_subscripts_digit_prefixed_pair():
-    out, n = llm_prepass.fix_subscripts("exceeds 0.5V CC margin")
-    assert "0.5VCC" in out and n == 1
+    out, n = llm_prepass.fix_subscripts("0.5 VCC rail; exceeds 0.5V CC margin")
+    assert "exceeds 0.5VCC margin" in out and n == 1
 
 
 def test_fix_subscripts_never_touches_split_words():
     # 'D-t yp e' is a hyphenated word fragment, not a 't yp' subscript
+    # ('typ' never occurs as a document token, so no join either way)
     out, n = llm_prepass.fix_subscripts("Dual D-t yp e fli p -flo p")
     assert "t_yp" not in out
     assert out == "Dual D-t yp e fli p -flo p" and n == 0
@@ -1468,6 +1484,25 @@ def test_fix_subscripts_part_numbers_untouched():
     text = "74HC74D 74HCT74D SOT108 - 1 2 mm x 2 mm"
     out, _n = llm_prepass.fix_subscripts(text)
     assert out == text
+
+
+def test_fix_spaced_underscores_joins_both_sides():
+    out, n = llm_prepass.fix_spaced_underscores(
+        "read the SDRAMC _ WPSR and R8 _ USB _ CTRL regs")
+    assert out == "read the SDRAMC_WPSR and R8_USB_CTRL regs" and n == 3
+
+
+def test_fix_spaced_underscores_leaves_one_sided_and_bare():
+    src = ("keep SDRAMC_ WPSR and SDRAMC _WPSR as-is;\n"
+           " ___ \n_flag_ stays; head _; a  _  b joins")
+    out, n = llm_prepass.fix_spaced_underscores(src)
+    assert out == src.replace("a  _  b joins", "a_b joins") and n == 1
+
+
+def test_fix_spaced_underscores_never_touches_table_pipes():
+    src = "| DST _ PARAMS _ UNCHANGED | value |"
+    out, n = llm_prepass.fix_spaced_underscores(src)
+    assert out == "| DST_PARAMS_UNCHANGED | value |" and n == 2
 
 
 def test_strip_horizontal_rules():

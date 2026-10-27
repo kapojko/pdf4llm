@@ -1,9 +1,10 @@
 """Deterministic pre-passes (no LLM involved).
 
 Applied before any model call: they remove extraction noise the models
-reliably try to "fix" (which would poison chunks) and normalise known
-flattened-subscript forms. All of it is deterministic and guarded, so it
-cannot corrupt prose.
+reliably try to "fix" (which would poison chunks) and restore source forms
+the converter garbled (spaced underscores, flattened subscript terms). All
+of it is deterministic and guarded, and nothing here inserts characters the
+source does not attest — cleanup must not introduce new entities.
 """
 from __future__ import annotations
 
@@ -181,16 +182,35 @@ _BR_TAG_SEARCH_RE = re.compile(r"(?i)<br\s*/?>")
 
 
 # ---------------------------------------------------------------------------
-# Deterministic pre-pass: subscript normalisation (no LLM involved).
-# PDF extraction flattens V_CC to 'V CC', T_amb to 'T amb', t_pd to 't pd'.
-# Normalised forms: established uppercase terms are joined ('V CC' -> 'VCC',
-# 'V IH' -> 'VIH', 't PLH' -> 'tPLH'); everything else gets an underscore
-# ('T amb' -> 'T_amb', 'C L' -> 'C_L', 'I IK' -> 'I_IK', 'Q n+1' -> 'Q_n+1').
-# Deterministic + guarded: prefix/suffix whitelists, English-stopword filter,
-# so prose like 'I do' or 'a few' can never be rewritten.
+# Deterministic pre-pass: subscript term joining (no LLM involved).
+# PDF extraction flattens subscript typography: V with a small 'CC' becomes
+# 'V CC', T with 'amb' becomes 'T amb'. This pass joins a quantity symbol
+# with its subscript ONLY when the joined form already occurs in THIS
+# document ('V CC' -> 'VCC' iff the token 'VCC' appears elsewhere): the
+# document's own usage is the evidence that the joined spelling is the
+# intended one. Everything else is left EXACTLY as extracted.
+#
+# No underscores are ever inserted. 'T_amb' is a notation the source never
+# used — an insertion is an irreversible bet that violates the pipeline's
+# prime rule (cleanup must not introduce new entities). Measured on
+# SAM9X60: ~17% of insertions were misfires ('f l a g' -> 'f_l a g' broke
+# common prose words the LLM stage could then no longer repair), and the
+# joined forms they were meant to produce ('VCC', 'Tamb') are equally
+# readable for the LLM consumer. Leftover spaced pairs ('T amb') are
+# whitespace-only fixable by the LLM stage wherever it sees them.
+#
+# Deterministic + guarded: prefix/suffix whitelists, English-stopword
+# filter, in-document evidence for every join — prose like 'I do' or
+# 'a few' can never be rewritten, and neither can debris ('C LU' stays:
+# 'CLU' never occurs in the document).
 # ---------------------------------------------------------------------------
 
 _SUB_PAIR_RE = re.compile(r"(?<![A-Za-z_\-])([A-Za-z]) ([A-Za-z][A-Za-z0-9+]{0,3}(?:\+\d+)?)\b")
+
+# Document token pattern, shared with the DocVocab SEND/SKIP filter
+# (re-exported from llm_batch): identifier-like tokens, '_' kept so that
+# register names ('SDRAMC_WPSR') count as one token.
+_VOCAB_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9-]*")
 
 # prefixes that are established quantity symbols in datasheets (never English
 # words on their own). 'I' (current) and 'V' (voltage) collide with the
@@ -212,34 +232,64 @@ _SUB_STOPWORDS = {
 
 
 def _sub_form(prefix: str, suffix: str) -> str | None:
-    """Return the normalised 'prefix_suffix' token, or None if not safe."""
+    """Return the candidate joined 'prefixSuffix' term, or None.
+
+    Only uppercase suffixes of 2+ letters are candidates ('V CC' -> 'VCC',
+    'V IH' -> 'VIH', 't PLH' -> 'tPLH', 'I EEE' -> 'IEEE'); lowercase,
+    mixed and single-letter suffixes are never rewritten.
+    """
     if prefix not in _SUB_PREFIXES and prefix != "I":
         return None  # prefix is not a known quantity symbol -> leave alone
     if prefix in {"A", "a", "i"}:
         return None  # article/pronoun readings dominate
     if suffix.lower() in _SUB_STOPWORDS:
         return None
-    if prefix == "I":
-        # current symbol; joining I+IK -> 'IIK' is unreadable, and 'I' is the
-        # English pronoun -> underscore form only
-        return f"{prefix}_{suffix}"
     if suffix.isupper() and len(suffix) >= 2:
-        # established compact terms: V CC -> VCC, V IH -> VIH, t PLH -> tPLH
         return f"{prefix}{suffix}"
-    # mixed/lowercase or single-letter suffixes: T amb -> T_amb, C L -> C_L
-    return f"{prefix}_{suffix}"
+    return None  # mixed/lowercase/single-letter suffix: leave as extracted
 
 
 def fix_subscripts(text: str) -> tuple[str, int]:
-    """Normalise flattened subscripts. Returns (text, replacement_count)."""
+    """Join flattened subscript terms attested by this document's usage.
+
+    'V CC' -> 'VCC' only when the token 'VCC' occurs (as written) elsewhere
+    in the document; everything else — including 'T amb'-style pairs with no
+    joined precedent — is left unchanged. Never inserts new characters.
+    Returns (text, join_count).
+    """
+    evidence = set(_VOCAB_TOKEN_RE.findall(text))
     count = 0
 
     def repl(m: re.Match) -> str:
         nonlocal count
         form = _sub_form(m.group(1), m.group(2))
-        if form is None:
+        if form is None or form not in evidence:
             return m.group(0)
         count += 1
         return form
 
     return _SUB_PAIR_RE.sub(repl, text), count
+
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-pass: spaced underscores (no LLM involved).
+# PDF text extraction inserts false spaces around '_' inside register and
+# signal names ('SDRAMC _ WPSR' for SDRAMC_WPSR, 'R8 _ USB _ CTRL'). The
+# underscore itself is real — only the spaces are artifacts — so joining
+# them is a whitespace-only restoration of the source form, never an edit
+# of content (the invariant-A projection treats the two as identical).
+# Guarded: a single '_' with word characters on BOTH sides is joined;
+# one-sided variants ('A_ B', 'A _B') and bare underscore runs ('___') are
+# left alone — unmeasured, and a one-sided join would also rewrite
+# extraction debris the LLM stage should see unchanged.
+# ---------------------------------------------------------------------------
+
+_SPACED_UNDERSCORE_RE = re.compile(r"(?<=[A-Za-z0-9]) +_ +(?=[A-Za-z0-9])")
+
+
+def fix_spaced_underscores(text: str) -> tuple[str, int]:
+    """Join false spaces around '_' between word characters ('A _ B' -> 'A_B').
+
+    Returns (text, joined_gap_count).
+    """
+    return _SPACED_UNDERSCORE_RE.subn("_", text)

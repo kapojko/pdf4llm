@@ -168,8 +168,9 @@ sampling = server defaults). Reports: `out/exp9_escalation/`.
 - **163 different fragments, same size** (borderline pool): ling 0 (heavy
   drift), ornith 32 (20%), nemotron 34 (21%, fixes 2 ornith misses).
 - Conclusions: model diversity is the yield driver (53% vs 6.5% same-model
-  requeue); a 16+23-unit hard core is failed by EVERY model (open work 1:
-  subscript misfire); same-model requeue economics refined (per round: 6.5%
+  requeue); a 16+23-unit hard core is failed by EVERY model (the
+  subscript-misfire class, since resolved — see Done: underscore policy
+  rebuild); same-model requeue economics refined (per round: 6.5%
   fix, ~30% unchanged echo, ~63% re-fail).
 
 ## Done: rescue pass (second-model salvage)
@@ -200,29 +201,79 @@ Live smoke: fire path (real model switch, per-level meta), skip path, and a
 
 ## Open work (priority order)
 
-1. **Subscript misfire breaks common words** (root cause found, fix needed):
-   `fix_subscripts` turns ligature-split fragments into unfixable ones —
-   extraction gives `'f l a g'` (whitespace-only, model-fixable), the
-   subscript pass matches `f` (quantity symbol) + single-letter suffix and
-   inserts `_` → `'f_l a g'`, which the prompt forbids models to repair and
-   the verifier (rightly) rejects. Probed models were RIGHT — they produced
-   `'flag'` and got rejected. SAM9X60: 409 damaged groups (`'f_l a g'` 103,
-   `'t_yp e'`, `'f_i eld'`, `'f_ect'` (affect), `'f_set'` (offset)); 16+23
-   probe hard-core units are exactly this class. Fix: gate the insertion on
-   document evidence (joined form occurs in doc → leave spaces for the
-   model; build vocab BEFORE the subscript pass), or a repair step right
-   after (evidence-gated `_` drop restricted to subscript-shaped
-   underscores); `SDRAMC _ WPSR`-style spaces around real underscores are a
-   separate safe whitespace-only rule. First measure legit-vs-misfire ratio
-   on rm0410 / CH32V208 / OV2640 (2591 insertions in SAM9X60, mostly legit).
+1. **NEXT: full SAM9X60 regeneration with the new code + rescue model**
+   (user-run; `--llm-keep-prellm --llm-capture --llm-rescue ...`), then
+   analysis of the artifacts, then this TODO gets finalized/trimmed.
+   Compare against the v1.9.0 run: rejection/yield rates, rescue yield on
+   a full document (probe-validated 53% on fragments, full-doc pending),
+   prepass counters (spaced-underscore joins, evidence-gated subscript
+   joins), and whether prompt/identifier-rule changes shift rejection
+   reasons.
 2. **Whole-chunk rescue for still-rejected chunks** (v2 candidate): a
    second whole-chunk echo attempt on the rescue model for chunks whose
    failures are not unit-shaped. Unmeasured on already-failed chunks;
    token-expensive (~2x chunk output). Only after unit-rescue data from
-   full-document runs.
+   the full-document run (open work 1).
+3. **Pre-existing underscore debris in raw extraction** (small, separate
+   class): a few documents ship converter artifacts like 'T_yp e' or
+   'C_ADD R' (CH32FV2x headings, SAM9X60 register names) and false-split
+   bitfield names ('WAIT CFG') — created by the PDF->MD converter, before
+   any pdf4llm pass. Left faithful; the LLM stage may repair them
+   (whitespace-only edits are verifier-legal), but no deterministic rule
+   exists yet. Fixing 'WAIT CFG' -> 'WAITCFG' would also remove the one
+   known false subscript join (see Done: underscore policy rebuild, item 5).
+
+## Done: underscore policy rebuild (v1.9.1)
+
+Human decision: **the pipeline must never insert entities the source does
+not contain.** The old subscript underscore branch ('T amb' -> 'T_amb') was
+an irreversible bet with a measured ~17% misfire rate (SAM9X60: 436/2591;
+322 hard 'X_y z' debris shapes post-prepass, breaking prose words the LLM
+could no longer repair). Landed instead:
+
+1. `fix_subscripts` rewritten — **join-only, document-evidence-gated**:
+   'V CC' -> 'VCC' only when the token 'VCC' occurs (as written) in the
+   document; everything else stays as extracted. No underscores inserted.
+   Whitespace-only, so verifier-legal in both directions; 2591 -> 431
+   joins on SAM9X60, 1163 -> 263 on rm0410, 367 -> 108 on CH32V208DS0.
+2. `fix_spaced_underscores` (new pre-pass): joins false spaces around '_'
+   between word chars on both sides ('SDRAMC _ WPSR' -> 'SDRAMC_WPSR').
+   One-sided variants untouched (unmeasured). 1858/119/157 joins on
+   SAM9X60/rm0410/CH32FV2x, all sampled contexts register names.
+3. Prompts: false "already normalised" claim replaced with the
+   identifier-protection rule (TECHNICAL_SYSTEM/LINE), rule added to
+   TECHNICAL_CELL (never had it); one 'V CC' -> 'VCC' example in the
+   system prompt (whitespace-only, verifier-legal).
+4. Hard 'X_y z' debris shapes: 322 -> 0 (SAM9X60), 8 -> 0 (rm0410).
+   `_VOCAB_TOKEN_RE` moved to llm_prepass (shared with DocVocab).
+   Tests: 229 in tests/test_llm.py.
+5. Known limitation, accepted (694-join audit, rm0410 + SAM9X60):
+   coincidental evidence can still enable a false join — the one found:
+   rm0410 §9.3.6 'C FG' -> 'CFG' (2/694), attested solely by 'WAIT CFG'
+   (itself a false-split bitfield name). A guard ("evidence must not
+   follow an ALL-CAPS word + space") was measured — blocks exactly these
+   2, zero collateral — but rejected as overfit to one example; the
+   unjoined 'C FG' also reads better (preserves the C FG / C BG parallel
+   structure; ALL-CAPS 'CFG' invites register-name misreading). Root
+   cause: split-bitfield-name extraction class (open work 3).
+
+Veto-heuristic experiments (scripts/exp10*_underscore_*.py: chain veto,
+lowercase-evidence veto, common-English fallback) were abandoned — every
+variant either false-vetoed genuine subscripts ('V DD' -> 'VDD', 63% false
+for the chain rule) or needed an external lexicon; obsolete after the
+insertion branch was removed.
 
 ## Rejected ideas (recorded so they are not re-proposed)
 
+- **Subscript underscore insertion** ('T amb' -> 'T_amb'): the pipeline
+  must not create entities absent from the source; measured ~17% misfire,
+  unfixable downstream (prompt forbids, verifier rejects). Replaced by
+  evidence-gated joining (see Done: underscore policy rebuild).
+- **Subscript-insertion veto heuristics** (chain veto via _gap_suspicious
+  groups, lowercase-evidence veto, common-English fallback lexicon):
+  every variant either false-vetoed genuine subscripts ('V DD' -> 'VDD',
+  63% false-veto for the chain rule) or needed a baked-in English lexicon;
+  obsolete after the insertion branch was removed entirely.
 - **JSON wire format without grammar enforcement**: adds JSON failure modes
   without the guarantees; +30–50% token overhead over the `N| ` protocol,
   measured at zero content violations. (`response_format`/grammar ruled out
@@ -249,15 +300,17 @@ Live smoke: fire path (real model switch, per-level meta), skip path, and a
 
 ## Validation status
 
-- Offline suite: 224 tests in `tests/test_llm.py` (+13 rescue, +2 transport,
-  +2 token meter).
+- Offline suite: 229 tests in `tests/test_llm.py`.
+- Underscore policy: offline-validated on 5 raw docs (SAM9X60, rm0410,
+  CH32V208DS0, CH32FV2x_V3xRM, OV2640); all 694 subscript joins audited
+  (2 known-false, accepted — see Done: underscore policy rebuild).
 - Full-document SAM9X60 run of the item-1/2 pipeline: done, analysed (see
   Done above); artifacts on `S:\Электроника\Microchip\SAM9X60`.
 - Cap headroom + drift guard: live-checked on 74HC_HCT74 / tlv62569 /
   CH32V208DS0 (`out/drift_check/`) — 0 rejections, 0 failed units.
 - Rescue pass: probe-validated on SAM9X60 fail-log fragments; live-smoked
   on 74HC_HCT74 (fire + skip paths). Full-document rescue validation
-  pending (next SAM9X60 rerun).
+  pending (open work 1: SAM9X60 regen with the new code).
 
 ## Done (for context)
 

@@ -27,7 +27,7 @@ import re
 import time
 from collections import Counter, deque
 
-from .llm_prepass import has_residual_br
+from .llm_prepass import _VOCAB_TOKEN_RE, has_residual_br
 from .llm_protocol import _echo_units
 from .llm_tokens import TokenMeter
 from .progress import LineProgress, _fmt_duration
@@ -71,7 +71,8 @@ _TRUNC_LOG_CAP = 10000
 # continuation token; internal hyphens ('D-t', 'flip-flop') are kept.
 _EDGE_CHARS = ".,:;!?*()[]{}\"'\u2019\u201c\u201d-"
 
-_VOCAB_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9-]*")
+# _VOCAB_TOKEN_RE lives in llm_prepass (the subscript-join evidence gate
+# shares it) and is imported above; DocVocab below re-uses it.
 
 
 class DocVocab:

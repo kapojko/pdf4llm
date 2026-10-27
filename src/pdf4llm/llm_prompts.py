@@ -38,8 +38,10 @@ TECHNICAL_SYSTEM_PROMPT = (
     "The text comes from an electronic component datasheet or microcontroller "
     "reference manual. PDF extraction left false spaces inside words.\n"
     "Typical fixes in this domain: 'D-t yp e' -> 'D-type', 'fli p -flo p' -> "
-    "'flip-flop', 'Orderin g' -> 'Ordering'. Subscripts like 'VCC', 'T_amb', "
-    "'C_L' are already normalised — never change or move underscores ('_').\n"
+    "'flip-flop', 'Orderin g' -> 'Ordering'. Spaced subscript terms join to "
+    "the document's own spelling ('V CC' -> 'VCC'). Underscores ('_') are "
+    "part of real register and signal names ('SDRAMC_WPSR', 'R8_USB_CTRL') "
+    "— never add, delete, or move them.\n"
     "Register values, pin numbers, voltages, timings and part numbers are "
     "sacrosanct: never let two numbers or a number and a symbol merge "
     "('2 0' must NOT become '20', '0.5 V' must stay '0.5 V').\n"
@@ -95,8 +97,9 @@ output:
 
 TECHNICAL_LINE_PROMPT = (
     "The lines come from an electronic component datasheet or microcontroller "
-    "reference manual. Subscripts like 'VCC' and 'T_amb' are already "
-    "normalised — never change or move underscores ('_').\n" + _LINE_RULES
+    "reference manual. Underscores ('_') are part of real register and signal "
+    "names ('SDRAMC_WPSR', 'R8_USB_CTRL') — never add, delete, or move them.\n"
+    + _LINE_RULES
 )
 GENERAL_LINE_PROMPT = _LINE_RULES
 
@@ -134,6 +137,8 @@ never echoed)
 TECHNICAL_CELL_PROMPT = (
     "The cells come from an electronic component datasheet or microcontroller "
     "reference manual (register maps, pin tables, electrical "
-    "characteristics).\n" + _CELL_RULES
+    "characteristics). Underscores ('_') are part of real register and "
+    "signal names ('SDRAMC_WPSR', 'R8_USB_CTRL') — never add, delete, or "
+    "move them.\n" + _CELL_RULES
 )
 GENERAL_CELL_PROMPT = _CELL_RULES
