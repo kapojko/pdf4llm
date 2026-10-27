@@ -1683,6 +1683,40 @@ def test_context_check_uses_meter(monkeypatch):
     assert workers == 1 and entry["key"] == "m"
 
 
+def test_fail_log_records_coordinates_and_model(monkeypatch):
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return "0| D-typ", None
+
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    _out, stats = llm_run.correct_with_llm(
+        CELL_DOC, "mymodel", "http://x", "k", verbose=False,
+        classify=False, retries=0)
+    e = stats["unit_fail_log"][-1]
+    assert e["model"] == "mymodel"
+    assert e["kind"] == "cell" and e["cell"] == 0 and e["line"] >= 1
+
+
+def test_keep_prellm_and_capture(tmp_path, monkeypatch):
+    def fake_call(system_prompt, chunk, *a, **kw):
+        return chunk, None
+
+    monkeypatch.setattr(llm_run, "_call_llm", fake_call)
+    monkeypatch.setattr(llm_protocol, "_call_llm", fake_call)
+    pre = tmp_path / "doc.prellm.md"
+    cap = tmp_path / "doc.exchange.jsonl"
+    doc = "para one\n\n---\n\npara two"
+    _out, stats = llm_run.correct_with_llm(
+        doc, "m", "http://x", "k", verbose=False, classify=False,
+        keep_prellm=str(pre), capture_path=str(cap))
+    # prellm = post-prepass text: the horizontal rule is stripped
+    assert pre.exists() and "---" not in pre.read_text(encoding="utf-8")
+    # transcript: one JSON record per LLM call
+    recs = [json.loads(l) for l in cap.read_text(encoding="utf-8").splitlines()]
+    assert recs and all({"system", "user", "reply", "finish"} <= set(r)
+                        for r in recs)
+    assert stats["chunks_accepted"] == 1
+
+
 def test_blank_chunk_never_sent(monkeypatch):
     # trailing blank lines after a table produce a whitespace-only chunk;
     # it must never reach the model (wasted whole-chunk call on empty input)

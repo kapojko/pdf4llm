@@ -77,6 +77,12 @@ cannot accept the repair any model would produce. Fixed deterministically:
    dropped (both shapes recovered, packing determinism proven).
    Side fix: whitespace-only chunks (table + trailing blanks) are never
    sent to the model (`test_blank_chunk_never_sent`).
+6. **Escalation-experiment groundwork**: fail-log entries carry `line`/`cell`
+   (exact unit coordinates -> fragment reconstruction via `chunk_offsets`);
+   CLI flags `--llm-keep-prellm` (writes `<name>.prellm.md`, the post-prepass
+   text chunk_offsets refer to) and `--llm-capture` (writes
+   `<name>.exchange.jsonl`, the full request/reply transcript incl. token
+   usage). Both opt-in; smoke: 32 KB prellm + 56 KB transcript on 74HC_HCT74.
 
 ## Open work (priority order)
 
@@ -131,9 +137,12 @@ cannot accept the repair any model would produce. Fixed deterministically:
   replay (see item 5); finalize check on 74HC_HCT74 / tlv62569 /
   CH32V208DS0 — 0 rejections, 0 failed units, 0 truncated calls, meta
   additions present (`out/finalize_check/`).
-- Remaining: full SAM9X60 re-run (2 h, explicit command) — expect the
-  missing-index share of the fail log to collapse and `truncated_calls` to
-  drop; also the natural validation vehicle for the escalation ladder.
+- Remaining: full SAM9X60 re-run (2 h, explicit command) with
+  `--llm-keep-prellm --llm-capture` — expect the missing-index share of the
+  fail log to collapse and `truncated_calls` to drop; the prellm snapshot +
+  transcript + fail-log coordinates then feed the model-escalation
+  experiment (replay exhausted-retry units against candidate models, the
+  verifier is the metric) before implementing open item 2.
 
 ## Done (for context)
 

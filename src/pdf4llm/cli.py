@@ -308,6 +308,17 @@ def convert_cmd(
              "key llm_chunk_chars). Smaller chunks are more stable on small "
              "models.",
     ),
+    llm_keep_prellm: bool = typer.Option(
+        False, "--llm-keep-prellm",
+        help="Keep the post-prepass markdown (the exact LLM pass input) as "
+             "<name>.prellm.md next to the output.",
+    ),
+    llm_capture: bool = typer.Option(
+        False, "--llm-capture",
+        help="Log every LLM request/reply pair to <name>.exchange.jsonl "
+             "(raw transcript for offline replay / model-escalation "
+             "experiments).",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Convert one or more PDFs to LLM-readable Markdown with a sanity score."""
@@ -351,6 +362,7 @@ def convert_cmd(
             pages=pages, llm_flag=llm_flag, model=model,
             llm_workers=llm_workers, llm_chunk_chars=llm_chunk_chars,
             llm_batch_tokens=llm_batch_tokens, verbose=verbose,
+            llm_keep_prellm=llm_keep_prellm, llm_capture=llm_capture,
         )
         codes.append(code)
         if code == 130:  # user interrupt: do not start the remaining files
@@ -502,6 +514,8 @@ def _process_one(
     llm_workers: int | None,
     llm_chunk_chars: int | None,
     llm_batch_tokens: int | None,
+    llm_keep_prellm: bool,
+    llm_capture: bool,
     verbose: bool,
 ) -> int:
     """Convert one PDF; returns the exit code for this file (0 = ok)."""
@@ -565,6 +579,10 @@ def _process_one(
                 sampling=c.get("llm_sampling"), retries=int(c.get("llm_retries", 2)),
                 workers=llm_workers, max_chars=chunk_chars,
                 batch_tokens=llm_batch_tokens,
+                keep_prellm=(str(md_path.with_suffix(".prellm.md"))
+                             if llm_keep_prellm else None),
+                capture_path=(str(md_path.with_suffix(".exchange.jsonl"))
+                              if llm_capture else None),
             )
         except LlmContextError as e:
             typer.echo(f"error: --llm aborted: {e}", err=True)

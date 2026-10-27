@@ -42,11 +42,13 @@ skipped (probably legitimate spacing). The vocabulary never edits text.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
 from types import SimpleNamespace
 
+from . import llm_classify, llm_protocol
 from .llm_batch import BATCH_TOKENS, BatchScheduler, ChunkState, DocVocab
 from .llm_chunk import chunk_markdown
 from .llm_classify import classify_with_llm
@@ -291,6 +293,69 @@ def correct_with_llm(
     retries: int = 2,
     workers: int | None = None,
     batch_tokens: int | None = None,
+    keep_prellm: str | None = None,
+    capture_path: str | None = None,
+) -> tuple[str, dict]:
+    """Run the guarded LLM correction pass (single strict mode).
+
+    ``keep_prellm`` writes the post-prepass markdown (the EXACT text the
+    pass chunks; meta's chunk_offsets refer to it) to the given path.
+    ``capture_path`` appends every LLM request/reply pair (full payloads,
+    replies, finish reason, token usage) to a JSONL transcript — the raw
+    material for offline replay / model-escalation experiments. Both are
+    opt-in; ordinary runs write only the corrected .md and meta.json.
+    """
+    real_call = _call_llm
+    capture_fh = None
+    if capture_path:
+        capture_fh = open(capture_path, "w", encoding="utf-8")
+
+        def capturing(system, user, *a, **kw):
+            t0 = time.monotonic()
+            reply, finish = real_call(system, user, *a, **kw)
+            sink = kw.get("usage_sink") or {}
+            capture_fh.write(json.dumps({
+                "system": system, "user": user,
+                "cap_tokens": kw.get("output_cap_tokens"),
+                "reply": reply, "finish": finish,
+                "prompt_tokens": sink.get("prompt_tokens"),
+                "completion_tokens": sink.get("completion_tokens"),
+                "dt": round(time.monotonic() - t0, 2),
+            }, ensure_ascii=False) + "\n")
+            capture_fh.flush()
+            return reply, finish
+
+        _set_transport(capturing)
+    try:
+        return _correct_with_llm(
+            text, model, endpoint, api_key, verbose, max_chars, classify,
+            sampling, retries, workers, batch_tokens, keep_prellm)
+    finally:
+        if capture_fh is not None:
+            _set_transport(real_call)
+            capture_fh.close()
+
+
+def _set_transport(fn) -> None:
+    """Point every module-level transport reference at ``fn`` (and back)."""
+    globals()["_call_llm"] = fn
+    llm_protocol._call_llm = fn
+    llm_classify._call_llm = fn
+
+
+def _correct_with_llm(
+    text: str,
+    model: str,
+    endpoint: str,
+    api_key: str,
+    verbose: bool = True,
+    max_chars: int = 2000,
+    classify: bool = True,
+    sampling: dict | None = None,
+    retries: int = 2,
+    workers: int | None = None,
+    batch_tokens: int | None = None,
+    keep_prellm: str | None = None,
 ) -> tuple[str, dict]:
     """Run the guarded LLM correction pass (single strict mode).
 
@@ -356,6 +421,9 @@ def correct_with_llm(
     sub_count = 0
     if is_technical:
         text, sub_count = fix_subscripts(text)
+    if keep_prellm:
+        from pathlib import Path
+        Path(keep_prellm).write_text(text, encoding="utf-8")
     if verbose:
         print(
             f"  llm: document classified {'technical' if is_technical else 'general'} "

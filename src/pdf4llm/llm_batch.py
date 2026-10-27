@@ -582,6 +582,7 @@ class BatchScheduler:
         if len(self.stats["unit_fail_log"]) < _FAIL_LOG_CAP:
             self.stats["unit_fail_log"].append({
                 "gid": u.gid, "kind": u.kind, "chunk": u.chunk,
+                "line": u.line, "cell": u.cell,
                 "ordinal": ordinal, "attempt": u.attempts, "reason": reason[:120],
                 "model": self.model,   # which model finally failed the unit
             })
