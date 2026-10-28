@@ -209,6 +209,7 @@ def convert(pdf: Path, out_dir: Path, pages: str | None = None) -> tuple[Path, d
         flush=True,
     )
     t0 = time.perf_counter()
+    first_use = _WRAPPER is None  # for the done line: model-load note
     wrapper = _get_wrapper()
     prog = LineProgress()
 
@@ -230,9 +231,12 @@ def convert(pdf: Path, out_dir: Path, pages: str | None = None) -> tuple[Path, d
         md = "\n\n".join(p for p in parts if p.strip())
     doc.close()
     prog.finish()
+    elapsed = time.perf_counter() - t0
+    rate = n / elapsed if elapsed > 0 else 0.0
     print(
-        f"  layout engine: done in {_fmt_duration(time.perf_counter() - t0)} "
-        "(includes model load on first use)",
+        f"  layout: done in {_fmt_duration(elapsed)} — {n} page(s), "
+        f"{rate:.1f} page/s"
+        + (" (includes one-time model load)" if first_use else ""),
         flush=True,
     )
 

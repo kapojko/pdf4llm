@@ -349,22 +349,23 @@ def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
         n = len(pool_units)
         if n == 0:
             skipped.append({"model": rmodel, "reason": "no failed units"})
+            print("  llm: rescue skipped: no failed units", flush=True)
             break
         fraction = n / max(1, stats["units_sent"])
         if fraction > max_fraction:
-            skipped.append({
-                "model": rmodel,
-                "reason": f"failed fraction {fraction:.3f} exceeds "
-                          f"max_fraction {max_fraction}",
-            })
+            reason = (f"failed fraction {fraction:.0%} exceeds "
+                      f"max_fraction {max_fraction:.0%}")
+            skipped.append({"model": rmodel, "reason": reason})
+            # always shown: a configured rescue level silently not running
+            # would look like a lost stage
+            print(f"  llm: rescue {li} skipped: {reason}", flush=True)
             continue
         # always shown (not verbose-gated): a silent stretch between the
         # main pass and the first rescue batch looks like a hang — the
         # rescue model must be loaded server-side first (measured 75-100 s)
         print(
-            f"  llm: rescue {li}/{len(levels)}: model {rmodel}, {n} failed "
-            f"unit(s) ({fraction:.1%} of sent) — first call may stall while "
-            "the server loads the model",
+            f"  llm: rescue {li}/{len(levels)}: {rmodel} — {n} failed unit(s) "
+            f"({fraction:.1%} of sent); first call may stall (server model load)",
             flush=True,
         )
         rstats = _rescue_stats()
@@ -400,6 +401,7 @@ def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
         # accounting so chunk classification reflects the post-rescue state
         # (_process_batch already added the fix to cs.units_fixed)
         applied_gids = {u.gid for u in rsched.applied}
+        level_rescued = len(applied_gids)
         with lock:
             for u in pool_units:
                 if u.gid in applied_gids:
@@ -420,10 +422,12 @@ def _run_rescue(states, prompts, vocab, levels, *, endpoint, api_key,
             "tokens": rsched.meter.meta(),
         })
         # always shown (not verbose-gated): the outcome of the extra
-        # (possibly expensive) model switch must be visible without -v
+        # (possibly expensive) model switch must be visible without -v.
+        # NOTE: stats['units_fixed'] is never incremented by the scheduler —
+        # the real count of applied fixes is len(rsched.applied)
         print(
-            f"  llm: rescue {li}: {rstats['units_fixed']} of {n} failed "
-            f"unit(s) fixed in {_fmt_duration(time.monotonic() - t_level)}",
+            f"  llm: rescue {li}: {level_rescued} of {n} failed unit(s) fixed "
+            f"in {_fmt_duration(time.monotonic() - t_level)}",
             flush=True,
         )
         pool_units = rsched.final_failed
@@ -592,6 +596,7 @@ def _correct_with_llm(
         flush=True,
     )
 
+    t_prellm = time.monotonic()
     is_technical, source = (True, "heuristic")
     if classify:
         is_technical, source = classify_with_llm(
@@ -606,17 +611,27 @@ def _correct_with_llm(
     if keep_prellm:
         from pathlib import Path
         Path(keep_prellm).write_text(text, encoding="utf-8")
-    if verbose:
-        print(
-            f"  llm: document classified {'technical' if is_technical else 'general'} "
-            f"({source})"
-            + (f"; {sub_count} subscript terms joined" if sub_count else "")
-            + (f"; {spaced_underscores} spaced underscores joined"
-               if spaced_underscores else "")
-            + (f"; {br_joined} '<br>' splits joined" if br_joined else "")
-            + (f"; {dash_fixed} dash bullets repaired" if dash_fixed else ""),
-            flush=True,
-        )
+    # always shown (not verbose-gated): classification may be an LLM call
+    # (slow first call), and the deterministic fixes are the visible outcome
+    # of the pre-LLM stage — a final line here keeps the stage accounted
+    parts = [f"{'technical' if is_technical else 'general'} ({source})"]
+    if sub_count:
+        parts.append(f"{sub_count} subscript(s) joined")
+    if spaced_underscores:
+        parts.append(f"{spaced_underscores} spaced underscore(s) joined")
+    if br_joined:
+        parts.append(f"{br_joined} '<br>' split(s) joined")
+    if dash_fixed:
+        parts.append(f"{dash_fixed} dash bullet(s) repaired")
+    if hr_removed:
+        parts.append(f"{hr_removed} horizontal rule(s) removed")
+    if dots_collapsed:
+        parts.append(f"{dots_collapsed} dot leader(s) collapsed")
+    print(
+        f"  llm: pre-llm done in {_fmt_duration(time.monotonic() - t_prellm)}: "
+        + ", ".join(parts),
+        flush=True,
+    )
 
     # per-document vocabulary (as-extracted, after pre-passes): SEND/SKIP
     # filter only — it never edits text
@@ -739,6 +754,22 @@ def _correct_with_llm(
         _finish_interrupted(stats)
         raise  # unreachable, keeps type-checkers happy
 
+    # always shown (not verbose-gated): the main pass is the longest stage —
+    # its own outcome must not be visible only merged into the post-rescue
+    # summary below. Unit accounting closes: fixed + unchanged + failed = sent
+    # (vocab-skipped units were never sent and are listed alongside).
+    main_sent = stats["units_sent"]
+    main_failed = stats["units_failed"]
+    main_unchanged = stats["units_unchanged"]
+    print(
+        f"  llm: main done in {_fmt_duration(time.monotonic() - t0)}: "
+        f"{len(chunks)} chunk(s), {stats['batches']} batch(es), "
+        f"{main_sent} unit(s) — {main_sent - main_unchanged - main_failed} fixed, "
+        f"{main_unchanged} unchanged, {main_failed} failed, "
+        f"{sum(cs.units_skipped for cs in states)} vocab-skipped",
+        flush=True,
+    )
+
     rescued = 0
     if rescue:
         rescued = _run_rescue(
@@ -765,18 +796,16 @@ def _correct_with_llm(
     stats["duration"] = time.monotonic() - t0
     # always shown (not verbose-gated): the outcome line of a possibly
     # hours-long pass must not require -v; the in-place progress line it
-    # replaces is gone at this point, so silence here looks like a hang
+    # replaces is gone at this point, so silence here looks like a hang.
+    # Chunk outcomes are the post-rescue classification; blocks_fixed counts
+    # applied fixes in accepted/salvaged chunks (rejected chunks keep 0).
+    # Per-level rescue detail is on the 'llm: rescue N:' lines above.
     print(
-        f"  llm: done in {_fmt_duration(stats['duration'])}: "
-        f"{len(chunks)} chunks ({stats['chunks_accepted']} accepted, "
-        f"{stats['chunks_salvaged']} salvaged, {stats['chunks_rejected']} "
-        f"rejected, {stats['chunks_toc_skipped']} toc-skipped); "
-        f"{stats['units_sent']} unit(s) sent in {stats['batches']} batch(es), "
-        f"{stats['blocks_fixed']} fixed, {stats['units_failed']} failed, "
-        f"{stats['units_skipped']} vocab-skipped"
-        + (f"; rescue: {rescued} rescued by "
-           + " + ".join(lv["model"] for lv in stats["rescue"]["levels"])
-           if rescued else ""),
+        f"  llm: done in {_fmt_duration(stats['duration'])}: {len(chunks)} chunks"
+        f" — {stats['chunks_accepted']} accepted, {stats['chunks_salvaged']} salvaged,"
+        f" {stats['chunks_rejected']} rejected, {stats['chunks_toc_skipped']}"
+        f" toc-skipped; {stats['blocks_fixed']} blocks fixed,"
+        f" {stats['units_failed']} units failed",
         flush=True,
     )
 

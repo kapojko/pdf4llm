@@ -32,7 +32,7 @@ import typer
 from . import __version__, checks, config as cfg, convert, prune
 from .llm_run import correct_with_llm, normalize_rescue
 from .llm_server import LlmContextError, LlmInterrupted, probe_swappy
-from .progress import LineProgress
+from .progress import LineProgress, _fmt_duration
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -391,6 +391,7 @@ def convert_cmd(
     if locate is not None and not discovered:
         inputs = _locate_files(inputs, locate, rebuild=locate_rebuild)
 
+    t_all = time.monotonic()
     codes: list[int] = []
     for pdf in inputs:
         code = _process_one(
@@ -404,6 +405,23 @@ def convert_cmd(
         codes.append(code)
         if code == 130:  # user interrupt: do not start the remaining files
             break
+    # whole-run summary (multi-file only: a single file's outcome is already
+    # fully visible in its per-file lines)
+    if len(codes) > 1 and 130 not in codes:
+        ok = codes.count(0)
+        low = codes.count(1)
+        failed = len(codes) - ok - low
+        parts = []
+        if ok:
+            parts.append(f"{ok} ok")
+        if low:
+            parts.append(f"{low} low-score")
+        if failed:
+            parts.append(f"{failed} failed")
+        typer.echo(
+            f"pdf4llm: done in {_fmt_duration(time.monotonic() - t_all)} — "
+            f"{len(codes)} file(s): {', '.join(parts)}"
+        )
     raise typer.Exit(max(codes))
 
 
@@ -653,18 +671,13 @@ def _process_one(
         meta["checks"] = checks.run_checks(text, meta["page_chars"])
         convert.write_meta(meta)
 
-        # always shown (like the layout-engine 'done' line): one line per
-        # file summarizing the pass, even when nothing was salvaged/rejected
-        note = (
-            " (originals kept — see meta.json)"
-            if llm_stats.get("chunks_rejected") else ""
-        )
-        typer.echo(
-            f"  llm: {llm_stats['chunks_accepted']}/{llm_stats['chunks_total']} "
-            f"chunks accepted, {llm_stats.get('chunks_salvaged', 0)} salvaged "
-            f"({llm_stats.get('blocks_fixed', 0)} blocks fixed), "
-            f"{llm_stats['chunks_rejected']} rejected{note}"
-        )
+        # the pass itself prints the summary ('llm: done in ...'); only add a
+        # hint line when chunks were rejected, pointing at the details
+        if llm_stats.get("chunks_rejected"):
+            typer.echo(
+                f"  llm: {llm_stats['chunks_rejected']} rejected chunk(s) — "
+                "originals kept; details in meta.json"
+            )
 
     # --copy comes LAST: the copy must be of the final (post-LLM) .md
     if copy_to is not None:
