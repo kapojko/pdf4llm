@@ -90,11 +90,11 @@ def classify_with_llm(
         )
         answer = (resp.choices[0].message.content or "").strip().upper()
     except Exception:
-        return (*classify_heuristic(text), "heuristic-fallback")
+        return classify_heuristic(text)[0], "heuristic-fallback"
 
     if "TECHNICAL" in answer and "GENERAL" not in answer:
         return True, "llm"
     if "GENERAL" in answer and "TECHNICAL" not in answer:
         return False, "llm"
     # Ambiguous (refusal, rambling, both words, empty) -> heuristic fallback.
-    return (*classify_heuristic(text), "heuristic-fallback")
+    return classify_heuristic(text)[0], "heuristic-fallback"

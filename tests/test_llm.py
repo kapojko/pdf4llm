@@ -390,6 +390,55 @@ def test_classify_heuristic_general():
     assert not is_tech
 
 
+def test_classify_with_llm_returns_pair(monkeypatch):
+    """classify_with_llm must return (is_technical, source) — a 2-tuple — on
+    every path. A 3-tuple here crashes correct_with_llm with
+    'too many values to unpack' at the start of the LLM pass."""
+    import sys
+    import types
+
+    text = "Abstract framing device for a work of literary fiction. " * 20
+
+    def fake_module(completion):
+        mod = types.ModuleType("litellm")
+        mod.suppress_debug_info = False
+        mod.completion = completion
+        return mod
+
+    def answer(content):
+        class _R:
+            class choices:  # noqa: N801 - minimal resp.choices[0].message
+                pass
+
+        msg = types.SimpleNamespace(content=content)
+        choice = types.SimpleNamespace(message=msg)
+        return types.SimpleNamespace(choices=[choice])
+
+    # LLM call raises -> heuristic-fallback path
+    def boom(**kwargs):
+        raise RuntimeError("server down")
+
+    monkeypatch.setitem(sys.modules, "litellm", fake_module(boom))
+    result = llm_classify.classify_with_llm(text, "m", "http://x", "k")
+    assert isinstance(result, tuple) and len(result) == 2
+    is_tech, source = result
+    assert not is_tech and source == "heuristic-fallback"
+
+    # LLM answers ambiguously -> heuristic-fallback path
+    monkeypatch.setitem(
+        sys.modules, "litellm", fake_module(lambda **kw: answer("I cannot say"))
+    )
+    is_tech, source = llm_classify.classify_with_llm(text, "m", "http://x", "k")
+    assert not is_tech and source == "heuristic-fallback"
+
+    # LLM answers TECHNICAL -> llm path
+    monkeypatch.setitem(
+        sys.modules, "litellm", fake_module(lambda **kw: answer("TECHNICAL"))
+    )
+    is_tech, source = llm_classify.classify_with_llm(text, "m", "http://x", "k")
+    assert is_tech and source == "llm"
+
+
 # ---------------------------------------------------------------------------
 # structure helpers: TOC-like detection, cell surgery, echo protocol parsing
 # ---------------------------------------------------------------------------
