@@ -121,27 +121,28 @@ def test_discover_update_only_stale(tree: Path):
     assert got == ["stale"]
 
 
-def test_discover_update_all_converted(tree: Path):
+def test_discover_update_reprocess_all_converted(tree: Path):
     got = sorted(e.pdf.stem for e in discover(
-        tree, "update-all", current_version=__version__, current_model="m1"))
+        tree, "update", current_version=__version__, current_model="m1",
+        reprocess=True))
     assert got == ["fresh", "stale"]
 
 
 def test_discover_convert_includes_side_files(tree: Path):
     got = sorted(e.pdf.stem for e in discover(
         tree, "convert", current_version=__version__, current_model="m1"))
-    assert got == ["fresh", "mdonly", "plain", "stale"]
+    assert got == ["mdonly", "plain", "stale"]
 
 
-def test_discover_convert_all_everything(tree: Path):
+def test_discover_all_everything(tree: Path):
     got = sorted(e.pdf.stem for e in discover(
-        tree, "convert-all", current_version=__version__))
+        tree, "all", current_version=__version__))
     assert got == ["bare", "fresh", "mdonly", "plain", "stale"]
 
 
 def test_discover_actions(tree: Path):
     by_stem = {e.pdf.stem: e for e in discover(
-        tree, "convert-all", current_version=__version__, current_model="m1")}
+        tree, "all", current_version=__version__, current_model="m1")}
     assert by_stem["stale"].action == "update"
     assert "0.9.0" in by_stem["stale"].reason
     assert by_stem["fresh"].action == "reconvert"
@@ -155,12 +156,12 @@ def test_discover_actions(tree: Path):
 def test_discover_requires_index(tmp_path: Path):
     (tmp_path / "x.pdf").write_bytes(b"%PDF")
     with pytest.raises(DiscoveryError):
-        discover(tmp_path, "update-all", current_version=__version__)
+        discover(tmp_path, "update", current_version=__version__)
 
 
 def test_discover_rebuild_builds_index(tmp_path: Path):
     (tmp_path / "x.pdf").write_bytes(b"%PDF")
-    got = discover(tmp_path, "convert-all", rebuild=True, current_version=__version__)
+    got = discover(tmp_path, "all", rebuild=True, current_version=__version__)
     assert [e.pdf.stem for e in got] == ["x"]
     assert (tmp_path / ".pdf4llm_locate.idx").exists()
 
@@ -175,7 +176,7 @@ def test_evaluate_pdf_matches_discover(tree: Path):
     from pdf4llm.locate_index import evaluate_pdf, skip_reason
     for pdf in sorted(tree.glob("*.pdf")):
         assert evaluate_pdf(
-            pdf, "convert-all", __version__, "m1", llm_enabled=True) is not None
+            pdf, "all", __version__, "m1", llm_enabled=True) is not None
     fresh, stale = tree / "fresh.pdf", tree / "stale.pdf"
     assert evaluate_pdf(fresh, "update", __version__, "m1", llm_enabled=True) is None
     assert skip_reason(fresh, "update", has_meta=True) == "already current"
@@ -196,8 +197,9 @@ def test_discover_trusts_index_for_existence(tree: Path):
 
 def test_discover_progress_callback(tree: Path):
     seen: list[tuple[int, int]] = []
-    discover(tree, "update-all", current_version=__version__,
-             current_model="m1", progress=lambda d, t: seen.append((d, t)))
+    discover(tree, "update", current_version=__version__,
+             current_model="m1", reprocess=True,
+             progress=lambda d, t: seen.append((d, t)))
     assert seen and seen[-1] == (len(seen), len(seen))
 
 
@@ -229,7 +231,7 @@ def fake_process(monkeypatch):
 
 
 def test_cli_locate_mode_without_locate_errors():
-    res = runner.invoke(cli_mod.app, ["--locate-mode", "update-all"])
+    res = runner.invoke(cli_mod.app, ["--locate-mode", "update"])
     assert res.exit_code == 2
     assert "--locate-mode" in res.output
 
@@ -271,18 +273,18 @@ def test_cli_locate_mode_with_inputs_other_modes(fake_llm, tree: Path,
                                                   fake_process):
     res = runner.invoke(cli_mod.app, [
         "stale.pdf", "fresh.pdf", "plain.pdf", "bare.pdf",
-        "--locate", str(tree), "--locate-mode", "update-all", "--force",
-        "--no-llm"])
+        "--locate", str(tree), "--locate-mode", "update", "--force",
+        "--no-llm", "--locate-reprocess"])
     assert res.exit_code == 0, res.output
     assert sorted(p.stem for p in fake_process) == ["fresh", "stale"]
-    # convert = update-all (meta.json present) + sibling files
+    # convert = update (meta.json present) + sibling files
     fake_process.clear()
     res = runner.invoke(cli_mod.app, [
         "stale.pdf", "fresh.pdf", "plain.pdf", "bare.pdf",
         "--locate", str(tree), "--locate-mode", "convert", "--force",
         "--no-llm"])
     assert res.exit_code == 0, res.output
-    assert sorted(p.stem for p in fake_process) == ["fresh", "plain", "stale"]
+    assert sorted(p.stem for p in fake_process) == ["plain", "stale"]
 
 
 def test_cli_locate_mode_with_inputs_dry_run(fake_llm, tree: Path):
@@ -331,10 +333,11 @@ def test_cli_discovery_missing_selected_files_warned(fake_llm, tree: Path,
 
 def test_cli_discovery_compact_list(fake_llm, tree: Path):
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run"])
+        "--locate", str(tree), "--locate-mode", "update", "--dry-run",
+        "--locate-reprocess"])
     assert res.exit_code == 0, res.output
     # root printed once, relative paths, action column, per-line reason (mixed)
-    assert f"--locate-mode update-all under {tree.resolve()}" in res.output
+    assert f"--locate-mode update under {tree.resolve()}" in res.output
     assert "fresh.pdf  — already current" in res.output
     # list line + per-file dry-run 'source:' line
     assert res.output.count("fresh.pdf") == 2
@@ -351,7 +354,7 @@ def test_cli_discovery_shared_reason_grouped(fake_llm, tree: Path):
         json.dumps({"pdf4llm_version": "0.5.0", "llm_model": "m1"}),
         encoding="utf-8")
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run",
+        "--locate", str(tree), "--locate-mode", "update", "--dry-run",
         "--no-llm"])
     assert res.exit_code == 0, res.output
     assert "reason (all 2):" in res.output
@@ -368,15 +371,15 @@ def test_cli_locate_mode_unknown_errors(fake_llm, tree: Path):
 def test_cli_discovery_without_index_errors(fake_llm, tmp_path: Path):
     (tmp_path / "x.pdf").write_bytes(b"%PDF")
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tmp_path), "--locate-mode", "update-all"])
+        "--locate", str(tmp_path), "--locate-mode", "update"])
     assert res.exit_code == 2
     assert "--locate-rebuild" in res.output
 
 
 def test_cli_discovery_dry_run_lists_without_prompt(fake_llm, tree: Path):
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run",
-        "--no-llm"])
+        "--locate", str(tree), "--locate-mode", "update", "--dry-run",
+        "--no-llm", "--locate-reprocess"])
     assert res.exit_code == 0
     assert "2 file(s)" in res.output
     # unified with explicit-input dry-run: per-file would-write details
@@ -386,7 +389,7 @@ def test_cli_discovery_dry_run_lists_without_prompt(fake_llm, tree: Path):
 
 def test_cli_discovery_dry_run_shows_copy_plan(fake_llm, tree: Path):
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--dry-run",
+        "--locate", str(tree), "--locate-mode", "update", "--dry-run",
         "--no-llm", "--copy", str(tree / "copies")])
     assert res.exit_code == 0, res.output
     assert "would copy to:" in res.output
@@ -396,15 +399,15 @@ def test_cli_discovery_dry_run_shows_copy_plan(fake_llm, tree: Path):
 def test_cli_discovery_declined_aborts(fake_llm, tree: Path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "n")
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all"])
+        "--locate", str(tree), "--locate-mode", "update"])
     assert res.exit_code == 1
     assert "declined" in res.output
 
 
 def test_cli_discovery_force_processes_list(fake_llm, tree: Path, fake_process):
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--force",
-        "--no-llm"])
+        "--locate", str(tree), "--locate-mode", "update", "--force",
+        "--no-llm", "--locate-reprocess"])
     assert res.exit_code == 0, res.output
     assert sorted(p.stem for p in fake_process) == ["fresh", "stale"]
 
@@ -424,22 +427,42 @@ def test_cli_discovery_convert_mode_through_cli(fake_llm, tree: Path, fake_proce
         "--no-llm"])
     assert res.exit_code == 0, res.output
     assert sorted(p.stem for p in fake_process) == \
-        ["fresh", "mdonly", "plain", "stale"]
+        ["mdonly", "plain", "stale"]
 
 
 def test_cli_discovery_approval_accepts(fake_llm, tree: Path, fake_process,
                                         monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "convert-all", "--no-llm"])
+        "--locate", str(tree), "--locate-mode", "all", "--no-llm"])
     assert res.exit_code == 0, res.output
     assert len(fake_process) == 5
+
+
+def test_cli_locate_reprocess_with_inputs(fake_llm, tree: Path, fake_process):
+    # --locate-reprocess with explicit inputs: previously current files
+    # are no longer skipped
+    res = runner.invoke(cli_mod.app, [
+        "stale.pdf", "fresh.pdf",
+        "--locate", str(tree), "--locate-mode", "update", "--force",
+        "--no-llm", "--locate-reprocess"])
+    assert res.exit_code == 0, res.output
+    assert sorted(p.stem for p in fake_process) == ["fresh", "stale"]
+
+
+def test_cli_discovery_reprocess(fake_llm, tree: Path, fake_process):
+    # --locate-reprocess in discovery mode: both converted files selected
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--locate-mode", "update", "--force",
+        "--no-llm", "--locate-reprocess"])
+    assert res.exit_code == 0, res.output
+    assert sorted(p.stem for p in fake_process) == ["fresh", "stale"]
 
 
 def test_cli_discovery_llm_without_config_errors(tree: Path, monkeypatch):
     monkeypatch.setattr(cli_mod.cfg, "load_config", lambda: {})
     res = runner.invoke(cli_mod.app, [
-        "--locate", str(tree), "--locate-mode", "update-all", "--force"])
+        "--locate", str(tree), "--locate-mode", "update", "--force"])
     assert res.exit_code == 3
     assert "--llm-auth" in res.output
 

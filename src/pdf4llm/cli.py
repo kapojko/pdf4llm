@@ -291,6 +291,12 @@ def convert_cmd(
              "(the only way discovery refreshes the index — it is never "
              "rebuilt implicitly)",
     ),
+    locate_reprocess: bool = typer.Option(
+        False, "--locate-reprocess",
+        help="Reconvert previously converted files that are already current "
+             "(same pdf4llm major.minor version and same LLM model). "
+             "Without this flag such files are skipped.",
+    ),
     locate_mode: str = typer.Option(
         None, "--locate-mode", metavar="MODE",
         help="Pick files by staleness. With --locate and NO input names: "
@@ -298,10 +304,9 @@ def convert_cmd(
              "files — only the ones that qualify for MODE are processed "
              "(no approval prompt). "
              "update: previously converted (meta.json) files that are stale "
-             "(older pdf4llm version or different LLM model); update-all: all "
-             "previously converted files; convert: update-all plus PDFs with "
-             "same-basename .docx/.txt/.md siblings; convert-all: every PDF. "
-             "Modes nest: update < update-all < convert < convert-all. "
+             "(older pdf4llm version or different LLM model); convert: update "
+             "plus PDFs with same-basename .docx/.txt/.md siblings; all: every "
+             "PDF. Modes nest: update < convert < all. "
              "Default: update (discovery only). The discovered list is shown "
              "for approval (--force skips).",
     ),
@@ -382,6 +387,7 @@ def convert_cmd(
             locate, locate_mode, rebuild=locate_rebuild, force=force,
             dry_run=dry_run, llm_enabled=llm_flag, model_override=model,
             pages=pages, out=out, copy_to=copy_to,
+            reprocess=locate_reprocess,
         )
         discovered = True
     else:
@@ -393,7 +399,7 @@ def convert_cmd(
     if locate_mode is not None and not discovered:
         inputs = _filter_explicit_inputs(
             inputs, locate_mode, llm_enabled=llm_flag,
-            model_override=model,
+            model_override=model, reprocess=locate_reprocess,
         )
 
     t_all = time.monotonic()
@@ -435,6 +441,7 @@ def _filter_explicit_inputs(
     mode: str,
     llm_enabled: bool,
     model_override: str | None,
+    reprocess: bool = False,
 ) -> list[Path]:
     """Apply --locate-mode as a filter on explicitly passed input files.
 
@@ -467,10 +474,12 @@ def _filter_explicit_inputs(
     for pdf in unique:
         has_meta = pdf.with_suffix(".meta.json").is_file()
         entry = _evaluate_pdf(
-            pdf, mode, __version__, current_model, llm_enabled)
+            pdf, mode, __version__, current_model, llm_enabled,
+            reprocess)
         if entry is None:
             typer.echo(
-                f"  {pdf.name}: skipped ({_skip_reason(pdf, mode, has_meta)})")
+                f"  {pdf.name}: skipped "
+                f"({_skip_reason(pdf, mode, has_meta, reprocess)})")
         else:
             selected.append(entry)
 
@@ -543,6 +552,7 @@ def _run_discovery(
     pages: str | None,
     out: Path | None,
     copy_to: Path | None,
+    reprocess: bool = False,
 ) -> list[Path]:
     """Discover files via --locate-mode, show them for approval, return paths."""
     if locate_mode not in _LOCATE_MODES:
@@ -592,7 +602,8 @@ def _run_discovery(
         entries = _discover_files(
             locate, locate_mode, rebuild=rebuild,
             current_version=__version__, current_model=current_model,
-            llm_enabled=llm_enabled, progress=on_progress,
+            llm_enabled=llm_enabled, reprocess=reprocess,
+            progress=on_progress,
         )
         prog.finish()
     except DiscoveryError as e:

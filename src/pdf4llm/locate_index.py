@@ -13,17 +13,17 @@ Discovery (--locate-mode without explicit input names): selects the files
 to process from the folder using the SAME index (no second walk). The
 modes nest, each including the previous one:
 
-    update < update-all < convert < convert-all
+    update < convert < all
 
-  update      previously converted (meta.json present) files that are
-              stale: missing/invalid pdf4llm_version or llm_model, a
-              pdf4llm version that differs in major.minor (patch-only
-              differences are accepted), or — when the LLM pass is enabled —
-              a different LLM model than the one this run would use;
-  update-all  all previously converted files (with meta.json);
-  convert     update-all plus PDFs that have same-basename .docx/.txt/.md
-              siblings (i.e. files conversion would delete/overwrite);
-  convert-all every PDF in the folder.
+  update   previously converted (meta.json present) files that are stale:
+            missing/invalid pdf4llm_version or llm_model, a pdf4llm version
+            that differs in major.minor (patch-only differences are
+            accepted), or — when the LLM pass is enabled — a different LLM
+            model than the one this run would use; with --locate-reprocess,
+            ALL previously converted files are included (stale or not);
+  convert  update plus PDFs that have same-basename .docx/.txt/.md
+            siblings (i.e. files conversion would delete/overwrite);
+  all      every PDF in the folder.
 
 The index is never rebuilt automatically for discovery (it can be big and
 expensive); use --locate-rebuild to (re)build it.
@@ -42,8 +42,8 @@ from typing import Callable
 _LOCATE_IDX_NAME = ".pdf4llm_locate.idx"
 _LOCATE_IDX_HEADER = "pdf4llm-locate-index 1"
 
-# nesting order: update < update-all < convert < convert-all
-MODES = ("update", "update-all", "convert", "convert-all")
+# nesting order: update < convert < all
+MODES = ("update", "convert", "all")
 
 
 class DiscoveryError(Exception):
@@ -191,11 +191,13 @@ def evaluate_pdf(
     current_version: str,
     current_model: str | None,
     llm_enabled: bool,
+    reprocess: bool = False,
 ) -> DiscoveryEntry | None:
     """Evaluate a single PDF against `mode`; None when it does not qualify.
 
     Shared by folder discovery and by the CLI's explicit-input filtering, so
-    both apply exactly the same per-file criteria.
+    both apply exactly the same per-file criteria. `reprocess` includes
+    previously converted files that would otherwise be skipped as current.
     """
     meta_path = pdf.with_suffix(".meta.json")
     has_meta = meta_path.is_file()
@@ -204,20 +206,26 @@ def evaluate_pdf(
             meta_path, current_version, current_model, llm_enabled)
         if has_meta else None
     )
-    if mode == "update" and not stale:
-        return None
-    if mode == "update-all" and not has_meta:
-        return None
-    if mode == "convert" and not has_meta:
-        delete, md = _side_files(pdf)
-        if not delete and md is None:
+    if mode == "update":
+        if not has_meta:
             return None
-    # convert-all: everything
+        if not stale and not reprocess:
+            return None
+    elif mode == "convert":
+        if not has_meta:
+            delete, md = _side_files(pdf)
+            if not delete and md is None:
+                return None
+        elif not stale and not reprocess:
+            return None
+    # all: everything
     action, reason = _reason_for(pdf, stale, has_meta)
     return DiscoveryEntry(pdf, action, reason)
 
 
-def skip_reason(pdf: Path, mode: str, has_meta: bool) -> str:
+def skip_reason(
+    pdf: Path, mode: str, has_meta: bool, reprocess: bool = False,
+) -> str:
     """Why `pdf` does NOT qualify for `mode` (for the CLI skip note).
 
     Only meaningful when evaluate_pdf(pdf, mode, ...) returned None.
@@ -226,11 +234,11 @@ def skip_reason(pdf: Path, mode: str, has_meta: bool) -> str:
         if has_meta:
             return "already current"
         return "meta.json missing (not previously converted)"
-    if mode == "update-all":
-        return "meta.json missing (not previously converted)"
     if mode == "convert":
-        return "new file without same-basename .docx/.txt/.md siblings"
-    return ""  # convert-all: never skipped
+        if not has_meta:
+            return "new file without same-basename .docx/.txt/.md siblings"
+        return "already current"
+    return ""  # all: never skipped
 
 
 def discover(
@@ -240,6 +248,7 @@ def discover(
     current_version: str = "",
     current_model: str | None = None,
     llm_enabled: bool = True,
+    reprocess: bool = False,
     progress: Callable[[int, int], None] | None = None,
 ) -> list[DiscoveryEntry]:
     """Collect the files to process for `mode` (see module docstring).
@@ -282,7 +291,7 @@ def discover(
     with ThreadPoolExecutor(max_workers=_DISCOVERY_WORKERS) as ex:
         futures = [ex.submit(
             evaluate_pdf, pdf, mode, current_version, current_model,
-            llm_enabled) for pdf in ordered]
+            llm_enabled, reprocess) for pdf in ordered]
         for fut in as_completed(futures):
             done += 1
             if progress is not None:
