@@ -295,7 +295,8 @@ def convert_cmd(
         False, "--locate-reprocess",
         help="Reconvert previously converted files that are already current "
              "(same pdf4llm major.minor version and same LLM model). "
-             "Without this flag such files are skipped.",
+             "Applies to all --locate-modes; without this flag such files "
+             "are skipped.",
     ),
     locate_mode: str = typer.Option(
         None, "--locate-mode", metavar="MODE",
@@ -305,8 +306,11 @@ def convert_cmd(
              "(no approval prompt). "
              "update: previously converted (meta.json) files that are stale "
              "(older pdf4llm version or different LLM model); convert: update "
-             "plus PDFs with same-basename .docx/.txt/.md siblings; all: every "
-             "PDF. Modes nest: update < convert < all. "
+             "plus PDFs with same-basename .docx/.txt/.md siblings; all: "
+             "convert plus every remaining PDF (new files). Modes nest: "
+             "update < convert < all. Previously converted files that are "
+             "already current are skipped in every mode unless "
+             "--locate-reprocess is passed. "
              "Default: update (discovery only). The discovered list is shown "
              "for approval (--force skips).",
     ),

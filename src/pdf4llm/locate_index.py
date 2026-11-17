@@ -19,11 +19,15 @@ modes nest, each including the previous one:
             missing/invalid pdf4llm_version or llm_model, a pdf4llm version
             that differs in major.minor (patch-only differences are
             accepted), or — when the LLM pass is enabled — a different LLM
-            model than the one this run would use; with --locate-reprocess,
-            ALL previously converted files are included (stale or not);
+            model than the one this run would use;
   convert  update plus PDFs that have same-basename .docx/.txt/.md
             siblings (i.e. files conversion would delete/overwrite);
-  all      every PDF in the folder.
+  all      every PDF in the folder (new files included).
+
+  In EVERY mode, previously converted files that are already current
+  (same pdf4llm major.minor version and same LLM model) are skipped
+  unless --locate-reprocess is passed; with it, all previously
+  converted files (stale or current) are included.
 
 The index is never rebuilt automatically for discovery (it can be big and
 expensive); use --locate-rebuild to (re)build it.
@@ -170,7 +174,8 @@ def _reason_for(pdf: Path, stale: str | None, has_meta: bool) -> tuple[str, str]
     if stale:
         parts.append(stale)
     elif has_meta:
-        parts.append("already current")
+        # not stale yet selected: only possible via --locate-reprocess
+        parts.append("--locate-reprocess (already current)")
     if md is not None:
         parts.append("overwrite .md")  # same stem, name adds no information
     if delete:
@@ -218,7 +223,11 @@ def evaluate_pdf(
                 return None
         elif not stale and not reprocess:
             return None
-    # all: everything
+    else:
+        # all: everything, except previously converted files that are
+        # already current (those are included only with --locate-reprocess)
+        if has_meta and not stale and not reprocess:
+            return None
     action, reason = _reason_for(pdf, stale, has_meta)
     return DiscoveryEntry(pdf, action, reason)
 
@@ -238,7 +247,10 @@ def skip_reason(
         if not has_meta:
             return "new file without same-basename .docx/.txt/.md siblings"
         return "already current"
-    return ""  # all: never skipped
+    # all: skipped only when previously converted and already current
+    if has_meta:
+        return "already current (pass --locate-reprocess to reconvert)"
+    return ""
 
 
 def discover(

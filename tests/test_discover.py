@@ -134,18 +134,29 @@ def test_discover_convert_includes_side_files(tree: Path):
     assert got == ["mdonly", "plain", "stale"]
 
 
-def test_discover_all_everything(tree: Path):
+def test_discover_all_skips_current(tree: Path):
+    # all: new files and side-file siblings included, but previously
+    # converted files that are already current are skipped
     got = sorted(e.pdf.stem for e in discover(
-        tree, "all", current_version=__version__))
+        tree, "all", current_version=__version__, current_model="m1"))
+    assert got == ["bare", "mdonly", "plain", "stale"]
+
+
+def test_discover_all_reprocess_includes_current(tree: Path):
+    got = sorted(e.pdf.stem for e in discover(
+        tree, "all", current_version=__version__, current_model="m1",
+        reprocess=True))
     assert got == ["bare", "fresh", "mdonly", "plain", "stale"]
 
 
 def test_discover_actions(tree: Path):
     by_stem = {e.pdf.stem: e for e in discover(
-        tree, "all", current_version=__version__, current_model="m1")}
+        tree, "all", current_version=__version__, current_model="m1",
+        reprocess=True)}
     assert by_stem["stale"].action == "update"
     assert "0.9.0" in by_stem["stale"].reason
     assert by_stem["fresh"].action == "reconvert"
+    assert "--locate-reprocess" in by_stem["fresh"].reason
     assert by_stem["plain"].action == "convert"
     assert "plain.docx" in by_stem["plain"].reason
     assert by_stem["mdonly"].action == "convert"
@@ -174,10 +185,13 @@ def test_discover_unknown_mode(tree: Path):
 def test_evaluate_pdf_matches_discover(tree: Path):
     # the per-file filter used for explicit inputs shares discovery criteria
     from pdf4llm.locate_index import evaluate_pdf, skip_reason
-    for pdf in sorted(tree.glob("*.pdf")):
-        assert evaluate_pdf(
-            pdf, "all", __version__, "m1", llm_enabled=True) is not None
     fresh, stale = tree / "fresh.pdf", tree / "stale.pdf"
+    # all: current previously converted files qualify only via reprocess
+    assert evaluate_pdf(fresh, "all", __version__, "m1", llm_enabled=True) is None
+    assert evaluate_pdf(
+        fresh, "all", __version__, "m1", llm_enabled=True,
+        reprocess=True) is not None
+    assert "--locate-reprocess" in skip_reason(fresh, "all", has_meta=True)
     assert evaluate_pdf(fresh, "update", __version__, "m1", llm_enabled=True) is None
     assert skip_reason(fresh, "update", has_meta=True) == "already current"
     assert evaluate_pdf(stale, "update", __version__, "m1", llm_enabled=True) is not None
@@ -338,7 +352,7 @@ def test_cli_discovery_compact_list(fake_llm, tree: Path):
     assert res.exit_code == 0, res.output
     # root printed once, relative paths, action column, per-line reason (mixed)
     assert f"--locate-mode update under {tree.resolve()}" in res.output
-    assert "fresh.pdf  — already current" in res.output
+    assert "fresh.pdf  — --locate-reprocess (already current)" in res.output
     # list line + per-file dry-run 'source:' line
     assert res.output.count("fresh.pdf") == 2
 
@@ -433,8 +447,16 @@ def test_cli_discovery_convert_mode_through_cli(fake_llm, tree: Path, fake_proce
 def test_cli_discovery_approval_accepts(fake_llm, tree: Path, fake_process,
                                         monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    # all without --locate-reprocess skips the current file (fresh)
     res = runner.invoke(cli_mod.app, [
         "--locate", str(tree), "--locate-mode", "all", "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert len(fake_process) == 4
+    # ... with it, every file is reconverted
+    fake_process.clear()
+    res = runner.invoke(cli_mod.app, [
+        "--locate", str(tree), "--locate-mode", "all", "--no-llm",
+        "--locate-reprocess"])
     assert res.exit_code == 0, res.output
     assert len(fake_process) == 5
 
