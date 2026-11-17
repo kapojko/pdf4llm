@@ -1,3 +1,3 @@
 """pdf4llm: single-file PDF -> Markdown converter for LLM context."""
 
-__version__ = "1.9.4"
+__version__ = "1.9.5"

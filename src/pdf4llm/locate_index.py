@@ -185,6 +185,54 @@ def _reason_for(pdf: Path, stale: str | None, has_meta: bool) -> tuple[str, str]
 _DISCOVERY_WORKERS = 32  # parallel meta.json/side-file network ops
 
 
+def evaluate_pdf(
+    pdf: Path,
+    mode: str,
+    current_version: str,
+    current_model: str | None,
+    llm_enabled: bool,
+) -> DiscoveryEntry | None:
+    """Evaluate a single PDF against `mode`; None when it does not qualify.
+
+    Shared by folder discovery and by the CLI's explicit-input filtering, so
+    both apply exactly the same per-file criteria.
+    """
+    meta_path = pdf.with_suffix(".meta.json")
+    has_meta = meta_path.is_file()
+    stale = (
+        staleness_reason(
+            meta_path, current_version, current_model, llm_enabled)
+        if has_meta else None
+    )
+    if mode == "update" and not stale:
+        return None
+    if mode == "update-all" and not has_meta:
+        return None
+    if mode == "convert" and not has_meta:
+        delete, md = _side_files(pdf)
+        if not delete and md is None:
+            return None
+    # convert-all: everything
+    action, reason = _reason_for(pdf, stale, has_meta)
+    return DiscoveryEntry(pdf, action, reason)
+
+
+def skip_reason(pdf: Path, mode: str, has_meta: bool) -> str:
+    """Why `pdf` does NOT qualify for `mode` (for the CLI skip note).
+
+    Only meaningful when evaluate_pdf(pdf, mode, ...) returned None.
+    """
+    if mode == "update":
+        if has_meta:
+            return "already current"
+        return "meta.json missing (not previously converted)"
+    if mode == "update-all":
+        return "meta.json missing (not previously converted)"
+    if mode == "convert":
+        return "new file without same-basename .docx/.txt/.md siblings"
+    return ""  # convert-all: never skipped
+
+
 def discover(
     folder: Path,
     mode: str,
@@ -229,30 +277,12 @@ def discover(
     ordered = sorted(pdfs, key=lambda p: p.as_posix().lower())
     total = len(ordered)
 
-    def evaluate(pdf: Path) -> DiscoveryEntry | None:
-        meta_path = pdf.with_suffix(".meta.json")
-        has_meta = meta_path.is_file()
-        stale = (
-            staleness_reason(
-                meta_path, current_version, current_model, llm_enabled)
-            if has_meta else None
-        )
-        if mode == "update" and not stale:
-            return None
-        if mode == "update-all" and not has_meta:
-            return None
-        if mode == "convert" and not has_meta:
-            delete, md = _side_files(pdf)
-            if not delete and md is None:
-                return None
-        # convert-all: everything
-        action, reason = _reason_for(pdf, stale, has_meta)
-        return DiscoveryEntry(pdf, action, reason)
-
     selected: list[DiscoveryEntry] = []
     done = 0
     with ThreadPoolExecutor(max_workers=_DISCOVERY_WORKERS) as ex:
-        futures = [ex.submit(evaluate, pdf) for pdf in ordered]
+        futures = [ex.submit(
+            evaluate_pdf, pdf, mode, current_version, current_model,
+            llm_enabled) for pdf in ordered]
         for fut in as_completed(futures):
             done += 1
             if progress is not None:

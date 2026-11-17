@@ -170,6 +170,21 @@ def test_discover_unknown_mode(tree: Path):
         discover(tree, "nope", current_version=__version__)
 
 
+def test_evaluate_pdf_matches_discover(tree: Path):
+    # the per-file filter used for explicit inputs shares discovery criteria
+    from pdf4llm.locate_index import evaluate_pdf, skip_reason
+    for pdf in sorted(tree.glob("*.pdf")):
+        assert evaluate_pdf(
+            pdf, "convert-all", __version__, "m1", llm_enabled=True) is not None
+    fresh, stale = tree / "fresh.pdf", tree / "stale.pdf"
+    assert evaluate_pdf(fresh, "update", __version__, "m1", llm_enabled=True) is None
+    assert skip_reason(fresh, "update", has_meta=True) == "already current"
+    assert evaluate_pdf(stale, "update", __version__, "m1", llm_enabled=True) is not None
+    bare = tree / "bare.pdf"
+    assert evaluate_pdf(bare, "convert", __version__, "m1", llm_enabled=True) is None
+    assert "new file" in skip_reason(bare, "convert", has_meta=False)
+
+
 def test_discover_trusts_index_for_existence(tree: Path):
     # vanished PDF is still evaluated from the index (no stat walk);
     # dropping it is the caller's (CLI) job via _filter_existing
@@ -219,10 +234,79 @@ def test_cli_locate_mode_without_locate_errors():
     assert "--locate-mode" in res.output
 
 
-def test_cli_locate_mode_with_inputs_errors(fake_llm, tree: Path):
+def test_cli_locate_mode_with_inputs_filters(fake_llm, tree: Path, fake_process):
+    # explicit inputs + --locate-mode: only the qualifying files are passed on
     res = runner.invoke(cli_mod.app, [
-        "stale.pdf", "--locate", str(tree), "--locate-mode", "update-all"])
-    assert res.exit_code == 2
+        "stale.pdf", "fresh.pdf", "plain.pdf",
+        "--locate", str(tree), "--locate-mode", "update", "--force", "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert [p.stem for p in fake_process] == ["stale"]
+    assert "1/3 passed file(s) need update" in res.output
+    assert "fresh.pdf: skipped (already current)" in res.output
+    assert "plain.pdf: skipped (meta.json missing" in res.output
+
+
+def test_cli_locate_mode_with_inputs_without_locate(fake_llm, tree: Path,
+                                                     fake_process):
+    # plain paths work too: the staleness check only needs the .meta.json
+    res = runner.invoke(cli_mod.app, [
+        str(tree / "stale.pdf"), str(tree / "fresh.pdf"),
+        "--locate-mode", "update", "--force", "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert [p.stem for p in fake_process] == ["stale"]
+
+
+def test_cli_locate_mode_with_inputs_none_selected(fake_llm, tree: Path,
+                                                    fake_process):
+    # all current -> short note, exit 0, nothing processed
+    res = runner.invoke(cli_mod.app, [
+        "fresh.pdf", "--locate", str(tree), "--locate-mode", "update",
+        "--force", "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert "0/1 passed file(s) need update" in res.output
+    assert fake_process == []
+
+
+def test_cli_locate_mode_with_inputs_other_modes(fake_llm, tree: Path,
+                                                  fake_process):
+    res = runner.invoke(cli_mod.app, [
+        "stale.pdf", "fresh.pdf", "plain.pdf", "bare.pdf",
+        "--locate", str(tree), "--locate-mode", "update-all", "--force",
+        "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert sorted(p.stem for p in fake_process) == ["fresh", "stale"]
+    # convert = update-all (meta.json present) + sibling files
+    fake_process.clear()
+    res = runner.invoke(cli_mod.app, [
+        "stale.pdf", "fresh.pdf", "plain.pdf", "bare.pdf",
+        "--locate", str(tree), "--locate-mode", "convert", "--force",
+        "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert sorted(p.stem for p in fake_process) == ["fresh", "plain", "stale"]
+
+
+def test_cli_locate_mode_with_inputs_dry_run(fake_llm, tree: Path):
+    # filter + --dry-run: notes printed, standard per-file dry-run details,
+    # nothing written (real _process_one, no fake)
+    res = runner.invoke(cli_mod.app, [
+        "stale.pdf", "fresh.pdf",
+        "--locate", str(tree), "--locate-mode", "update", "--dry-run",
+        "--no-llm"])
+    assert res.exit_code == 0, res.output
+    assert "1/2 passed file(s) need update" in res.output
+    assert "fresh.pdf: skipped (already current)" in res.output
+    assert "would write:" in res.output
+    assert "dry-run: nothing written" in res.output
+    assert not (tree / "stale.md").exists()
+
+
+def test_cli_locate_mode_with_inputs_llm_without_config_errors(
+        tree: Path, monkeypatch):
+    monkeypatch.setattr(cli_mod.cfg, "load_config", lambda: {})
+    res = runner.invoke(cli_mod.app, [
+        "stale.pdf", "--locate", str(tree), "--locate-mode", "update"])
+    assert res.exit_code == 3
+    assert "--llm-auth" in res.output
 
 
 def test_cli_locate_without_mode_defaults_to_update(fake_llm, tree: Path,

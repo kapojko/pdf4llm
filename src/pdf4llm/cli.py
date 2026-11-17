@@ -145,6 +145,8 @@ from .locate_index import (  # noqa: E402
     load_index as _locate_load_index,
     locate_index_path as _locate_index_path,
     discover as _discover_files,
+    evaluate_pdf as _evaluate_pdf,
+    skip_reason as _skip_reason,
 )
 
 
@@ -291,14 +293,17 @@ def convert_cmd(
     ),
     locate_mode: str = typer.Option(
         None, "--locate-mode", metavar="MODE",
-        help="With --locate and NO input names: pick files from FOLDER. "
+        help="Pick files by staleness. With --locate and NO input names: "
+             "pick files from FOLDER. With input names: filter the given "
+             "files — only the ones that qualify for MODE are processed "
+             "(no approval prompt). "
              "update: previously converted (meta.json) files that are stale "
              "(older pdf4llm version or different LLM model); update-all: all "
              "previously converted files; convert: update-all plus PDFs with "
              "same-basename .docx/.txt/.md siblings; convert-all: every PDF. "
              "Modes nest: update < update-all < convert < convert-all. "
-             "Default: update. The discovered list is shown for approval "
-             "(--force skips).",
+             "Default: update (discovery only). The discovered list is shown "
+             "for approval (--force skips).",
     ),
     copy_to: Path = typer.Option(
         None, "--copy", metavar="FOLDER",
@@ -381,15 +386,15 @@ def convert_cmd(
         discovered = True
     else:
         discovered = False
-        if locate_mode is not None:
-            typer.echo(
-                "error: --locate-mode applies only when --locate is used "
-                "without input file names", err=True,
-            )
-            raise typer.Exit(2)
 
     if locate is not None and not discovered:
         inputs = _locate_files(inputs, locate, rebuild=locate_rebuild)
+
+    if locate_mode is not None and not discovered:
+        inputs = _filter_explicit_inputs(
+            inputs, locate_mode, llm_enabled=llm_flag,
+            model_override=model,
+        )
 
     t_all = time.monotonic()
     codes: list[int] = []
@@ -423,6 +428,60 @@ def convert_cmd(
             f"{len(codes)} file(s): {', '.join(parts)}"
         )
     raise typer.Exit(max(codes))
+
+
+def _filter_explicit_inputs(
+    inputs: list[Path],
+    mode: str,
+    llm_enabled: bool,
+    model_override: str | None,
+) -> list[Path]:
+    """Apply --locate-mode as a filter on explicitly passed input files.
+
+    Each input is evaluated with the same per-file criteria as folder
+    discovery (staleness_reason / side files); only the ones that qualify
+    for `mode` are kept. Prints a per-file update/skip note; no approval
+    prompt (the user named the files explicitly). Exits 0 when nothing
+    qualifies.
+    """
+    if mode not in _LOCATE_MODES:
+        typer.echo(
+            f"error: unknown --locate-mode '{mode}' "
+            f"(valid: {', '.join(_LOCATE_MODES)})", err=True,
+        )
+        raise typer.Exit(2)
+
+    current_model: str | None = None
+    if llm_enabled:
+        c = cfg.load_config()
+        current_model = model_override or c.get("model")
+        if not current_model:
+            typer.echo(
+                "error: --locate-mode with the LLM pass enabled requires LLM "
+                "config. Run once with --llm-auth, or pass --no-llm.", err=True,
+            )
+            raise typer.Exit(3)
+
+    unique = list(dict.fromkeys(inputs))
+    selected: list[DiscoveryEntry] = []
+    for pdf in unique:
+        has_meta = pdf.with_suffix(".meta.json").is_file()
+        entry = _evaluate_pdf(
+            pdf, mode, __version__, current_model, llm_enabled)
+        if entry is None:
+            typer.echo(
+                f"  {pdf.name}: skipped ({_skip_reason(pdf, mode, has_meta)})")
+        else:
+            selected.append(entry)
+
+    if not selected:
+        typer.echo(
+            f"locate: 0/{len(unique)} passed file(s) need {mode} — nothing to do")
+        raise typer.Exit(0)
+    typer.echo(f"locate: {len(selected)}/{len(unique)} passed file(s) need {mode}:")
+    for e in selected:
+        typer.echo(f"  {e.pdf.name} — {e.reason}")
+    return [e.pdf for e in selected]
 
 
 def _filter_existing(entries: list) -> list:
